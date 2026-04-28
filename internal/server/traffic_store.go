@@ -314,6 +314,7 @@ func (s *TrafficStore) Flush() error {
 
 func (s *TrafficStore) flushLocked() error {
 	if len(s.pendingMinute) == 0 {
+		s.pendingErr = nil
 		return nil
 	}
 	if s.pendingErr != nil {
@@ -730,6 +731,9 @@ func (s *TrafficStore) EvictTunnel(clientID, tunnelName string) error {
 			delete(s.pendingMinute, key)
 		}
 	}
+	if len(s.pendingMinute) == 0 {
+		s.pendingErr = nil
+	}
 	_, err := s.db.Exec(`DELETE FROM traffic_buckets WHERE client_id = ? AND tunnel_name = ?`, clientID, tunnelName)
 	return err
 }
@@ -742,6 +746,9 @@ func (s *TrafficStore) EvictClient(clientID string) error {
 		if bucket.ClientID == clientID {
 			delete(s.pendingMinute, key)
 		}
+	}
+	if len(s.pendingMinute) == 0 {
+		s.pendingErr = nil
 	}
 	_, err := s.db.Exec(`DELETE FROM traffic_buckets WHERE client_id = ?`, clientID)
 	return err
