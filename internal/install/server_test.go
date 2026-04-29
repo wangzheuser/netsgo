@@ -152,6 +152,67 @@ func TestInstallServerWithCustomTLSCollectsCertAndKey(t *testing.T) {
 	}
 }
 
+func TestInstallServerFreshInstallPreparesDirsBeforeApplyInit(t *testing.T) {
+	ui := &fakeUI{
+		inputs:    []string{"9527", "127.0.0.1/32", "https://panel.example.com", "admin", "10000-11000"},
+		passwords: []string{"Password123", "Password123"},
+		confirms:  []bool{true},
+	}
+	calls := make([]string, 0, 8)
+	record := func(name string) {
+		calls = append(calls, name)
+	}
+
+	err := InstallServerWith(serverDeps{
+		UI:            ui,
+		Detect:        func(role svcmgr.Role) svcmgr.InstallState { return svcmgr.StateNotInstalled },
+		SelectTLSMode: func(ui uiProvider) (string, error) { return "off", nil },
+		EnsureUser: func(name string) error {
+			record("ensure-user")
+			return nil
+		},
+		EnsureDirs: func() error {
+			record("ensure-dirs")
+			return nil
+		},
+		ApplyInit: func(dataDir string, params server.InitParams) error {
+			record("apply-init")
+			return nil
+		},
+		CurrentBinaryPath: func() (string, error) { return "/tmp/netsgo", nil },
+		InstallBinary:     func(src string) error { return nil },
+		WriteServerEnv:    func(layout svcmgr.ServiceLayout, env svcmgr.ServerEnv) error { return nil },
+		WriteServerUnit:   func(layout svcmgr.ServiceLayout) error { return nil },
+		DaemonReload:      func() error { return nil },
+		EnableAndStart:    func(unit string) error { return nil },
+	})
+	if err != nil {
+		t.Fatalf("fresh server install should not error: %v", err)
+	}
+	assertCallBefore(t, calls, "ensure-user", "apply-init")
+	assertCallBefore(t, calls, "ensure-dirs", "apply-init")
+}
+
+func assertCallBefore(t *testing.T, calls []string, first, second string) {
+	t.Helper()
+	firstIndex := -1
+	secondIndex := -1
+	for i, call := range calls {
+		if call == first && firstIndex == -1 {
+			firstIndex = i
+		}
+		if call == second && secondIndex == -1 {
+			secondIndex = i
+		}
+	}
+	if firstIndex == -1 || secondIndex == -1 {
+		t.Fatalf("calls = %#v, want both %q and %q", calls, first, second)
+	}
+	if firstIndex > secondIndex {
+		t.Fatalf("calls = %#v, want %q before %q", calls, first, second)
+	}
+}
+
 func TestInstallServerWithBrokenStateFails(t *testing.T) {
 	ui := &fakeUI{}
 	err := InstallServerWith(serverDeps{

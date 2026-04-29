@@ -222,6 +222,12 @@ func InstallServerWith(deps serverDeps) error {
 		}
 	}
 	if state != svcmgr.StateHistoricalDataOnly {
+		if err := deps.EnsureUser(svcmgr.SystemUser); err != nil {
+			return err
+		}
+		if err := deps.EnsureDirs(); err != nil {
+			return err
+		}
 		if err := deps.ApplyInit(svcmgr.ManagedDataDir, initParams); err != nil {
 			return err
 		}
