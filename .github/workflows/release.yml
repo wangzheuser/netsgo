@@ -8,6 +8,7 @@ on:
 permissions:
   contents: write
   packages: write
+  security-events: write
 
 concurrency:
   group: release-${{ github.ref }}
@@ -152,6 +153,7 @@ jobs:
     runs-on: ubuntu-latest
     needs: docker
     steps:
+      - uses: actions/checkout@v4
       - uses: docker/login-action@v3
         with:
           registry: ghcr.io
