@@ -27,7 +27,6 @@ func TestLoadRecoverableInitParams(t *testing.T) {
 		AdminUsername: "admin",
 		AdminPassword: "Password123",
 		ServerAddr:    "https://panel.example.com",
-		AllowedPorts:  "80,443,10000-20000",
 	}
 	if err := ApplyInit(dataDir, params); err != nil {
 		t.Fatalf("ApplyInit() failed: %v", err)
@@ -39,9 +38,6 @@ func TestLoadRecoverableInitParams(t *testing.T) {
 	}
 	if got.ServerAddr != params.ServerAddr {
 		t.Fatalf("ServerAddr = %q, want %q", got.ServerAddr, params.ServerAddr)
-	}
-	if got.AllowedPorts != params.AllowedPorts {
-		t.Fatalf("AllowedPorts = %q, want %q", got.AllowedPorts, params.AllowedPorts)
 	}
 }
 
@@ -57,7 +53,6 @@ func TestLoadRecoverableInitParamsKeepsHistoricalServerAddr(t *testing.T) {
 		AdminUsername: "admin",
 		AdminPassword: "Password123",
 		ServerAddr:    "https://old.example.com",
-		AllowedPorts:  "10000-10010",
 	}
 	if err := ApplyInit(dataDir, params); err != nil {
 		t.Fatalf("ApplyInit() failed: %v", err)

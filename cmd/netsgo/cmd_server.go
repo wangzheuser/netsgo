@@ -24,14 +24,12 @@ type initFlagValues struct {
 	AdminUsername string
 	AdminPassword string
 	ServerAddr    string
-	AllowedPorts  string
 }
 
 func (v initFlagValues) anyProvided() bool {
 	return v.AdminUsername != "" ||
 		v.AdminPassword != "" ||
-		v.ServerAddr != "" ||
-		v.AllowedPorts != ""
+		v.ServerAddr != ""
 }
 
 func buildInitParamsFromViper() server.InitParams {
@@ -39,7 +37,6 @@ func buildInitParamsFromViper() server.InitParams {
 		AdminUsername: viper.GetString("init-admin-username"),
 		AdminPassword: viper.GetString("init-admin-password"),
 		ServerAddr:    viper.GetString("init-server-addr"),
-		AllowedPorts:  viper.GetString("init-allowed-ports"),
 	}
 }
 
@@ -50,8 +47,8 @@ func validateInitFlagsForStartup(initialized bool, values initFlagValues) error 
 	if !values.anyProvided() {
 		return fmt.Errorf("server not yet initialized; provide all --init-* flags (or NETSGO_INIT_* env vars), or use netsgo install for interactive setup")
 	}
-	if values.AdminUsername == "" || values.AdminPassword == "" || values.ServerAddr == "" || values.AllowedPorts == "" {
-		return fmt.Errorf("server not yet initialized; must provide all of: --init-admin-username, --init-admin-password, --init-server-addr, --init-allowed-ports")
+	if values.AdminUsername == "" || values.AdminPassword == "" || values.ServerAddr == "" {
+		return fmt.Errorf("server not yet initialized; must provide all of: --init-admin-username, --init-admin-password, --init-server-addr")
 	}
 	return nil
 }
@@ -87,7 +84,6 @@ func prepareServerStartup(dataDir string, initParams server.InitParams) (serverS
 		AdminUsername: initParams.AdminUsername,
 		AdminPassword: initParams.AdminPassword,
 		ServerAddr:    initParams.ServerAddr,
-		AllowedPorts:  initParams.AllowedPorts,
 	}); err != nil {
 		release()
 		return serverStartupPreparation{}, err
@@ -131,8 +127,7 @@ All flags support environment variable configuration with NETSGO_ prefix, e.g.:
   netsgo server \
     --init-admin-username admin \
     --init-admin-password Password123 \
-    --init-server-addr https://panel.example.com \
-    --init-allowed-ports 10000-11000
+    --init-server-addr https://panel.example.com
 
   # Start with auto-generated self-signed certificate
   netsgo server --tls-mode auto
@@ -162,7 +157,6 @@ All flags support environment variable configuration with NETSGO_ prefix, e.g.:
 			AdminUsername: initParams.AdminUsername,
 			AdminPassword: initParams.AdminPassword,
 			ServerAddr:    initParams.ServerAddr,
-			AllowedPorts:  initParams.AllowedPorts,
 		}) {
 			log.Printf("ℹ️  Server already initialized, --init-* flags will be ignored")
 		}
@@ -238,7 +232,6 @@ func init() {
 	serverCmd.Flags().String("init-admin-username", "", "Admin username for first-time initialization")
 	serverCmd.Flags().String("init-admin-password", "", "Admin password for first-time initialization")
 	serverCmd.Flags().String("init-server-addr", "", "Server external address for first-time initialization")
-	serverCmd.Flags().String("init-allowed-ports", "", "Allowed port ranges for first-time initialization")
 	serverCmd.Flags().String("server-addr", "", "Force-override server external address or domain")
 	serverCmd.Flags().Bool("allow-loopback-management-host", false, "Explicitly allow localhost/127.0.0.1/::1 as fallback management Host")
 
@@ -270,9 +263,6 @@ func init() {
 		panic(err)
 	}
 	if err := viper.BindPFlag("init-server-addr", serverCmd.Flags().Lookup("init-server-addr")); err != nil {
-		panic(err)
-	}
-	if err := viper.BindPFlag("init-allowed-ports", serverCmd.Flags().Lookup("init-allowed-ports")); err != nil {
 		panic(err)
 	}
 	if err := viper.BindPFlag("server-addr", serverCmd.Flags().Lookup("server-addr")); err != nil {

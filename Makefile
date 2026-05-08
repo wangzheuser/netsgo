@@ -62,7 +62,6 @@ DEV_KEY  ?= sk-8ccf857d-db62-4806-9719-776900e0785d
 DEV_INIT_ADMIN_USERNAME ?= admin
 DEV_INIT_ADMIN_PASSWORD ?= admin.2026
 DEV_INIT_SERVER_ADDR    ?= http://localhost:$(DEV_PORT)
-DEV_INIT_ALLOWED_PORTS  ?= 10000-11000
 STACK_PROXY ?= nginx
 STACK_PROJECT ?= netsgo-stack-$(STACK_PROXY)
 STACK_PROXY_PORT ?= 19080
@@ -83,8 +82,7 @@ dev-server:
 		--allow-loopback-management-host \
 		--init-admin-username $(DEV_INIT_ADMIN_USERNAME) \
 		--init-admin-password $(DEV_INIT_ADMIN_PASSWORD) \
-		--init-server-addr $(DEV_INIT_SERVER_ADDR) \
-		--init-allowed-ports $(DEV_INIT_ALLOWED_PORTS)
+		--init-server-addr $(DEV_INIT_SERVER_ADDR)
 
 # 启动客户端，连接本地服务端
 dev-client:

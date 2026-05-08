@@ -342,7 +342,7 @@ function TunnelDialogForm({
             <p className="text-[11px] text-muted-foreground mt-1.5">
               可用端口范围：
               {status?.allowed_ports === undefined
-                ? '10000-11000'
+                ? '加载中…'
                 : status.allowed_ports.length > 0
                   ? status.allowed_ports.map(p => p.start === p.end ? p.start : `${p.start}-${p.end}`).join(', ')
                   : '无限制'}

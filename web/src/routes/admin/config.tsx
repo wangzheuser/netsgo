@@ -524,9 +524,9 @@ function AdminConfigForm({ initialConfig }: { initialConfig: AdminConfig }) {
             <AlertDialogMedia className="bg-amber-500/10">
               <AlertTriangle className="text-amber-500" />
             </AlertDialogMedia>
-            <AlertDialogTitle>端口白名单变更影响提示</AlertDialogTitle>
+            <AlertDialogTitle>端口范围变更影响提示</AlertDialogTitle>
             <AlertDialogDescription>
-              以下 <span className="font-semibold text-foreground">{affectedTunnels.length}</span> 条现有隧道的端口不在新的白名单范围内，保存后这些隧道将被标记为异常并停止转发。
+              以下 <span className="font-semibold text-foreground">{affectedTunnels.length}</span> 条现有隧道的端口不在新的允许范围内，保存后这些隧道将被标记为异常并停止转发。
             </AlertDialogDescription>
           </AlertDialogHeader>
 

@@ -183,7 +183,6 @@ func InstallServerWith(deps serverDeps) error {
 		if initParams.AdminPassword != confirmPassword {
 			return fmt.Errorf("两次输入的管理员密码不一致")
 		}
-		initParams.AllowedPorts = "1024-65535"
 	}
 
 	deps.UI.PrintSummary("安装摘要", confirmSummaryRows(svcmgr.RoleServer,

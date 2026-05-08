@@ -17,7 +17,6 @@ func TestBuildInitParamsFromViper(t *testing.T) {
 	viper.Set("init-admin-username", "admin")
 	viper.Set("init-admin-password", "Password123")
 	viper.Set("init-server-addr", "https://panel.example.com")
-	viper.Set("init-allowed-ports", "10000-10010")
 
 	params := buildInitParamsFromViper()
 	if params.AdminUsername != "admin" {
@@ -28,9 +27,6 @@ func TestBuildInitParamsFromViper(t *testing.T) {
 	}
 	if params.ServerAddr != "https://panel.example.com" {
 		t.Fatalf("expected ServerAddr %q, got %q", "https://panel.example.com", params.ServerAddr)
-	}
-	if params.AllowedPorts != "10000-10010" {
-		t.Fatalf("expected AllowedPorts %q, got %q", "10000-10010", params.AllowedPorts)
 	}
 	if !params.IsComplete() {
 		t.Fatal("complete init params should be recognized as complete")
@@ -68,7 +64,7 @@ func TestValidateInitFlagsForStartup(t *testing.T) {
 				AdminPassword: "Password123",
 			},
 			wantErr: true,
-			wantMsg: "--init-admin-username, --init-admin-password, --init-server-addr, --init-allowed-ports",
+			wantMsg: "--init-admin-username, --init-admin-password, --init-server-addr",
 		},
 		{
 			name:        "uninitialized with full init flags passes",
@@ -77,7 +73,6 @@ func TestValidateInitFlagsForStartup(t *testing.T) {
 				AdminUsername: "admin",
 				AdminPassword: "Password123",
 				ServerAddr:    "https://panel.example.com",
-				AllowedPorts:  "10000-10010",
 			},
 			wantErr: false,
 		},

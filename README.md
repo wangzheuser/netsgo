@@ -71,7 +71,7 @@
 sudo ./netsgo install
 ```
 
-按交互提示选择 **Server**，并填入管理员账号、访问地址、允许端口范围等信息。安装完成后：
+按交互提示选择 **Server**，并填入管理员账号、访问地址等信息。安装完成后：
 
 ```bash
 # 已经安装到系统中, 可以直接使用 netsgo 命令了
@@ -102,7 +102,6 @@ services:
       NETSGO_INIT_ADMIN_USERNAME: "admin"
       NETSGO_INIT_ADMIN_PASSWORD: "<change-me-strong-password>"
       NETSGO_INIT_SERVER_ADDR: "https://your-netsgo-domain.com"
-      NETSGO_INIT_ALLOWED_PORTS: "10000-11000"
     volumes:
       - netsgo-data:/var/lib/netsgo
 
@@ -121,15 +120,14 @@ Docker 镜像默认执行 `netsgo server`。这里通过 `NETSGO_DATA_DIR=/var/l
 <details>
 <summary>点击展开 CLI 直跑命令</summary>
 
-首次启动必须提供完整的 `--init-*` 参数：
+首次启动必须提供初始化管理员与服务地址参数：
 
 ```bash
 ./netsgo server \
   --port 9527 \
   --init-admin-username admin \
   --init-admin-password '<change-me-strong-password>' \
-  --init-server-addr https://your-netsgo-domain.com \
-  --init-allowed-ports 10000-11000
+  --init-server-addr https://your-netsgo-domain.com
 ```
 
 请务必把示例中的 `<change-me-strong-password>` 替换为高强度密码，不要直接用于生产环境。初始化完成后，同一数据目录后续启动可省略 `init-*` 参数。
@@ -301,8 +299,7 @@ your-netsgo-domain.com {
 netsgo server \
   --init-admin-username admin \
   --init-admin-password '<change-me-strong-password>' \
-  --init-server-addr https://panel.example.com \
-  --init-allowed-ports 10000-11000
+  --init-server-addr https://panel.example.com
 
 # 已初始化数据目录的后续启动
 netsgo server --data-dir ~/.local/state/netsgo
@@ -362,7 +359,6 @@ sudo netsgo manage    # 查看状态、启停、日志、卸载
 | `NETSGO_INIT_ADMIN_USERNAME` | `--init-admin-username` | 首次初始化管理员用户名 |
 | `NETSGO_INIT_ADMIN_PASSWORD` | `--init-admin-password` | 首次初始化管理员密码 |
 | `NETSGO_INIT_SERVER_ADDR` | `--init-server-addr` | 首次初始化写入的管理面地址 |
-| `NETSGO_INIT_ALLOWED_PORTS` | `--init-allowed-ports` | 首次初始化允许端口范围 |
 
 ### 客户端
 

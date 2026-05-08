@@ -43,7 +43,7 @@ func TestInstallServerWithHistoricalDataSkipsInit(t *testing.T) {
 		Detect:        func(role svcmgr.Role) svcmgr.InstallState { return svcmgr.StateHistoricalDataOnly },
 		SelectTLSMode: func(ui uiProvider) (string, error) { return "off", nil },
 		LoadRecoverable: func() (server.InitParams, error) {
-			return server.InitParams{ServerAddr: "https://panel.example.com", AllowedPorts: "10000-11000"}, nil
+			return server.InitParams{ServerAddr: "https://panel.example.com"}, nil
 		},
 		EnsureUser: func(name string) error { return nil },
 		EnsureDirs: func() error { return nil },
@@ -94,7 +94,7 @@ func TestInstallServerWithHistoricalDataDeclineReuseStopsInstall(t *testing.T) {
 		Detect:        func(role svcmgr.Role) svcmgr.InstallState { return svcmgr.StateHistoricalDataOnly },
 		SelectTLSMode: func(ui uiProvider) (string, error) { return "off", nil },
 		LoadRecoverable: func() (server.InitParams, error) {
-			return server.InitParams{ServerAddr: "https://panel.example.com", AllowedPorts: "10000-11000"}, nil
+			return server.InitParams{ServerAddr: "https://panel.example.com"}, nil
 		},
 		EnsureUser:        func(name string) error { return nil },
 		EnsureDirs:        func() error { return nil },
@@ -198,8 +198,8 @@ func TestInstallServerFreshInstallPreparesDirsBeforeApplyInit(t *testing.T) {
 	}
 	assertCallBefore(t, calls, "ensure-user", "apply-init")
 	assertCallBefore(t, calls, "ensure-dirs", "apply-init")
-	if gotInitParams.AllowedPorts != "1024-65535" {
-		t.Fatalf("fresh server init allowed ports = %q, want %q", gotInitParams.AllowedPorts, "1024-65535")
+	if gotInitParams.ServerAddr != "https://panel.example.com" {
+		t.Fatalf("fresh server init server addr = %q, want %q", gotInitParams.ServerAddr, "https://panel.example.com")
 	}
 	assertInputPromptDefault(t, ui.inputCalls, "可信代理 CIDR", "127.0.0.1/8")
 	assertInputPromptDescriptionContains(t, ui.inputCalls, "可信代理 CIDR", "0.0.0.0/0")
