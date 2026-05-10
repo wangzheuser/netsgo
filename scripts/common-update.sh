@@ -4,21 +4,15 @@ set -eu
 
 NETSGO_LATEST_CNB="https://cnb.cool/zsio/netsgo/-/raw/release-index/updates/index-v1/latest.json"
 NETSGO_LATEST_GITHUB="https://raw.githubusercontent.com/zsio/netsgo/release-index/updates/index-v1/latest.json"
-NETSGO_COMMON_CNB="https://cnb.cool/zsio/netsgo/-/raw/main/scripts/common-update.sh"
-NETSGO_COMMON_GITHUB="https://raw.githubusercontent.com/zsio/netsgo/main/scripts/common-update.sh"
 
 # Release public keys are derived from the private release signing key stored in
 # NETSGO_RELEASE_SIGNING_KEY_PEM. Commit public keys here so install/upgrade
 # scripts can verify release checksums without trusting HTTPS alone.
 # BEGIN NETSGO RELEASE PUBLIC KEYS
-if [ -z "${NETSGO_RELEASE_PUBLIC_KEY_PEM:-}" ]; then
-  NETSGO_RELEASE_PUBLIC_KEY_PEM='-----BEGIN PUBLIC KEY-----
+NETSGO_RELEASE_PUBLIC_KEY_PEM='-----BEGIN PUBLIC KEY-----
 MCowBQYDK2VwAyEAH4VWaTpLBw8/WXELyluQChFm5Fi1qI2E8DSOwYKpRCc=
 -----END PUBLIC KEY-----'
-fi
-if [ -z "${NETSGO_RELEASE_ALLOWED_SIGNERS:-}" ]; then
-  NETSGO_RELEASE_ALLOWED_SIGNERS='netsgo-release ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIB+FVmk6SwcPP1lxC8pbkAoRZuRYtaiNhPA0jsGCqUQn'
-fi
+NETSGO_RELEASE_ALLOWED_SIGNERS='netsgo-release ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIB+FVmk6SwcPP1lxC8pbkAoRZuRYtaiNhPA0jsGCqUQn'
 # END NETSGO RELEASE PUBLIC KEYS
 
 die() {
@@ -164,10 +158,8 @@ official_url_allowed() {
   case "$1" in
     https://github.com/zsio/netsgo/releases/download/*) return 0 ;;
     https://raw.githubusercontent.com/zsio/netsgo/release-index/*) return 0 ;;
-    https://raw.githubusercontent.com/zsio/netsgo/main/scripts/common-update.sh) return 0 ;;
     https://cnb.cool/zsio/netsgo/-/releases/download/*) return 0 ;;
     https://cnb.cool/zsio/netsgo/-/raw/release-index/*) return 0 ;;
-    https://cnb.cool/zsio/netsgo/-/raw/main/scripts/common-update.sh) return 0 ;;
     *) return 1 ;;
   esac
 }
