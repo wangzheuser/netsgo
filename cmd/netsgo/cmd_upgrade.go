@@ -8,7 +8,6 @@ import (
 	"os"
 	"os/exec"
 	"strings"
-	"syscall"
 
 	"netsgo/internal/svcmgr"
 	"netsgo/internal/tui"
@@ -207,7 +206,7 @@ var upgradeCmd = &cobra.Command{
 	使用 -f/--force 可强制允许不可比较、等版本或降级替换。
 	使用 -y/--yes 可跳过最终确认。`,
 	RunE: func(cmd *cobra.Command, args []string) error {
-		if err := rerunUpgradeWithSudoIfNeeded(os.Getuid(), exec.LookPath, syscall.Exec); err != nil {
+		if err := rerunUpgradeWithSudoIfNeeded(os.Getuid(), exec.LookPath, execAsRoot); err != nil {
 			return err
 		}
 
@@ -260,13 +259,23 @@ func readConfirmationFrom(reader *bufio.Reader) bool {
 
 func installedUnits() []string {
 	var units []string
-	if svcmgr.Detect(svcmgr.RoleServer) == svcmgr.StateInstalled {
+	if serviceFilesExist(svcmgr.NewLayout(svcmgr.RoleServer)) {
 		units = append(units, svcmgr.UnitName(svcmgr.RoleServer))
 	}
-	if svcmgr.Detect(svcmgr.RoleClient) == svcmgr.StateInstalled {
+	if serviceFilesExist(svcmgr.NewLayout(svcmgr.RoleClient)) {
 		units = append(units, svcmgr.UnitName(svcmgr.RoleClient))
 	}
 	return units
+}
+
+func serviceFilesExist(layout svcmgr.ServiceLayout) bool {
+	if _, err := os.Stat(layout.UnitPath); err != nil {
+		return false
+	}
+	if _, err := os.Stat(layout.EnvPath); err != nil {
+		return false
+	}
+	return true
 }
 
 func getInstalledVersion() (string, error) {

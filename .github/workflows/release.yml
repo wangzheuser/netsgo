@@ -32,10 +32,10 @@ jobs:
     needs: release-gate
     steps:
       - uses: actions/checkout@v6
-      - name: Reject npm lockfiles in Bun-managed web app
+      - name: Reject non-Bun lockfiles in frontend workspaces
         run: |
-          ! find web -maxdepth 1 \( -name 'package-lock.json' -o -name 'npm-shrinkwrap.json' \) | grep -q . || {
-            echo "npm lockfiles must not exist in web/; use Bun and web/bun.lock instead."
+          ! find web desktop -maxdepth 1 \( -name 'package-lock.json' -o -name 'npm-shrinkwrap.json' -o -name 'pnpm-lock.yaml' -o -name 'yarn.lock' \) | grep -q . || {
+            echo "Non-Bun lockfiles must not exist in web/ or desktop/; use Bun and bun.lock instead."
             exit 1
           }
       - uses: oven-sh/setup-bun@v2
@@ -57,6 +57,74 @@ jobs:
         with:
           name: web-dist
           path: /tmp/web-dist.tgz
+          if-no-files-found: error
+
+  desktop-dist:
+    needs: binaries
+    permissions:
+      contents: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-15-intel
+            target: x86_64-apple-darwin
+            artifact: desktop-macos-x64
+          - os: macos-15
+            target: aarch64-apple-darwin
+            artifact: desktop-macos-arm64
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            artifact: desktop-windows-x64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: oven-sh/setup-bun@v2
+      - name: Install desktop dependencies
+        working-directory: desktop
+        run: bun install --frozen-lockfile
+      - name: Build desktop sidecar
+        shell: bash
+        env:
+          VERSION: ${{ github.ref_name }}
+          COMMIT: ${{ github.sha }}
+        run: scripts/build-desktop-sidecar.sh "${{ matrix.target }}"
+      - name: Build desktop bundles
+        working-directory: desktop
+        run: bun run tauri build --target "${{ matrix.target }}"
+      - name: Upload desktop artifacts to GitHub release
+        shell: bash
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          shopt -s globstar nullglob
+          assets=(
+            desktop/src-tauri/target/${{ matrix.target }}/release/bundle/**/*.dmg
+            desktop/src-tauri/target/${{ matrix.target }}/release/bundle/**/*.app.tar.gz
+            desktop/src-tauri/target/${{ matrix.target }}/release/bundle/**/*.msi
+            desktop/src-tauri/target/${{ matrix.target }}/release/bundle/**/*.exe
+          )
+          if [ "${#assets[@]}" -eq 0 ]; then
+            echo "No desktop bundle assets found" >&2
+            find desktop/src-tauri/target/${{ matrix.target }}/release/bundle -type f 2>/dev/null || true
+            exit 1
+          fi
+          gh release upload "$GITHUB_REF_NAME" "${assets[@]}" --clobber
+      - uses: actions/upload-artifact@v7
+        with:
+          name: ${{ matrix.artifact }}
+          path: |
+            desktop/src-tauri/target/${{ matrix.target }}/release/bundle/**/*.dmg
+            desktop/src-tauri/target/${{ matrix.target }}/release/bundle/**/*.app.tar.gz
+            desktop/src-tauri/target/${{ matrix.target }}/release/bundle/**/*.msi
+            desktop/src-tauri/target/${{ matrix.target }}/release/bundle/**/*.exe
           if-no-files-found: error
 
   verify:
@@ -164,6 +232,7 @@ jobs:
       contents: write
     needs:
       - binaries
+      - desktop-dist
       - mirror-source-to-cnb
     env:
       CNB_REPO_URL: ${{ secrets.CNB_REPO_URL }}
@@ -177,6 +246,7 @@ jobs:
         with:
           name: release-dist
           path: dist
+      - uses: oven-sh/setup-bun@v2
       - name: Restore current release index
         shell: bash
         run: |
@@ -329,7 +399,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          CNB_REPO_SLUG="${{ steps.cnb-vars.outputs.slug }}" CNB_UPLOADED_ASSETS="${{ steps.cnb-assets.outputs.uploaded_assets }}" node scripts/release-index.mjs build
+          CNB_REPO_SLUG="${{ steps.cnb-vars.outputs.slug }}" CNB_UPLOADED_ASSETS="${{ steps.cnb-assets.outputs.uploaded_assets }}" bun scripts/release-index.mjs build
       - name: Push release-index branch to GitHub
         shell: bash
         env:

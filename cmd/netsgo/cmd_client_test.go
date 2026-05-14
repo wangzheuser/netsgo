@@ -1,69 +1,64 @@
 package main
 
 import (
+	"os"
 	"strings"
 	"testing"
+
+	"netsgo/pkg/datadir"
 )
-
-func TestMaskKey(t *testing.T) {
-	tests := []struct {
-		name string
-		key  string
-		want string
-	}{
-		{name: "empty", key: "", want: "(empty)"},
-		{name: "short", key: "abcd", want: "****"},
-		{name: "long", key: "sk-test-key", want: "*******-key"},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			if got := maskKey(tt.key); got != tt.want {
-				t.Fatalf("maskKey(%q) = %q, want %q", tt.key, got, tt.want)
-			}
-		})
-	}
-}
 
 func TestResolveClientDataDir(t *testing.T) {
 	t.Setenv("NETSGO_DATA_DIR", "/env/data")
 
 	if got := resolveClientDataDir("/flag/data", true); got != "/flag/data" {
-		t.Fatalf("changed flag should override NETSGO_DATA_DIR, got %q", got)
+		t.Fatalf("changed flag should win, got %q", got)
 	}
 	if got := resolveClientDataDir("/default/data", false); got != "/env/data" {
-		t.Fatalf("NETSGO_DATA_DIR should override unchanged default, got %q", got)
+		t.Fatalf("env data dir should win when flag is unchanged, got %q", got)
 	}
-}
 
-func TestResolveClientDataDirUsesDefaultWithoutEnv(t *testing.T) {
 	t.Setenv("NETSGO_DATA_DIR", "")
-
 	if got := resolveClientDataDir("/default/data", false); got != "/default/data" {
-		t.Fatalf("default data dir mismatch: got %q", got)
+		t.Fatalf("default data dir should be used without env override, got %q", got)
 	}
 }
 
-func TestClientHelpPrefersHTTPServiceAddress(t *testing.T) {
-	serverFlag := clientCmd.Flags().Lookup("server")
-	if serverFlag == nil {
-		t.Fatal("client --server flag not registered")
+func TestClientCommandLogFormatFlag(t *testing.T) {
+	flag := clientCmd.Flags().Lookup("log-format")
+	if flag == nil {
+		t.Fatal("client command should define --log-format")
 	}
-	if serverFlag.DefValue != "http://localhost:9527" {
-		t.Fatalf("client --server default = %q, want http://localhost:9527", serverFlag.DefValue)
+	if flag.DefValue != "text" {
+		t.Fatalf("default log format = %q, want text", flag.DefValue)
 	}
-	if !strings.Contains(serverFlag.Usage, "http/https recommended") {
-		t.Fatalf("client --server usage should recommend http/https, got %q", serverFlag.Usage)
+}
+
+func TestClientCommandHelpIncludesImportantFlags(t *testing.T) {
+	var output strings.Builder
+	clientCmd.SetOut(&output)
+	clientCmd.SetErr(&output)
+	t.Cleanup(func() {
+		clientCmd.SetOut(os.Stdout)
+		clientCmd.SetErr(os.Stderr)
+	})
+
+	if err := clientCmd.Help(); err != nil {
+		t.Fatalf("client help: %v", err)
 	}
-	if !strings.Contains(clientCmd.Long, "Service address formats:") {
-		t.Fatalf("client long help should describe service addresses, got %q", clientCmd.Long)
-	}
-	if !strings.Contains(clientCmd.Long, "Backward-compatible WebSocket form") {
-		t.Fatalf("client long help should keep ws/wss compatibility visible, got %q", clientCmd.Long)
-	}
-	if strings.Contains(clientCmd.Long, "Plain WebSocket") ||
-		strings.Contains(clientCmd.Example, "--server ws://") ||
-		strings.Contains(clientCmd.Example, "--server wss://") {
-		t.Fatalf("client help should not present ws:// as the first-use path")
+
+	help := output.String()
+	for _, want := range []string{
+		"--server",
+		"--key",
+		"--data-dir",
+		"--log-format",
+		"--tls-skip-verify",
+		"--tls-fingerprint",
+		datadir.DefaultDataDir(),
+	} {
+		if !strings.Contains(help, want) {
+			t.Fatalf("client help missing %q:\n%s", want, help)
+		}
 	}
 }

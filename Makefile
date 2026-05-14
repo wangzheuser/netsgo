@@ -1,4 +1,4 @@
-.PHONY: build build-web build-go clean docs dev-server dev-client dev-bench dev-web test test-race lint test-e2e-nginx test-e2e-caddy bench-data soak-data compose-stack-up compose-stack-logs compose-stack-down compose-stack-clean test-compose-stack test-compose-stack-nginx test-compose-stack-caddy
+.PHONY: build build-web build-go build-desktop-sidecar build-desktop clean docs dev-server dev-client dev-bench dev-web test test-race lint test-e2e-nginx test-e2e-caddy bench-data soak-data compose-stack-up compose-stack-logs compose-stack-down compose-stack-clean test-compose-stack test-compose-stack-nginx test-compose-stack-caddy
 
 # 编译输出目录
 BIN_DIR=bin
@@ -34,6 +34,19 @@ build-go:
 	@echo "🔨 编译 netsgo..."
 	go build -ldflags "$(LDFLAGS)" -o $(BIN_DIR)/netsgo ./cmd/netsgo/
 	@echo "✅ 编译完成: $(BIN_DIR)/netsgo"
+
+DESKTOP_TARGET_TRIPLE ?= $(shell rustc --print host-tuple 2>/dev/null || rustc -vV 2>/dev/null | sed -n 's/^host: //p')
+DESKTOP_BUNDLE_ARGS ?= --no-bundle
+
+# 构建当前 Rust target 对应的 desktop client sidecar。使用 dev tag 跳过 server Web 面板嵌入。
+build-desktop-sidecar:
+	@VERSION="$(VERSION)" COMMIT="$(COMMIT)" DATE="$(DATE)" scripts/build-desktop-sidecar.sh "$(DESKTOP_TARGET_TRIPLE)"
+
+# 本地验证 desktop 能消费上一步生成的 netsgo sidecar。默认只编译不打包安装器。
+build-desktop: build-desktop-sidecar
+	@echo "🖥️  构建 desktop..."
+	cd desktop && bun install --frozen-lockfile && bun run tauri build --target "$(DESKTOP_TARGET_TRIPLE)" $(DESKTOP_BUNDLE_ARGS)
+	@echo "✅ desktop 构建完成"
 
 # 清理
 clean:

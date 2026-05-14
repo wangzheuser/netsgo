@@ -108,7 +108,11 @@ func ReadClientEnv(layout ServiceLayout) (ClientEnv, error) {
 }
 
 func writeEnvFile(path string, values map[string]string) error {
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+	dir := filepath.Dir(path)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return err
+	}
+	if err := os.Chmod(dir, 0o755); err != nil {
 		return err
 	}
 
@@ -132,7 +136,14 @@ func writeEnvFile(path string, values map[string]string) error {
 		builder.WriteByte('\n')
 	}
 
-	return fileutil.AtomicWriteFile(path, []byte(builder.String()), 0o600)
+	if err := fileutil.AtomicWriteFile(path, []byte(builder.String()), 0o640); err != nil {
+		return err
+	}
+	return repairEnvFileOwnership(path)
+}
+
+func RepairEnvFileOwnership(layout ServiceLayout) error {
+	return repairEnvFileOwnership(layout.EnvPath)
 }
 
 func readEnvFile(path string) (map[string]string, error) {
