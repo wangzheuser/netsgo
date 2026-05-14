@@ -104,19 +104,21 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
-          shopt -s globstar nullglob
-          assets=(
-            desktop/src-tauri/target/${{ matrix.target }}/release/bundle/**/*.dmg
-            desktop/src-tauri/target/${{ matrix.target }}/release/bundle/**/*.app.tar.gz
-            desktop/src-tauri/target/${{ matrix.target }}/release/bundle/**/*.msi
-            desktop/src-tauri/target/${{ matrix.target }}/release/bundle/**/*.exe
-          )
-          if [ "${#assets[@]}" -eq 0 ]; then
-            echo "No desktop bundle assets found" >&2
-            find desktop/src-tauri/target/${{ matrix.target }}/release/bundle -type f 2>/dev/null || true
+          bundle_dir="desktop/src-tauri/target/${{ matrix.target }}/release/bundle"
+          if [ ! -d "$bundle_dir" ]; then
+            echo "Desktop bundle directory not found: $bundle_dir" >&2
             exit 1
           fi
-          gh release upload "$GITHUB_REF_NAME" "${assets[@]}" --clobber
+          found=0
+          while IFS= read -r -d '' asset; do
+            found=1
+            gh release upload "$GITHUB_REF_NAME" "$asset" --clobber
+          done < <(find "$bundle_dir" -type f \( -name '*.dmg' -o -name '*.app.tar.gz' -o -name '*.msi' -o -name '*.exe' \) -print0)
+          if [ "$found" -eq 0 ]; then
+            echo "No desktop bundle assets found" >&2
+            find "$bundle_dir" -type f 2>/dev/null || true
+            exit 1
+          fi
       - uses: actions/upload-artifact@v7
         with:
           name: ${{ matrix.artifact }}
