@@ -289,6 +289,7 @@ export const enUS = {
     passwordSecurityDescription: 'Rotate the administrator password. The new password must differ from the current one.',
     newPassword: 'New password',
     updatePassword: 'Update password',
+    passwordConfigured: 'Configured',
     twoFactorAuth: 'Two-factor authentication',
     totpPanelDescription: 'Add authenticator-app verification after password sign-in.',
     totpEnabled: 'TOTP enabled',

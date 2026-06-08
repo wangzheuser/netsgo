@@ -291,6 +291,7 @@ export const zhCN = {
     passwordSecurityDescription: '定期更换高强度密码。新密码不能与当前密码相同。',
     newPassword: '新密码',
     updatePassword: '修改密码',
+    passwordConfigured: '已设置',
     twoFactorAuth: '双因素认证',
     totpPanelDescription: '为密码登录增加基于认证器应用的一次性验证码。',
     totpEnabled: 'TOTP 已启用',
