@@ -250,6 +250,7 @@ func TestAdminStore_ValidateAdminPassword_Success(t *testing.T) {
 	}
 	if user == nil {
 		t.Fatal("user should not be nil")
+		return
 	}
 	if user.Username != "admin" {
 		t.Errorf("expected username admin, got %s", user.Username)

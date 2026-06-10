@@ -1040,6 +1040,7 @@ func TestAPI_Login_SetsSecureCookie_WhenTrustedProxyReportsHTTPS(t *testing.T) {
 	}
 	if sessionCookie == nil {
 		t.Fatal("login response is missing the netsgo_session cookie")
+		return
 	}
 	if !sessionCookie.Secure {
 		t.Error("should set a Secure cookie when a trusted reverse proxy declares HTTPS")
@@ -1076,6 +1077,7 @@ func TestAPI_Login_IgnoresUntrustedProxyHTTPSForSecureCookie(t *testing.T) {
 	}
 	if sessionCookie == nil {
 		t.Fatal("login response is missing the netsgo_session cookie")
+		return
 	}
 	if sessionCookie.Secure {
 		t.Error("should not trust forged HTTPS headers from an untrusted proxy")
