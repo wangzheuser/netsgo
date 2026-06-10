@@ -417,12 +417,16 @@ func replaceRecoveryCodesInTx(tx *sql.Tx, userID string, codes []string) error {
 	return nil
 }
 
-func consumeRecoveryCodeInTx(tx *sql.Tx, userID, code string) (bool, error) {
+func consumeRecoveryCodeInTx(tx *sql.Tx, userID, code string) (matched bool, err error) {
 	rows, err := tx.Query(`SELECT id, code_hash FROM admin_totp_recovery_codes WHERE user_id = ? AND used_at IS NULL ORDER BY created_at, id`, userID)
 	if err != nil {
 		return false, err
 	}
-	defer rows.Close()
+	defer func() {
+		if cerr := rows.Close(); cerr != nil && err == nil {
+			err = cerr
+		}
+	}()
 
 	var matchedID string
 	for rows.Next() {
@@ -619,7 +623,7 @@ func (s *AdminStore) AddPasskey(userID, name, credentialID string, credential we
 	return &passkey, nil
 }
 
-func (s *AdminStore) ListPasskeys(userID string) ([]AdminPasskey, error) {
+func (s *AdminStore) ListPasskeys(userID string) (passkeys []AdminPasskey, err error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
@@ -628,9 +632,12 @@ func (s *AdminStore) ListPasskeys(userID string) ([]AdminPasskey, error) {
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
+	defer func() {
+		if cerr := rows.Close(); cerr != nil && err == nil {
+			err = cerr
+		}
+	}()
 
-	var passkeys []AdminPasskey
 	for rows.Next() {
 		passkey, err := scanAdminPasskey(rows)
 		if err != nil {
@@ -644,7 +651,7 @@ func (s *AdminStore) ListPasskeys(userID string) ([]AdminPasskey, error) {
 	return passkeys, nil
 }
 
-func (s *AdminStore) ListPasskeysByRP(rpID, origin string) ([]AdminPasskey, error) {
+func (s *AdminStore) ListPasskeysByRP(rpID, origin string) (passkeys []AdminPasskey, err error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
@@ -653,9 +660,12 @@ func (s *AdminStore) ListPasskeysByRP(rpID, origin string) ([]AdminPasskey, erro
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
+	defer func() {
+		if cerr := rows.Close(); cerr != nil && err == nil {
+			err = cerr
+		}
+	}()
 
-	var passkeys []AdminPasskey
 	for rows.Next() {
 		passkey, err := scanAdminPasskey(rows)
 		if err != nil {
