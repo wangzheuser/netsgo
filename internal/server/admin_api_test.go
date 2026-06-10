@@ -98,6 +98,7 @@ func seedStoredTunnel(t *testing.T, s *Server, clientID string, req protocol.Pro
 
 	if s.store == nil {
 		t.Fatal("test setup error: s.store must not be nil")
+		return
 	}
 	if req.LocalIP == "" {
 		req.LocalIP = "127.0.0.1"
