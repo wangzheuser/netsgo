@@ -48,7 +48,7 @@ RUN set -eux; \
         -o /out/netsgo \
         ./cmd/netsgo
 
-FROM gcr.io/distroless/base-debian12:nonroot AS runtime
+FROM gcr.io/distroless/static-debian12:nonroot AS runtime
 
 WORKDIR /app
 
