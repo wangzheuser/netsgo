@@ -4,7 +4,8 @@ import { renderToStaticMarkup } from 'react-dom/server';
 
 import { TooltipProvider } from '@/components/ui/tooltip';
 
-import { ClientToClientTopologyButton, getInitialTunnelFormState } from './TunnelDialog';
+import { ClientToClientTopologyButton } from './TunnelDialog';
+import { getInitialTunnelFormState } from './tunnel-dialog-form';
 
 const legacyInlineWarning = ['客户端互访', '需要', '至少', '两个客户端'].join('');
 function renderClientToClientButton(disabled: boolean) {
