@@ -117,3 +117,5 @@ curl -fsSL https://netsgo.zs.uy/upgrade.sh | sh -s -- -y
 ## License
 
 [Apache-2.0](LICENSE)
+
+首发于 [linux.do](https://linux.do) 论坛

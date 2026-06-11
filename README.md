@@ -117,3 +117,5 @@ This table is a capability checklist, not a ranking. Cells intentionally use sho
 ## License
 
 [Apache-2.0](LICENSE)
+
+First published on the [linux.do](https://linux.do) forum.
