@@ -3,6 +3,7 @@ package server
 import (
 	"database/sql"
 	"errors"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -671,6 +672,68 @@ func TestAdminStore_AddAndGetAPIKeys(t *testing.T) {
 	keys = store.GetAPIKeys()
 	if len(keys) != 1 {
 		t.Errorf("expected 1 available key, got %d", len(keys))
+	}
+}
+
+func TestAdminStore_AddAPIKeyStoresLookupDigest(t *testing.T) {
+	store := newInitializedAdminStore(t)
+	rawKey := "sk-digest-key"
+	key, err := store.AddAPIKey("digest", rawKey, []string{"connect"}, nil)
+	if err != nil {
+		t.Fatalf("AddAPIKey failed: %v", err)
+	}
+	if key.LookupDigest == "" {
+		t.Fatal("new API key should store a lookup digest")
+	}
+	if key.LookupDigest != apiKeyLookupDigest(rawKey) {
+		t.Fatalf("lookup digest mismatch: got %q want %q", key.LookupDigest, apiKeyLookupDigest(rawKey))
+	}
+	var storedDigest string
+	if err := store.db.QueryRow(`SELECT lookup_digest FROM api_keys WHERE id = ?`, key.ID).Scan(&storedDigest); err != nil {
+		t.Fatalf("load lookup digest: %v", err)
+	}
+	if storedDigest != key.LookupDigest {
+		t.Fatalf("stored digest mismatch: got %q want %q", storedDigest, key.LookupDigest)
+	}
+}
+
+func TestAdminStore_ValidateClientKeyLegacyWithoutDigestFallsBack(t *testing.T) {
+	store := newInitializedAdminStore(t)
+	rawKey := "sk-legacy-key"
+	key, err := store.AddAPIKey("legacy", rawKey, []string{"connect"}, nil)
+	if err != nil {
+		t.Fatalf("AddAPIKey failed: %v", err)
+	}
+	if _, err := store.db.Exec(`UPDATE api_keys SET lookup_digest = '' WHERE id = ?`, key.ID); err != nil {
+		t.Fatalf("clear lookup digest: %v", err)
+	}
+	valid, err := store.ValidateClientKey(rawKey)
+	if !valid || err != nil {
+		t.Fatalf("legacy key without lookup digest should remain valid: valid=%v err=%v", valid, err)
+	}
+}
+
+func TestGenerateUUIDReturnsErrorOnRNGFailure(t *testing.T) {
+	original := cryptoRandRead
+	cryptoRandRead = func([]byte) (int, error) { return 0, io.ErrUnexpectedEOF }
+	t.Cleanup(func() { cryptoRandRead = original })
+
+	if id, err := generateUUIDE(); err == nil || id != "" {
+		t.Fatalf("generateUUIDE should fail without emitting an ID, id=%q err=%v", id, err)
+	}
+}
+
+func TestAdminStore_AddAPIKeyRNGFailureDoesNotPersist(t *testing.T) {
+	store := newInitializedAdminStore(t)
+	original := cryptoRandRead
+	cryptoRandRead = func([]byte) (int, error) { return 0, io.ErrUnexpectedEOF }
+	t.Cleanup(func() { cryptoRandRead = original })
+
+	if key, err := store.AddAPIKey("rng-fail", "sk-rng-fail", []string{"connect"}, nil); err == nil || key != nil {
+		t.Fatalf("AddAPIKey should fail on RNG failure without a key, key=%v err=%v", key, err)
+	}
+	if keys := store.GetAPIKeys(); len(keys) != 0 {
+		t.Fatalf("RNG failure should not persist API keys, got %d", len(keys))
 	}
 }
 

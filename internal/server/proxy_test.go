@@ -75,6 +75,60 @@ func TestStartProxy_Success(t *testing.T) {
 	_ = sConn.Close()
 }
 
+func TestStartProxy_DefaultBindIPListensWildcard(t *testing.T) {
+	s := New(0)
+	client := &ClientConn{ID: "proxy-bind-default", proxies: make(map[string]*ProxyTunnel)}
+	s.clients.Store(client.ID, client)
+	cConn, sConn := net.Pipe()
+	sSession, _ := mux.NewServerSession(sConn, mux.DefaultConfig())
+	client.dataSession = sSession
+	t.Cleanup(func() {
+		s.StopAllProxies(client)
+		_ = cConn.Close()
+		_ = sConn.Close()
+	})
+
+	req := protocol.ProxyNewRequest{Name: "wildcard", Type: protocol.ProxyTypeTCP, LocalIP: "127.0.0.1", LocalPort: 8080, RemotePort: reserveTCPPort(t)}
+	if err := s.StartProxy(client, req); err != nil {
+		t.Fatalf("StartProxy failed: %v", err)
+	}
+	client.proxyMu.RLock()
+	addr := client.proxies[req.Name].Listener.Addr().(*net.TCPAddr)
+	client.proxyMu.RUnlock()
+	if !addr.IP.IsUnspecified() {
+		t.Fatalf("omitted bind_ip should listen wildcard, got %s", addr.IP)
+	}
+}
+
+func TestStartProxy_ExplicitLoopbackBindIPUsesLoopback(t *testing.T) {
+	s := New(0)
+	client := &ClientConn{ID: "proxy-bind-loopback", proxies: make(map[string]*ProxyTunnel)}
+	s.clients.Store(client.ID, client)
+	cConn, sConn := net.Pipe()
+	sSession, _ := mux.NewServerSession(sConn, mux.DefaultConfig())
+	client.dataSession = sSession
+	t.Cleanup(func() {
+		s.StopAllProxies(client)
+		_ = cConn.Close()
+		_ = sConn.Close()
+	})
+
+	req := protocol.ProxyNewRequest{Name: "loopback", Type: protocol.ProxyTypeTCP, BindIP: "127.0.0.1", LocalIP: "127.0.0.1", LocalPort: 8080, RemotePort: reserveTCPPort(t)}
+	if err := s.StartProxy(client, req); err != nil {
+		t.Fatalf("StartProxy failed: %v", err)
+	}
+	client.proxyMu.RLock()
+	tunnel := client.proxies[req.Name]
+	addr := tunnel.Listener.Addr().(*net.TCPAddr)
+	client.proxyMu.RUnlock()
+	if !addr.IP.IsLoopback() {
+		t.Fatalf("explicit 127.0.0.1 bind should listen loopback, got %s", addr.IP)
+	}
+	if tunnel.Config.BindIP != "127.0.0.1" {
+		t.Fatalf("runtime config should preserve bind_ip, got %q", tunnel.Config.BindIP)
+	}
+}
+
 func TestStartProxy_NoDataChannel(t *testing.T) {
 	s := New(0)
 	clientID := "proxy-no-data"
