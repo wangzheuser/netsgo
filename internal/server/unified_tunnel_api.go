@@ -313,8 +313,8 @@ func unifiedTunnelProxyConfigMatchesClientRole(tunnel protocol.ProxyConfig, clie
 
 func (s *Server) handleCreateUnifiedTunnel(w http.ResponseWriter, r *http.Request) {
 	var req tunnelCreateRequestAPI
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeAPIError(w, http.StatusBadRequest, "invalid_request_body", "invalid request body")
+	if err := decodeJSONRequestBody(r, &req); err != nil {
+		writeJSONRequestDecodeError(w, err)
 		return
 	}
 
@@ -340,8 +340,8 @@ func (s *Server) handleUpdateUnifiedTunnel(w http.ResponseWriter, r *http.Reques
 	}
 
 	var req tunnelUpdateRequestAPI
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeAPIError(w, http.StatusBadRequest, "invalid_request_body", "invalid request body")
+	if err := decodeJSONRequestBody(r, &req); err != nil {
+		writeJSONRequestDecodeError(w, err)
 		return
 	}
 	if req.ExpectedRevision <= 0 {

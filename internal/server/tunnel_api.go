@@ -20,8 +20,8 @@ func (s *Server) handleUpdateDisplayName(w http.ResponseWriter, r *http.Request)
 	var req struct {
 		DisplayName string `json:"display_name"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeAPIError(w, http.StatusBadRequest, "invalid_request_body", "invalid request body")
+	if err := decodeJSONRequestBody(r, &req); err != nil {
+		writeJSONRequestDecodeError(w, err)
 		return
 	}
 
@@ -62,8 +62,8 @@ func (s *Server) handleUpdateBandwidthSettings(w http.ResponseWriter, r *http.Re
 		IngressBPS *int64 `json:"ingress_bps"`
 		EgressBPS  *int64 `json:"egress_bps"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeAPIError(w, http.StatusBadRequest, "invalid_request_body", "invalid request body")
+	if err := decodeJSONRequestBody(r, &req); err != nil {
+		writeJSONRequestDecodeError(w, err)
 		return
 	}
 	if req.IngressBPS == nil || req.EgressBPS == nil {
@@ -204,8 +204,8 @@ func (s *Server) handleCreateTunnel(w http.ResponseWriter, r *http.Request) {
 	clientID := r.PathValue("id")
 
 	var req protocol.ProxyNewRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeAPIError(w, http.StatusBadRequest, "invalid_request_body", "invalid request body")
+	if err := decodeJSONRequestBody(r, &req); err != nil {
+		writeJSONRequestDecodeError(w, err)
 		return
 	}
 	// Tunnel IDs are server-owned stable identifiers. Ignore any client-supplied
@@ -390,8 +390,8 @@ func (s *Server) handleUpdateTunnel(w http.ResponseWriter, r *http.Request) {
 		IngressBPS int64  `json:"ingress_bps"`
 		EgressBPS  int64  `json:"egress_bps"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeAPIError(w, http.StatusBadRequest, "invalid_request_body", "invalid request body")
+	if err := decodeJSONRequestBody(r, &req); err != nil {
+		writeJSONRequestDecodeError(w, err)
 		return
 	}
 	req.Name = strings.TrimSpace(req.Name)

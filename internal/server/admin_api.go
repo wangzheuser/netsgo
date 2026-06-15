@@ -69,8 +69,8 @@ func (s *Server) handleAPILogin(w http.ResponseWriter, r *http.Request) {
 		Password string `json:"password"`
 	}
 
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeAPIError(w, http.StatusBadRequest, "invalid_request_body", "invalid request body")
+	if err := decodeJSONRequestBody(r, &req); err != nil {
+		writeJSONRequestDecodeError(w, err)
 		return
 	}
 
@@ -142,8 +142,8 @@ func (s *Server) handleAPIAdminKeys(w http.ResponseWriter, r *http.Request) {
 			MaxUses     int      `json:"max_uses"`   // 0 = unlimited
 			ExpiresIn   string   `json:"expires_in"` // "1h","3h","24h","168h","" or "0" means no expiry
 		}
-		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-			writeAPIError(w, http.StatusBadRequest, "invalid_request_body", "invalid body")
+		if err := decodeJSONRequestBody(r, &req); err != nil {
+			writeJSONRequestDecodeError(w, err)
 			return
 		}
 
@@ -277,8 +277,8 @@ func (s *Server) handleAPIAdminConfig(w http.ResponseWriter, r *http.Request) {
 
 	case http.MethodPut:
 		var config ServerConfig
-		if err := json.NewDecoder(r.Body).Decode(&config); err != nil {
-			writeAPIError(w, http.StatusBadRequest, "invalid_request_body", "invalid body")
+		if err := decodeJSONRequestBody(r, &config); err != nil {
+			writeJSONRequestDecodeError(w, err)
 			return
 		}
 
