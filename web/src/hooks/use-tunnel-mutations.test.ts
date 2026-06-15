@@ -2,7 +2,7 @@ import { describe, expect, test } from 'bun:test';
 
 import { ApiError } from '@/lib/api';
 
-import { buildLegacyClientTunnelPath, shouldUseLegacyTunnelEndpoint } from './use-tunnel-mutations';
+import { legacyClientTunnelPath, shouldUseLegacyTunnelEndpoint } from './use-tunnel-mutations';
 
 describe('shouldUseLegacyTunnelEndpoint', () => {
   test('allows legacy fallback for old server-expose endpoints', () => {
@@ -19,8 +19,8 @@ describe('shouldUseLegacyTunnelEndpoint', () => {
     expect(shouldUseLegacyTunnelEndpoint(new Error('network failed'), 'server_expose')).toBe(false);
   });
 
-  test('encodes legacy client tunnel path segments', () => {
-    expect(buildLegacyClientTunnelPath('client/with?#chars')).toBe('/api/clients/client%2Fwith%3F%23chars/tunnels');
-    expect(buildLegacyClientTunnelPath('client/with?#chars', '/tun%2F1/resume')).toBe('/api/clients/client%2Fwith%3F%23chars/tunnels/tun%2F1/resume');
+  test('legacy client tunnel path encodes clientId path segments', () => {
+    expect(legacyClientTunnelPath('client/with?reserved#chars')).toBe('/api/clients/client%2Fwith%3Freserved%23chars/tunnels');
+    expect(legacyClientTunnelPath('client/with?reserved#chars', '/tunnel-1/resume')).toBe('/api/clients/client%2Fwith%3Freserved%23chars/tunnels/tunnel-1/resume');
   });
 });
