@@ -117,6 +117,7 @@ func TestOpenServerDBMigratesEmptyDatabaseToExpectedSchema(t *testing.T) {
 			{name: "id", typ: "TEXT", primaryKey: true},
 			{name: "name", typ: "TEXT", notNull: true},
 			{name: "key_hash", typ: "TEXT", notNull: true},
+			{name: "lookup_digest", typ: "TEXT", notNull: true, defaultValue: "''"},
 			{name: "created_at", typ: "TEXT", notNull: true},
 			{name: "expires_at", typ: "TEXT"},
 			{name: "is_active", typ: "INTEGER", notNull: true},
@@ -284,7 +285,10 @@ func TestOpenServerDBMigratesEmptyDatabaseToExpectedSchema(t *testing.T) {
 			{name: "idx_admin_auth_challenges_user_kind", unique: false, columns: []string{"user_id", "kind"}},
 			{name: "sqlite_autoindex_admin_auth_challenges_1", unique: true, columns: []string{"id"}},
 		},
-		"api_keys": {{name: "sqlite_autoindex_api_keys_1", unique: true, columns: []string{"id"}}},
+		"api_keys": {
+			{name: "idx_api_keys_lookup_digest", unique: false, columns: []string{"lookup_digest"}},
+			{name: "sqlite_autoindex_api_keys_1", unique: true, columns: []string{"id"}},
+		},
 		"api_key_permissions": {
 			{name: "sqlite_autoindex_api_key_permissions_1", unique: true, columns: []string{"api_key_id", "permission"}},
 		},
