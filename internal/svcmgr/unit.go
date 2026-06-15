@@ -45,7 +45,7 @@ func ReadUnitInfo(unitPath string) (UnitInfo, error) {
 		case strings.HasPrefix(line, "Group="):
 			info.Group = strings.TrimPrefix(line, "Group=")
 		case strings.HasPrefix(line, "EnvironmentFile="):
-			info.EnvironmentFile = strings.TrimPrefix(line, "EnvironmentFile=")
+			info.EnvironmentFile = unquoteSystemdArg(strings.TrimPrefix(line, "EnvironmentFile="))
 		case strings.HasPrefix(line, "ExecStart="):
 			info.ExecStart = strings.TrimPrefix(line, "ExecStart=")
 		}
@@ -140,4 +140,29 @@ func systemdQuoteArg(value string) string {
 	}
 	replacer := strings.NewReplacer(`\`, `\\`, `"`, `\"`, `$`, `$$`)
 	return `"` + replacer.Replace(value) + `"`
+}
+
+func unquoteSystemdArg(value string) string {
+	if len(value) < 2 || value[0] != '"' || value[len(value)-1] != '"' {
+		return value
+	}
+	inner := value[1 : len(value)-1]
+	var builder strings.Builder
+	escaped := false
+	for _, r := range inner {
+		if escaped {
+			builder.WriteRune(r)
+			escaped = false
+			continue
+		}
+		if r == '\\' {
+			escaped = true
+			continue
+		}
+		builder.WriteRune(r)
+	}
+	if escaped {
+		builder.WriteByte('\\')
+	}
+	return builder.String()
 }

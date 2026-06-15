@@ -1,6 +1,7 @@
 package install
 
 import (
+	"fmt"
 	"io/fs"
 	"os"
 	"os/user"
@@ -56,9 +57,12 @@ func ensureManagedRoleDirsWithRoot(root string, role svcmgr.Role, lookup userLoo
 }
 
 func chownTree(root string, uid, gid int) error {
-	return filepath.WalkDir(root, func(path string, _ fs.DirEntry, err error) error {
+	return filepath.WalkDir(root, func(path string, entry fs.DirEntry, err error) error {
 		if err != nil {
 			return err
+		}
+		if entry.Type()&fs.ModeSymlink != 0 {
+			return fmt.Errorf("refusing to chown symlink in managed directory: %s", path)
 		}
 		return os.Chown(path, uid, gid)
 	})
