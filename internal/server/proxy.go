@@ -193,6 +193,14 @@ func findTCPUDPPortConflictNames(port int, bindIP, excludeName, excludeClientID 
 	return conflicts, nil
 }
 
+func serverListenAddress(bindIP string, port int) string {
+	host := normalizeServerBindIP(bindIP)
+	if host == "0.0.0.0" {
+		host = ""
+	}
+	return net.JoinHostPort(host, strconv.Itoa(port))
+}
+
 func serverBindIPsConflict(a, b string) bool {
 	a = normalizeServerBindIP(a)
 	b = normalizeServerBindIP(b)
@@ -308,7 +316,7 @@ func (s *Server) activatePreparedTunnel(client *ClientConn, tunnel *ProxyTunnel)
 		return nil
 	}
 
-	addr := net.JoinHostPort(normalizeServerBindIP(tunnel.Config.BindIP), fmt.Sprintf("%d", tunnel.Config.RemotePort))
+	addr := serverListenAddress(tunnel.Config.BindIP, tunnel.Config.RemotePort)
 	ln, err := net.Listen("tcp", addr)
 	if err != nil {
 		return fmt.Errorf("failed to listen on %s: %w", addr, err)

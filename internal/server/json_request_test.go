@@ -37,7 +37,7 @@ func (b *trackingJSONBody) Close() error {
 }
 
 func TestDecodeJSONRequestBodyLimitAndTrailingToken(t *testing.T) {
-	t.Run("accepts exactly 128KB", func(t *testing.T) {
+	t.Run("accepts exactly 32KB", func(t *testing.T) {
 		payload := `{"v":"` + strings.Repeat("a", int(jsonRequestBodyLimitBytes)-8) + `"}`
 		if int64(len(payload)) != jsonRequestBodyLimitBytes {
 			t.Fatalf("test payload length: got %d, want %d", len(payload), jsonRequestBodyLimitBytes)
@@ -51,7 +51,7 @@ func TestDecodeJSONRequestBodyLimitAndTrailingToken(t *testing.T) {
 		}
 	})
 
-	t.Run("rejects 128KB plus one", func(t *testing.T) {
+	t.Run("rejects 32KB plus one", func(t *testing.T) {
 		payload := `{"v":"` + strings.Repeat("a", int(jsonRequestBodyLimitBytes)-7) + `"}`
 		if int64(len(payload)) != jsonRequestBodyLimitBytes+1 {
 			t.Fatalf("test payload length: got %d, want %d", len(payload), jsonRequestBodyLimitBytes+1)
@@ -93,6 +93,20 @@ func TestDecodeJSONRequestBodyLimitAndTrailingToken(t *testing.T) {
 		var dst map[string]string
 		if err := decodeOptionalJSONRequestBody(req, &dst); err != nil {
 			t.Fatalf("optional empty body should decode as zero value: %v", err)
+		}
+	})
+
+	t.Run("passkey requests accept exactly 128KB", func(t *testing.T) {
+		payload := `{"v":"` + strings.Repeat("a", int(passkeyJSONRequestBodyLimitBytes)-8) + `"}`
+		if int64(len(payload)) != passkeyJSONRequestBodyLimitBytes {
+			t.Fatalf("test payload length: got %d, want %d", len(payload), passkeyJSONRequestBodyLimitBytes)
+		}
+		req := httptest.NewRequest(http.MethodPost, "/api/auth/passkey/finish", strings.NewReader(payload))
+		var dst struct {
+			V string `json:"v"`
+		}
+		if err := decodePasskeyJSONRequestBody(req, &dst); err != nil {
+			t.Fatalf("exact passkey-limit JSON should decode: %v", err)
 		}
 	})
 }

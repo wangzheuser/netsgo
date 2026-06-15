@@ -986,7 +986,7 @@ func (s *Server) preflightServerIngressResource(req tunnelCreateRequestAPI) erro
 			return newProxyRequestValidationError(fmt.Errorf("port %d is not in the allowed range", cfg.Port), "ingress.config.port", "", http.StatusBadRequest)
 		}
 	}
-	addr := net.JoinHostPort(normalizeServerBindIP(cfg.BindIP), fmt.Sprintf("%d", cfg.Port))
+	addr := serverListenAddress(cfg.BindIP, cfg.Port)
 	if req.Ingress.Type == tunnelIngressTypeUDPListen {
 		conn, err := net.ListenPacket("udp", addr)
 		if err != nil {

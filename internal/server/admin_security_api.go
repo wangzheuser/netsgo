@@ -200,7 +200,7 @@ func (s *Server) handleAPIPasskeyLoginFinish(w http.ResponseWriter, r *http.Requ
 		ChallengeID string          `json:"challenge_id"`
 		Credential  json.RawMessage `json:"credential"`
 	}
-	if err := decodeJSONRequestBody(r, &req); err != nil {
+	if err := decodePasskeyJSONRequestBody(r, &req); err != nil {
 		writeJSONRequestDecodeError(w, err)
 		return
 	}
@@ -631,7 +631,7 @@ func (s *Server) handleAPIAdminSecurityPasskeyFinish(w http.ResponseWriter, r *h
 		ChallengeID string          `json:"challenge_id"`
 		Credential  json.RawMessage `json:"credential"`
 	}
-	if err := decodeJSONRequestBody(r, &req); err != nil {
+	if err := decodePasskeyJSONRequestBody(r, &req); err != nil {
 		writeJSONRequestDecodeError(w, err)
 		return
 	}

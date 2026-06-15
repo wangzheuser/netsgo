@@ -75,6 +75,26 @@ func TestStartProxy_Success(t *testing.T) {
 	_ = sConn.Close()
 }
 
+func TestServerListenAddressPreservesWildcardHost(t *testing.T) {
+	tests := []struct {
+		name   string
+		bindIP string
+		want   string
+	}{
+		{name: "empty", bindIP: "", want: ":1234"},
+		{name: "wildcard", bindIP: "0.0.0.0", want: ":1234"},
+		{name: "trimmed wildcard", bindIP: " 0.0.0.0 ", want: ":1234"},
+		{name: "loopback", bindIP: "127.0.0.1", want: "127.0.0.1:1234"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := serverListenAddress(tt.bindIP, 1234); got != tt.want {
+				t.Fatalf("serverListenAddress(%q, 1234) = %q, want %q", tt.bindIP, got, tt.want)
+			}
+		})
+	}
+}
+
 func TestStartProxy_DefaultBindIPListensWildcard(t *testing.T) {
 	s := New(0)
 	client := &ClientConn{ID: "proxy-bind-default", proxies: make(map[string]*ProxyTunnel)}

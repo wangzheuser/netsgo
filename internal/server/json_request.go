@@ -10,19 +10,26 @@ import (
 	"strings"
 )
 
-const jsonRequestBodyLimitBytes int64 = 128 << 10
+const (
+	jsonRequestBodyLimitBytes        int64 = 32 << 10
+	passkeyJSONRequestBodyLimitBytes int64 = 128 << 10
+)
 
 var errJSONRequestBodyTooLarge = errors.New("json request body too large")
 
 func decodeJSONRequestBody(r *http.Request, dst any) error {
-	return decodeJSONRequestBodyWithPolicy(r, dst, false)
+	return decodeJSONRequestBodyWithPolicy(r, dst, jsonRequestBodyLimitBytes, false)
+}
+
+func decodePasskeyJSONRequestBody(r *http.Request, dst any) error {
+	return decodeJSONRequestBodyWithPolicy(r, dst, passkeyJSONRequestBodyLimitBytes, false)
 }
 
 func decodeOptionalJSONRequestBody(r *http.Request, dst any) error {
-	return decodeJSONRequestBodyWithPolicy(r, dst, true)
+	return decodeJSONRequestBodyWithPolicy(r, dst, jsonRequestBodyLimitBytes, true)
 }
 
-func decodeJSONRequestBodyWithPolicy(r *http.Request, dst any, allowEmpty bool) error {
+func decodeJSONRequestBodyWithPolicy(r *http.Request, dst any, limit int64, allowEmpty bool) error {
 	if r.Body == nil || r.Body == http.NoBody {
 		if allowEmpty {
 			return nil
@@ -37,12 +44,12 @@ func decodeJSONRequestBodyWithPolicy(r *http.Request, dst any, allowEmpty bool) 
 		_ = r.Body.Close()
 	}()
 
-	limited := io.LimitReader(r.Body, jsonRequestBodyLimitBytes+1)
+	limited := io.LimitReader(r.Body, limit+1)
 	body, err := io.ReadAll(limited)
 	if err != nil {
 		return err
 	}
-	if int64(len(body)) > jsonRequestBodyLimitBytes {
+	if int64(len(body)) > limit {
 		shouldDrain = false
 		return errJSONRequestBodyTooLarge
 	}

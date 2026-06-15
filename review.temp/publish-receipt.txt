@@ -1,4 +1,0 @@
-branch=security-review-2026-06-12
-pushed=true
-remote=origin
-pr_url=https://github.com/zsio/netsgo/pull/new/security-review-2026-06-12
