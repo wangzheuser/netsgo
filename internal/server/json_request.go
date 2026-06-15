@@ -29,8 +29,11 @@ func decodeJSONRequestBodyWithPolicy(r *http.Request, dst any, allowEmpty bool) 
 		}
 		return io.ErrUnexpectedEOF
 	}
+	shouldDrain := true
 	defer func() {
-		_, _ = io.Copy(io.Discard, r.Body)
+		if shouldDrain {
+			_, _ = io.Copy(io.Discard, r.Body)
+		}
 		_ = r.Body.Close()
 	}()
 
@@ -40,6 +43,7 @@ func decodeJSONRequestBodyWithPolicy(r *http.Request, dst any, allowEmpty bool) 
 		return err
 	}
 	if int64(len(body)) > jsonRequestBodyLimitBytes {
+		shouldDrain = false
 		return errJSONRequestBodyTooLarge
 	}
 	if allowEmpty && strings.TrimSpace(string(body)) == "" {

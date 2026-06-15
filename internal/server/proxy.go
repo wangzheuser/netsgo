@@ -109,7 +109,7 @@ func (s *Server) validateProxyRequestWithExclusions(client *ClientConn, req prot
 		}
 	}
 
-	conflicts, err := findTCPUDPPortConflictNames(req.RemotePort, excludeName, excludeClientID, s)
+	conflicts, err := findTCPUDPPortConflictNames(req.RemotePort, req.BindIP, excludeName, excludeClientID, s)
 	if err != nil {
 		return newProxyRequestValidationError(fmt.Errorf("failed to check port conflicts: %w", err), protocol.TunnelMutationFieldRemotePort, "", http.StatusServiceUnavailable)
 	}
@@ -142,14 +142,15 @@ func serverListenPort(s *Server) int {
 	return 0
 }
 
-func findTCPUDPPortConflictNames(port int, excludeName, excludeClientID string, server *Server) ([]string, error) {
+func findTCPUDPPortConflictNames(port int, bindIP, excludeName, excludeClientID string, server *Server) ([]string, error) {
 	if port <= 0 || server == nil {
 		return []string{}, nil
 	}
 
+	bindIP = normalizeServerBindIP(bindIP)
 	conflicts := []string{}
 	seen := map[string]struct{}{}
-	matchAndAppend := func(clientID, name, tunnelType string, remotePort int) {
+	matchAndAppend := func(clientID, name, tunnelType string, remotePort int, tunnelBindIP string) {
 		if tunnelType != protocol.ProxyTypeTCP && tunnelType != protocol.ProxyTypeUDP {
 			return
 		}
@@ -157,6 +158,9 @@ func findTCPUDPPortConflictNames(port int, excludeName, excludeClientID string, 
 			return
 		}
 		if remotePort != port {
+			return
+		}
+		if !serverBindIPsConflict(bindIP, tunnelBindIP) {
 			return
 		}
 
@@ -170,7 +174,7 @@ func findTCPUDPPortConflictNames(port int, excludeName, excludeClientID string, 
 
 	server.RangeClients(func(clientID string, client *ClientConn) bool {
 		client.RangeProxies(func(name string, tunnel *ProxyTunnel) bool {
-			matchAndAppend(clientID, name, tunnel.Config.Type, tunnel.Config.RemotePort)
+			matchAndAppend(clientID, name, tunnel.Config.Type, tunnel.Config.RemotePort, tunnel.Config.BindIP)
 			return true
 		})
 		return true
@@ -182,11 +186,17 @@ func findTCPUDPPortConflictNames(port int, excludeName, excludeClientID string, 
 			return nil, fmt.Errorf("load persisted tunnels for proxy conflict detection: %w", err)
 		}
 		for _, tunnel := range allTunnels {
-			matchAndAppend(tunnel.ClientID, tunnel.Name, tunnel.Type, tunnel.RemotePort)
+			matchAndAppend(tunnel.ClientID, tunnel.Name, tunnel.Type, tunnel.RemotePort, tunnel.BindIP)
 		}
 	}
 
 	return conflicts, nil
+}
+
+func serverBindIPsConflict(a, b string) bool {
+	a = normalizeServerBindIP(a)
+	b = normalizeServerBindIP(b)
+	return a == "0.0.0.0" || b == "0.0.0.0" || a == b
 }
 
 func (s *Server) ensureClientDataReady(client *ClientConn) error {

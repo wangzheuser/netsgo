@@ -1705,6 +1705,17 @@ func apiKeyLookupDigest(raw string) string {
 
 func candidateAPIKeysForRaw(q dbQuerier, raw string) ([]APIKey, error) {
 	digest := apiKeyLookupDigest(raw)
+	keys, err := loadAPIKeysByLookupDigest(q, digest)
+	if err != nil {
+		return nil, err
+	}
+	if len(keys) > 0 {
+		return keys, nil
+	}
+	return loadAPIKeysByLookupDigest(q, "")
+}
+
+func loadAPIKeysByLookupDigest(q dbQuerier, digest string) ([]APIKey, error) {
 	rows, err := q.Query(`SELECT `+apiKeySelectColumns()+` FROM api_keys WHERE lookup_digest = ? ORDER BY created_at, id`, digest)
 	if err != nil {
 		return nil, err
@@ -1733,9 +1744,8 @@ func candidateAPIKeysForRaw(q dbQuerier, raw string) ([]APIKey, error) {
 			}
 			keys[i].Permissions = permissions
 		}
-		return keys, nil
 	}
-	return loadAPIKeys(q)
+	return keys, nil
 }
 
 // ========== Client Tokens ==========

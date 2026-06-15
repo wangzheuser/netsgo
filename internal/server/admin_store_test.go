@@ -713,6 +713,38 @@ func TestAdminStore_ValidateClientKeyLegacyWithoutDigestFallsBack(t *testing.T) 
 	}
 }
 
+func TestCandidateAPIKeysForRawFallbackOnlyLoadsLegacyKeys(t *testing.T) {
+	store := newInitializedAdminStore(t)
+	rawKey := "sk-modern-key"
+	modern, err := store.AddAPIKey("modern", rawKey, []string{"connect"}, nil)
+	if err != nil {
+		t.Fatalf("AddAPIKey modern failed: %v", err)
+	}
+	legacy, err := store.AddAPIKey("legacy", "sk-legacy-key", []string{"connect"}, nil)
+	if err != nil {
+		t.Fatalf("AddAPIKey legacy failed: %v", err)
+	}
+	if _, err := store.db.Exec(`UPDATE api_keys SET lookup_digest = '' WHERE id = ?`, legacy.ID); err != nil {
+		t.Fatalf("clear legacy lookup digest: %v", err)
+	}
+
+	keys, err := candidateAPIKeysForRaw(store.db, "sk-invalid-key")
+	if err != nil {
+		t.Fatalf("candidateAPIKeysForRaw invalid failed: %v", err)
+	}
+	if len(keys) != 1 || keys[0].ID != legacy.ID {
+		t.Fatalf("invalid digest fallback should only load legacy keys, got %+v", keys)
+	}
+
+	keys, err = candidateAPIKeysForRaw(store.db, rawKey)
+	if err != nil {
+		t.Fatalf("candidateAPIKeysForRaw modern failed: %v", err)
+	}
+	if len(keys) != 1 || keys[0].ID != modern.ID {
+		t.Fatalf("matching digest should load only matching modern key, got %+v", keys)
+	}
+}
+
 func TestGenerateUUIDReturnsErrorOnRNGFailure(t *testing.T) {
 	original := cryptoRandRead
 	cryptoRandRead = func([]byte) (int, error) { return 0, io.ErrUnexpectedEOF }

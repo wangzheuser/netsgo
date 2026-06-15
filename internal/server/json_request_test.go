@@ -3,11 +3,38 @@ package server
 import (
 	"bytes"
 	"errors"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
 )
+
+type trackingJSONBody struct {
+	data        string
+	readOffset  int
+	readCalls   int
+	closed      bool
+	readPastCap bool
+}
+
+func (b *trackingJSONBody) Read(p []byte) (int, error) {
+	b.readCalls++
+	if b.readOffset >= len(b.data) {
+		return 0, io.EOF
+	}
+	n := copy(p, b.data[b.readOffset:])
+	b.readOffset += n
+	if b.readOffset > int(jsonRequestBodyLimitBytes)+1 {
+		b.readPastCap = true
+	}
+	return n, nil
+}
+
+func (b *trackingJSONBody) Close() error {
+	b.closed = true
+	return nil
+}
 
 func TestDecodeJSONRequestBodyLimitAndTrailingToken(t *testing.T) {
 	t.Run("accepts exactly 128KB", func(t *testing.T) {
@@ -34,6 +61,22 @@ func TestDecodeJSONRequestBodyLimitAndTrailingToken(t *testing.T) {
 		err := decodeJSONRequestBody(req, &dst)
 		if !errors.Is(err, errJSONRequestBodyTooLarge) {
 			t.Fatalf("oversize JSON should return errJSONRequestBodyTooLarge, got %v", err)
+		}
+	})
+
+	t.Run("oversize body is closed without draining the tail", func(t *testing.T) {
+		body := &trackingJSONBody{data: strings.Repeat("x", int(jsonRequestBodyLimitBytes)+32)}
+		req := httptest.NewRequest(http.MethodPost, "/api/test", body)
+		var dst map[string]string
+		err := decodeJSONRequestBody(req, &dst)
+		if !errors.Is(err, errJSONRequestBodyTooLarge) {
+			t.Fatalf("oversize JSON should return errJSONRequestBodyTooLarge, got %v", err)
+		}
+		if !body.closed {
+			t.Fatal("oversize body should still be closed")
+		}
+		if body.readPastCap {
+			t.Fatalf("oversize body should not be drained after the cap, read offset=%d", body.readOffset)
 		}
 	})
 
