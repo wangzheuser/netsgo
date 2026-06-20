@@ -11,6 +11,7 @@ import (
 
 	"github.com/hashicorp/yamux"
 
+	"netsgo/internal/socks5wire"
 	"netsgo/pkg/mux"
 	"netsgo/pkg/protocol"
 )
@@ -415,6 +416,146 @@ func TestClientRelaySOCKS5CopiesDynamicTargetHeader(t *testing.T) {
 	}
 }
 
+func TestClientRelaySOCKS5DialResultIsNotCountedAsPayload(t *testing.T) {
+	s := New(0)
+	s.store = newTestTunnelStore(t)
+	trafficStore, cleanupTraffic := newTestTrafficStore(t)
+	defer cleanupTraffic()
+	s.trafficStore = trafficStore
+
+	stored := testClientRelayStoredTunnel(t)
+	stored.Ingress.Type = protocol.IngressTypeSOCKS5Listen
+	stored.Ingress.Config = mustRawJSON(protocol.SOCKS5ListenConfig{
+		BindIP:             "127.0.0.1",
+		Port:               18080,
+		AllowedSourceCIDRs: []string{"127.0.0.0/8"},
+		Auth:               protocol.SOCKS5AuthConfig{Type: protocol.SOCKS5AuthTypeNone},
+	})
+	stored.Target.Type = protocol.TargetTypeSOCKS5ConnectHandler
+	stored.Target.Config = mustRawJSON(protocol.SOCKS5ConnectHandlerConfig{
+		AllowedTargetCIDRs: []string{"0.0.0.0/0", "::/0"},
+		DialTimeoutSeconds: 5,
+	})
+	mustAddStableTunnel(t, s.store, stored)
+	s.c2c.set(stored)
+
+	targetPipe, serverPipe := net.Pipe()
+	defer mustClose(t, targetPipe)
+	defer mustClose(t, serverPipe)
+	targetClientSession, err := mux.NewClientSession(targetPipe, mux.DefaultConfig())
+	if err != nil {
+		t.Fatalf("target client session: %v", err)
+	}
+	defer mustClose(t, targetClientSession)
+	serverTargetSession, err := mux.NewServerSession(serverPipe, mux.DefaultConfig())
+	if err != nil {
+		t.Fatalf("server target session: %v", err)
+	}
+	defer mustClose(t, serverTargetSession)
+
+	targetClient := &ClientConn{
+		ID:          stored.Target.ClientID,
+		proxies:     make(map[string]*ProxyTunnel),
+		dataSession: serverTargetSession,
+		generation:  1,
+		state:       clientStateLive,
+	}
+	s.clients.Store(targetClient.ID, targetClient)
+	ingressClient := &ClientConn{
+		ID:         stored.Ingress.ClientID,
+		proxies:    make(map[string]*ProxyTunnel),
+		generation: 1,
+		state:      clientStateLive,
+	}
+
+	targetStreamCh := make(chan net.Conn, 1)
+	go func() {
+		stream, err := targetClientSession.AcceptStream()
+		if err != nil {
+			targetStreamCh <- nil
+			return
+		}
+		targetStreamCh <- stream
+	}()
+
+	ingressStream, relayStream := net.Pipe()
+	defer mustClose(t, ingressStream)
+	defer mustClose(t, relayStream)
+	header := testClientRelayHeader(stored)
+	header.TargetHost = "example.com"
+	header.TargetPort = 443
+	header.TargetAddrType = protocol.SOCKS5AddrTypeDomain
+	header.OriginalHost = "example.com"
+
+	done := make(chan struct{})
+	go func() {
+		s.handleClientOpenedDataStream(ingressClient, relayStream, header)
+		close(done)
+	}()
+
+	var targetStream net.Conn
+	select {
+	case targetStream = <-targetStreamCh:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for target stream")
+	}
+	if targetStream == nil {
+		t.Fatal("target stream failed to open")
+	}
+	defer mustClose(t, targetStream)
+
+	if _, err := protocol.DecodeDataStreamHeader(targetStream); err != nil {
+		t.Fatalf("decode target stream header: %v", err)
+	}
+	dialResult := protocol.SOCKS5DialResult{Status: protocol.SOCKS5DialStatusSuccess}
+	if err := socks5wire.WriteDialResult(targetStream, dialResult); err != nil {
+		t.Fatalf("write target dial result: %v", err)
+	}
+	mustSetReadDeadline(t, ingressStream, time.Now().Add(2*time.Second))
+	gotResult, err := socks5wire.ReadDialResult(ingressStream)
+	if err != nil {
+		t.Fatalf("read ingress dial result: %v", err)
+	}
+	if gotResult.Status != protocol.SOCKS5DialStatusSuccess {
+		t.Fatalf("dial result mismatch: %+v", gotResult)
+	}
+
+	payload := []byte("socks5 payload")
+	response := []byte("socks5 response")
+	if _, err := ingressStream.Write(payload); err != nil {
+		t.Fatalf("write ingress payload: %v", err)
+	}
+	targetBuf := make([]byte, len(payload))
+	mustSetReadDeadline(t, targetStream, time.Now().Add(2*time.Second))
+	if _, err := io.ReadFull(targetStream, targetBuf); err != nil {
+		t.Fatalf("read target payload: %v", err)
+	}
+	if !bytes.Equal(targetBuf, payload) {
+		t.Fatalf("target payload mismatch: got %q want %q", targetBuf, payload)
+	}
+	if _, err := targetStream.Write(response); err != nil {
+		t.Fatalf("write target response: %v", err)
+	}
+	ingressBuf := make([]byte, len(response))
+	mustSetReadDeadline(t, ingressStream, time.Now().Add(2*time.Second))
+	if _, err := io.ReadFull(ingressStream, ingressBuf); err != nil {
+		t.Fatalf("read ingress response: %v", err)
+	}
+	if !bytes.Equal(ingressBuf, response) {
+		t.Fatalf("ingress response mismatch: got %q want %q", ingressBuf, response)
+	}
+
+	_ = ingressStream.Close()
+	_ = targetStream.Close()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("SOCKS5 relay did not stop after streams closed")
+	}
+
+	assertClientRelayTrafficBucket(t, s, trafficStore, stored, uint64(len(payload)), uint64(len(response)))
+}
+
 func TestClientRelayRejectsStaleRevision(t *testing.T) {
 	s := New(0)
 	stored := testClientRelayStoredTunnel(t)
@@ -787,6 +928,36 @@ func TestClientRelayIngressProvisionFailureUnprovisionsTarget(t *testing.T) {
 	req := readTunnelUnprovision(t, targetWS)
 	if req.TunnelID != stored.ID || req.Revision != stored.Revision || req.Role != protocol.DataStreamRoleTarget || req.Reason != "ingress_provision_failed" {
 		t.Fatalf("target cleanup unprovision mismatch: %+v", req)
+	}
+}
+
+func TestClientRelaySOCKS5TargetProvisionDoesNotReceiveIngressPasswordHash(t *testing.T) {
+	stored := testClientRelayStoredTunnel(t)
+	stored.Ingress.Type = protocol.IngressTypeSOCKS5Listen
+	stored.Ingress.Config = mustRawJSON(protocol.SOCKS5ListenConfig{
+		BindIP:             "127.0.0.1",
+		Port:               1080,
+		AllowedSourceCIDRs: []string{"127.0.0.0/8"},
+		Auth: protocol.SOCKS5AuthConfig{
+			Type:         protocol.SOCKS5AuthTypeUsernamePassword,
+			Username:     "alice",
+			PasswordHash: "$argon2id$v=19$m=65536,t=3,p=1$c2FsdA$Ynl0ZXM",
+		},
+	})
+	stored.Target.Type = protocol.TargetTypeSOCKS5ConnectHandler
+	stored.Target.Config = mustRawJSON(protocol.SOCKS5ConnectHandlerConfig{
+		AllowedTargetCIDRs: []string{"0.0.0.0/0", "::/0"},
+		DialTimeoutSeconds: 10,
+	})
+
+	targetSpec := tunnelSpecProtocolForRole(stored, protocol.ProxyRuntimeStatePending, protocol.DataStreamRoleTarget)
+	if bytes.Contains(targetSpec.Ingress.Config, []byte("password_hash")) {
+		t.Fatalf("target provision should not receive ingress password hash: %s", string(targetSpec.Ingress.Config))
+	}
+
+	ingressSpec := tunnelSpecProtocolForRole(stored, protocol.ProxyRuntimeStatePending, protocol.DataStreamRoleIngress)
+	if !bytes.Contains(ingressSpec.Ingress.Config, []byte("password_hash")) {
+		t.Fatalf("ingress provision should retain ingress password hash: %s", string(ingressSpec.Ingress.Config))
 	}
 }
 

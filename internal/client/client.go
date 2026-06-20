@@ -496,6 +496,10 @@ func (c *Client) cleanup() {
 		c.proxies.Delete(key)
 		return true
 	})
+	c.socks5Targets.Range(func(key, _ any) bool {
+		c.socks5Targets.Delete(key)
+		return true
+	})
 	c.tunnels.Range(func(key, value any) bool {
 		if rt, ok := value.(*clientTunnelRuntime); ok {
 			rt.close()

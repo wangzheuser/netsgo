@@ -543,6 +543,66 @@ func TestAPI_UnifiedTunnelSOCKS5PasswordIsWriteOnly(t *testing.T) {
 	}
 }
 
+func TestStoredTunnelViewConfigRedactsSOCKS5PasswordHash(t *testing.T) {
+	s, _, _, cleanup := setupTestServerWithStores(t, true)
+	defer cleanup()
+
+	stored := StoredTunnel{
+		ProxyNewRequest: protocol.ProxyNewRequest{
+			ID:         "socks5-view-redact-id",
+			Name:       "socks5-view-redact",
+			Type:       protocol.ProxyTypeTCP,
+			RemotePort: 1080,
+		},
+		ClientID:        "target-client",
+		OwnerClientID:   "target-client",
+		Binding:         TunnelBindingClientID,
+		Revision:        1,
+		Topology:        TunnelTopologyServerExpose,
+		DesiredState:    protocol.ProxyDesiredStateRunning,
+		RuntimeState:    protocol.ProxyRuntimeStateOffline,
+		TransportPolicy: protocol.TransportPolicyServerRelayOnly,
+		ActualTransport: protocol.ActualTransportUnknown,
+		P2P:             P2PState{State: TunnelP2PStateIdle},
+		Ingress: EndpointSpec{
+			Location: protocol.EndpointLocationServer,
+			Type:     protocol.IngressTypeSOCKS5Listen,
+			Config: mustRawJSON(protocol.SOCKS5ListenConfig{
+				BindIP:             "0.0.0.0",
+				Port:               1080,
+				AllowedSourceCIDRs: []string{"0.0.0.0/0", "::/0"},
+				Auth: protocol.SOCKS5AuthConfig{
+					Type:         protocol.SOCKS5AuthTypeUsernamePassword,
+					Username:     "alice",
+					PasswordHash: "$argon2id$v=19$m=65536,t=3,p=1$c2FsdA$Ynl0ZXM",
+				},
+			}),
+		},
+		Target: EndpointSpec{
+			Location: protocol.EndpointLocationClient,
+			ClientID: "target-client",
+			Type:     protocol.TargetTypeSOCKS5ConnectHandler,
+			Config: mustRawJSON(protocol.SOCKS5ConnectHandlerConfig{
+				AllowedTargetCIDRs: []string{"0.0.0.0/0", "::/0"},
+				DialTimeoutSeconds: 10,
+			}),
+		},
+		CreatedAt: time.Now().UTC(),
+		UpdatedAt: time.Now().UTC(),
+	}
+	if err := stored.normalize(); err != nil {
+		t.Fatalf("normalize stored tunnel: %v", err)
+	}
+	view := s.storedTunnelViewConfig(stored)
+	raw, err := json.Marshal(view)
+	if err != nil {
+		t.Fatalf("marshal view: %v", err)
+	}
+	if bytes.Contains(raw, []byte("password_hash")) || bytes.Contains(raw, []byte("$argon2id")) {
+		t.Fatalf("stored tunnel view should redact password hash: %s", string(raw))
+	}
+}
+
 func TestAPI_UnifiedTunnelRejectsFutureTargetsAndDirectPolicies(t *testing.T) {
 	s, handler, token, cleanup := setupTestServerWithStores(t, true)
 	defer cleanup()

@@ -13,17 +13,26 @@ import (
 )
 
 type socks5ServerListenRuntimeConfig struct {
-	config      protocol.SOCKS5ListenConfig
-	sourceCIDRs []*net.IPNet
+	config             protocol.SOCKS5ListenConfig
+	sourceCIDRs        []*net.IPNet
+	dialTimeoutSeconds int
 }
+
+const socks5HandshakeTimeout = 10 * time.Second
 
 func isSOCKS5ServerExpose(config protocol.ProxyConfig) bool {
 	return config.Topology == protocol.TunnelTopologyServerExpose &&
 		config.Ingress != nil &&
-		config.Ingress.Type == protocol.IngressTypeSOCKS5Listen
+		config.Ingress.Type == protocol.IngressTypeSOCKS5Listen &&
+		config.Target != nil &&
+		config.Target.Type == protocol.TargetTypeSOCKS5ConnectHandler
 }
 
 func decodeSOCKS5ServerListenRuntimeConfig(raw []byte) (socks5ServerListenRuntimeConfig, error) {
+	return decodeSOCKS5ServerListenRuntimeConfigFromSpec(raw, nil)
+}
+
+func decodeSOCKS5ServerListenRuntimeConfigFromSpec(raw []byte, targetRaw []byte) (socks5ServerListenRuntimeConfig, error) {
 	var cfg protocol.SOCKS5ListenConfig
 	if err := json.Unmarshal(raw, &cfg); err != nil {
 		return socks5ServerListenRuntimeConfig{}, err
@@ -32,7 +41,17 @@ func decodeSOCKS5ServerListenRuntimeConfig(raw []byte) (socks5ServerListenRuntim
 	if err != nil {
 		return socks5ServerListenRuntimeConfig{}, err
 	}
-	return socks5ServerListenRuntimeConfig{config: cfg, sourceCIDRs: cidrs}, nil
+	dialTimeoutSeconds := 10
+	if len(targetRaw) > 0 {
+		var targetCfg protocol.SOCKS5ConnectHandlerConfig
+		if err := json.Unmarshal(targetRaw, &targetCfg); err != nil {
+			return socks5ServerListenRuntimeConfig{}, err
+		}
+		if targetCfg.DialTimeoutSeconds > 0 {
+			dialTimeoutSeconds = targetCfg.DialTimeoutSeconds
+		}
+	}
+	return socks5ServerListenRuntimeConfig{config: cfg, sourceCIDRs: cidrs, dialTimeoutSeconds: dialTimeoutSeconds}, nil
 }
 
 func parseRuntimeCIDRs(values []string) ([]*net.IPNet, error) {
@@ -71,7 +90,11 @@ func (s *Server) activatePreparedSOCKS5ServerExposeTunnel(client *ClientConn, tu
 	if tunnel.Config.Ingress == nil {
 		return fmt.Errorf("SOCKS5 tunnel %q missing ingress endpoint config", tunnel.Config.Name)
 	}
-	listenCfg, err := decodeSOCKS5ServerListenRuntimeConfig(tunnel.Config.Ingress.Config)
+	var targetConfig []byte
+	if tunnel.Config.Target != nil {
+		targetConfig = tunnel.Config.Target.Config
+	}
+	listenCfg, err := decodeSOCKS5ServerListenRuntimeConfigFromSpec(tunnel.Config.Ingress.Config, targetConfig)
 	if err != nil {
 		return fmt.Errorf("decode SOCKS5 ingress config: %w", err)
 	}
@@ -131,10 +154,12 @@ func (s *Server) handleSOCKS5ProxyConn(client *ClientConn, tunnel *ProxyTunnel, 
 	if !sourceAddressAllowed(extConn.RemoteAddr(), listenCfg.sourceCIDRs) {
 		return
 	}
+	_ = extConn.SetDeadline(time.Now().Add(socks5HandshakeTimeout))
 	request, ok := socks5wire.ServeHandshake(extConn, listenCfg.config)
 	if !ok {
 		return
 	}
+	_ = extConn.SetDeadline(time.Time{})
 	stream, err := s.openSOCKS5StreamToClient(client, tunnel, request)
 	if err != nil {
 		log.Printf("⚠️ SOCKS5 proxy [%s] open stream failed: %v", tunnel.Config.Name, err)
@@ -144,7 +169,9 @@ func (s *Server) handleSOCKS5ProxyConn(client *ClientConn, tunnel *ProxyTunnel, 
 	}
 	defer func() { _ = stream.Close() }()
 
+	_ = stream.SetReadDeadline(time.Now().Add(time.Duration(listenCfg.dialTimeoutSeconds) * time.Second))
 	result, err := socks5wire.ReadDialResult(stream)
+	_ = stream.SetReadDeadline(time.Time{})
 	if err != nil {
 		_ = socks5wire.WriteReply(extConn, socks5wire.RepGeneralFailure, "", 0)
 		return

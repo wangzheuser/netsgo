@@ -9,6 +9,7 @@ import (
 	"sync"
 	"time"
 
+	"netsgo/internal/socks5wire"
 	"netsgo/pkg/mux"
 	"netsgo/pkg/protocol"
 )
@@ -134,7 +135,7 @@ func (s *Server) reconcileClientRelayTunnel(stored StoredTunnel) error {
 		TunnelID: stored.ID,
 		Revision: stored.Revision,
 		Role:     protocol.DataStreamRoleTarget,
-		Spec:     tunnelSpecProtocolFromStored(stored, protocol.ProxyRuntimeStatePending),
+		Spec:     tunnelSpecProtocolForRole(stored, protocol.ProxyRuntimeStatePending, protocol.DataStreamRoleTarget),
 	}); err != nil {
 		if cleanupErr := s.unprovisionClientRelayTunnel(stored, "target_provision_failed"); cleanupErr != nil {
 			log.Printf("⚠️ failed to clean up client relay tunnel %s after target provision failure: %v", stored.ID, cleanupErr)
@@ -147,7 +148,7 @@ func (s *Server) reconcileClientRelayTunnel(stored StoredTunnel) error {
 		TunnelID: stored.ID,
 		Revision: stored.Revision,
 		Role:     protocol.DataStreamRoleIngress,
-		Spec:     tunnelSpecProtocolFromStored(stored, protocol.ProxyRuntimeStatePending),
+		Spec:     tunnelSpecProtocolForRole(stored, protocol.ProxyRuntimeStatePending, protocol.DataStreamRoleIngress),
 	}); err != nil {
 		if cleanupErr := s.unprovisionClientRelayTunnel(stored, "ingress_provision_failed"); cleanupErr != nil {
 			log.Printf("⚠️ failed to clean up client relay tunnel %s after ingress provision failure: %v", stored.ID, cleanupErr)
@@ -276,6 +277,10 @@ func (s *Server) notifyClientTunnelUnprovision(client *ClientConn, tunnelID stri
 }
 
 func tunnelSpecProtocolFromStored(stored StoredTunnel, runtimeState string) protocol.TunnelSpec {
+	return tunnelSpecProtocolForRole(stored, runtimeState, "")
+}
+
+func tunnelSpecProtocolForRole(stored StoredTunnel, runtimeState, role string) protocol.TunnelSpec {
 	actual := stored.ActualTransport
 	if actual == "" {
 		actual = protocol.ActualTransportUnknown
@@ -292,8 +297,8 @@ func tunnelSpecProtocolFromStored(stored StoredTunnel, runtimeState string) prot
 		Revision:        stored.Revision,
 		Topology:        stored.Topology,
 		OwnerClientID:   stored.OwnerClientID,
-		Ingress:         endpointSpecProtocolFromStored(stored.Ingress),
-		Target:          endpointSpecProtocolFromStored(stored.Target),
+		Ingress:         endpointSpecProtocolFromStoredForRole(stored.Ingress, role),
+		Target:          endpointSpecProtocolFromStoredForRole(stored.Target, role),
 		TransportPolicy: stored.TransportPolicy,
 		ActualTransport: actual,
 		P2P:             protocol.P2PState{State: stored.P2P.State, Error: stored.P2P.Error, SessionID: stored.P2P.SessionID},
@@ -309,11 +314,19 @@ func tunnelSpecProtocolFromStored(stored StoredTunnel, runtimeState string) prot
 }
 
 func endpointSpecProtocolFromStored(endpoint EndpointSpec) protocol.EndpointSpec {
+	return endpointSpecProtocolFromStoredForRole(endpoint, "")
+}
+
+func endpointSpecProtocolFromStoredForRole(endpoint EndpointSpec, role string) protocol.EndpointSpec {
+	config := endpoint.Config
+	if role == protocol.DataStreamRoleTarget && endpoint.Type == protocol.IngressTypeSOCKS5Listen {
+		config = redactSOCKS5ListenConfig(endpoint.Config)
+	}
 	return protocol.EndpointSpec{
 		Location: endpoint.Location,
 		ClientID: endpoint.ClientID,
 		Type:     endpoint.Type,
-		Config:   endpoint.Config,
+		Config:   config,
 	}
 }
 
@@ -357,10 +370,24 @@ func (s *Server) handleClientOpenedDataStream(openClient *ClientConn, openStream
 		s.relayClientUDPFrames(stored, targetStream, openStream, targetClient.BandwidthRuntime(), s.c2c.limits(stored.ID))
 		return
 	}
+	if stored.Ingress.Type == TunnelIngressTypeSOCKS5Listen {
+		if err := relaySOCKS5DialResultFrame(openStream, targetStream); err != nil {
+			log.Printf("⚠️ client relay SOCKS5 dial result failed [%s]: %v", stored.ID, err)
+			return
+		}
+	}
 
 	_, _ = relayTunnelPayload(targetStream, openStream, targetClient.BandwidthRuntime(), s.c2c.limits(stored.ID), func(ingressBytes, egressBytes uint64) {
 		s.recordStoredTunnelTrafficAt(time.Now(), stored, ingressBytes, egressBytes)
 	})
+}
+
+func relaySOCKS5DialResultFrame(ingressStream, targetStream net.Conn) error {
+	result, err := socks5wire.ReadDialResult(targetStream)
+	if err != nil {
+		return err
+	}
+	return socks5wire.WriteDialResult(ingressStream, result)
 }
 
 func (s *Server) relayClientUDPFrames(stored StoredTunnel, targetStream, ingressStream net.Conn, clientRuntime, tunnelRuntime *directionalBandwidthRuntime) {

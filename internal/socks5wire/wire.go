@@ -157,6 +157,9 @@ func ReadConnectRequest(conn net.Conn) (ConnectRequest, byte, bool) {
 	if _, err := io.ReadFull(conn, header[:]); err != nil || header[0] != Version {
 		return ConnectRequest{}, RepGeneralFailure, false
 	}
+	if header[2] != 0x00 {
+		return ConnectRequest{}, RepGeneralFailure, false
+	}
 	switch header[1] {
 	case CommandConnect:
 	case CommandBind, CommandUDPAssociate:

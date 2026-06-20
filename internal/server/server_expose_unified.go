@@ -32,7 +32,7 @@ func (s *Server) restoreUnifiedServerExposeTunnel(client *ClientConn, stored Sto
 		TunnelID: stored.ID,
 		Revision: stored.Revision,
 		Role:     protocol.DataStreamRoleTarget,
-		Spec:     tunnelSpecProtocolFromStored(stored, protocol.ProxyRuntimeStatePending),
+		Spec:     tunnelSpecProtocolForRole(stored, protocol.ProxyRuntimeStatePending, protocol.DataStreamRoleTarget),
 	}
 	if err := s.waitForClientTunnelProvisionAck(client, req); err != nil {
 		if errors.Is(err, errTunnelProvisionAckCancelled) {

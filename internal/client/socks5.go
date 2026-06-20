@@ -14,6 +14,8 @@ import (
 	"netsgo/pkg/protocol"
 )
 
+const socks5HandshakeTimeout = 10 * time.Second
+
 type clientSOCKS5TargetRuntime struct {
 	tunnelID    string
 	revision    int64
@@ -25,8 +27,9 @@ type clientSOCKS5TargetRuntime struct {
 }
 
 type socks5ListenRuntimeConfig struct {
-	config      protocol.SOCKS5ListenConfig
-	sourceCIDRs []*net.IPNet
+	config             protocol.SOCKS5ListenConfig
+	sourceCIDRs        []*net.IPNet
+	dialTimeoutSeconds int
 }
 
 func newClientSOCKS5TargetRuntime(req protocol.TunnelProvisionRequest) (clientSOCKS5TargetRuntime, error) {
@@ -130,7 +133,7 @@ func dialSOCKS5Target(header protocol.DataStreamHeader, target clientSOCKS5Targe
 	if !targetAllowsResolvedIPs(ips, target.targetCIDRs) {
 		return nil, protocol.SOCKS5DialResult{Status: protocol.SOCKS5DialStatusTargetDenied, Message: "resolved target IP denied by policy"}
 	}
-	conn, err := net.DialTimeout("tcp", net.JoinHostPort(host, fmt.Sprintf("%d", port)), timeout)
+	conn, err := dialResolvedSOCKS5TargetIPs(ips, port, timeout)
 	if err != nil {
 		return nil, socks5DialResultFromError(err)
 	}
@@ -140,6 +143,26 @@ func dialSOCKS5Target(header protocol.DataStreamHeader, target clientSOCKS5Targe
 		result.BoundPort = addr.Port
 	}
 	return conn, result
+}
+
+func dialResolvedSOCKS5TargetIPs(ips []net.IP, port int, timeout time.Duration) (net.Conn, error) {
+	deadline := time.Now().Add(timeout)
+	var lastErr error
+	for _, ip := range ips {
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			break
+		}
+		conn, err := net.DialTimeout("tcp", net.JoinHostPort(ip.String(), fmt.Sprintf("%d", port)), remaining)
+		if err == nil {
+			return conn, nil
+		}
+		lastErr = err
+	}
+	if lastErr != nil {
+		return nil, lastErr
+	}
+	return nil, fmt.Errorf("dial timeout")
 }
 
 func targetAllowsHostPort(host string, port int, target clientSOCKS5TargetRuntime) bool {
@@ -199,7 +222,7 @@ func socks5DialResultFromError(err error) protocol.SOCKS5DialResult {
 }
 
 func (c *Client) acceptIngressSOCKS5(rt *sessionRuntime, req protocol.TunnelProvisionRequest, runtime *clientTunnelRuntime) {
-	listenCfg, err := decodeSOCKS5ListenRuntimeConfig(req.Spec.Ingress.Config)
+	listenCfg, err := decodeSOCKS5ListenRuntimeConfigFromSpec(req.Spec.Ingress.Config, req.Spec.Target.Config)
 	if err != nil {
 		c.failIngressTunnelRuntime(rt, req, runtime, fmt.Sprintf("decode SOCKS5 ingress config failed: %v", err))
 		return
@@ -226,6 +249,10 @@ func (c *Client) acceptIngressSOCKS5(rt *sessionRuntime, req protocol.TunnelProv
 }
 
 func decodeSOCKS5ListenRuntimeConfig(raw []byte) (socks5ListenRuntimeConfig, error) {
+	return decodeSOCKS5ListenRuntimeConfigFromSpec(raw, nil)
+}
+
+func decodeSOCKS5ListenRuntimeConfigFromSpec(raw []byte, targetRaw []byte) (socks5ListenRuntimeConfig, error) {
 	var cfg protocol.SOCKS5ListenConfig
 	if err := json.Unmarshal(raw, &cfg); err != nil {
 		return socks5ListenRuntimeConfig{}, err
@@ -234,7 +261,17 @@ func decodeSOCKS5ListenRuntimeConfig(raw []byte) (socks5ListenRuntimeConfig, err
 	if err != nil {
 		return socks5ListenRuntimeConfig{}, err
 	}
-	return socks5ListenRuntimeConfig{config: cfg, sourceCIDRs: cidrs}, nil
+	dialTimeoutSeconds := 10
+	if len(targetRaw) > 0 {
+		var targetCfg protocol.SOCKS5ConnectHandlerConfig
+		if err := json.Unmarshal(targetRaw, &targetCfg); err != nil {
+			return socks5ListenRuntimeConfig{}, err
+		}
+		if targetCfg.DialTimeoutSeconds > 0 {
+			dialTimeoutSeconds = targetCfg.DialTimeoutSeconds
+		}
+	}
+	return socks5ListenRuntimeConfig{config: cfg, sourceCIDRs: cidrs, dialTimeoutSeconds: dialTimeoutSeconds}, nil
 }
 
 func (c *Client) handleIngressSOCKS5Conn(rt *sessionRuntime, req protocol.TunnelProvisionRequest, runtime *clientTunnelRuntime, conn net.Conn, listenCfg socks5ListenRuntimeConfig) {
@@ -245,10 +282,12 @@ func (c *Client) handleIngressSOCKS5Conn(rt *sessionRuntime, req protocol.Tunnel
 	if !sourceAddrAllowed(conn.RemoteAddr(), listenCfg.sourceCIDRs) {
 		return
 	}
+	_ = conn.SetDeadline(time.Now().Add(socks5HandshakeTimeout))
 	request, ok := socks5wire.ServeHandshake(conn, listenCfg.config)
 	if !ok {
 		return
 	}
+	_ = conn.SetDeadline(time.Time{})
 	stream, err := openIngressSOCKS5Stream(rt, req, c.CurrentClientID(), request)
 	if err != nil {
 		_ = socks5wire.WriteReply(conn, socks5wire.RepGeneralFailure, "", 0)
@@ -256,7 +295,9 @@ func (c *Client) handleIngressSOCKS5Conn(rt *sessionRuntime, req protocol.Tunnel
 		return
 	}
 	defer func() { _ = stream.Close() }()
+	_ = stream.SetReadDeadline(time.Now().Add(time.Duration(listenCfg.dialTimeoutSeconds) * time.Second))
 	result, err := socks5wire.ReadDialResult(stream)
+	_ = stream.SetReadDeadline(time.Time{})
 	if err != nil {
 		_ = socks5wire.WriteReply(conn, socks5wire.RepGeneralFailure, "", 0)
 		return

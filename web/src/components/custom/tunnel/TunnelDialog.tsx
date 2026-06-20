@@ -118,8 +118,16 @@ function parseCommaSeparatedList(value: string) {
   return value.split(',').map((item) => item.trim()).filter(Boolean);
 }
 
-function parseCommaSeparatedPorts(value: string) {
-  return parseCommaSeparatedList(value).map((item) => Number.parseInt(item, 10)).filter((port) => Number.isInteger(port));
+function parseCommaSeparatedPortList(value: string) {
+  const ports: number[] = [];
+  for (const item of parseCommaSeparatedList(value)) {
+    const port = parsePortInput(item);
+    if (port === null) {
+      return null;
+    }
+    ports.push(port);
+  }
+  return ports;
 }
 
 function localFieldError(field: string, message: string): LocalFieldError {
@@ -317,7 +325,9 @@ function TunnelDialogForm({
       return;
     }
 
-	if (isSocks5) {
+    const socks5AllowedTargetPorts = parseCommaSeparatedPortList(socks5TargetPorts);
+
+    if (isSocks5) {
       if (socks5AuthType === 'username_password' && (!socks5Username.trim() || (!isEditing && !socks5Password))) {
         setFieldError(localFieldError('ingress.config.auth', t('tunnels.socks5AuthRequired')));
         return;
@@ -328,6 +338,10 @@ function TunnelDialogForm({
       }
       if (!Number.isInteger(parsedSocks5DialTimeout) || parsedSocks5DialTimeout < 1 || parsedSocks5DialTimeout > 120) {
         setFieldError(localFieldError('target.config.dial_timeout_seconds', t('tunnels.socks5DialTimeoutInvalid')));
+        return;
+      }
+      if (socks5AllowedTargetPorts === null) {
+        setFieldError(localFieldError('target.config.allowed_target_ports', portErrorMessage));
         return;
       }
     }
@@ -368,7 +382,7 @@ function TunnelDialogForm({
             password: socks5Password,
             allowed_target_cidrs: parseCommaSeparatedList(socks5TargetCidrs),
             allowed_target_hosts: parseCommaSeparatedList(socks5TargetHosts),
-            allowed_target_ports: parseCommaSeparatedPorts(socks5TargetPorts),
+            allowed_target_ports: socks5AllowedTargetPorts ?? [],
             dial_timeout_seconds: parsedSocks5DialTimeout,
           } : undefined,
           confirm_no_auth_risk: isSocks5 ? confirmNoAuthRisk : undefined,
@@ -409,7 +423,7 @@ function TunnelDialogForm({
           password: socks5Password,
           allowed_target_cidrs: parseCommaSeparatedList(socks5TargetCidrs),
           allowed_target_hosts: parseCommaSeparatedList(socks5TargetHosts),
-          allowed_target_ports: parseCommaSeparatedPorts(socks5TargetPorts),
+          allowed_target_ports: socks5AllowedTargetPorts ?? [],
           dial_timeout_seconds: parsedSocks5DialTimeout,
         } : undefined,
         confirm_no_auth_risk: isSocks5 ? confirmNoAuthRisk : undefined,
@@ -439,9 +453,10 @@ function TunnelDialogForm({
     && (isSocks5 || parsedLocalPort !== null)
     && (isClientToClient ? canUseClientToClient && selectedIngressClientId && bindIp.trim() && type !== 'http' : true)
     && (isHttp ? domain.trim() : parsedRemotePort !== null)
-	&& (isClientToClient || isHttp || (parsedRemotePort !== null && isPortAllowedByRanges(parsedRemotePort, status?.allowed_ports)))
+    && (isClientToClient || isHttp || (parsedRemotePort !== null && isPortAllowedByRanges(parsedRemotePort, status?.allowed_ports)))
     && (!isSocks5 || (socks5AuthType !== 'username_password' || (socks5Username.trim() && (isEditing || socks5Password))))
     && (!isSocks5 || isClientToClient || socks5AuthType !== 'none' || confirmNoAuthRisk)
+    && (!isSocks5 || parseCommaSeparatedPortList(socks5TargetPorts) !== null)
     && parsedIngressBps !== null
     && parsedEgressBps !== null,
   );
