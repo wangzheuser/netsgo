@@ -231,6 +231,18 @@ func (s *Server) storedTunnelViewConfig(stored StoredTunnel) protocol.ProxyConfi
 	config := storedTunnelToProxyConfig(stored)
 	spec := specFromStoredTunnel(stored, s)
 	setProxyConfigStates(&config, spec.DesiredState, runtimeStateForProxyConfig(spec.RuntimeState), spec.Error)
+	config.Ingress = &protocol.EndpointSpec{
+		Location: spec.Ingress.Location,
+		ClientID: spec.Ingress.ClientID,
+		Type:     spec.Ingress.Type,
+		Config:   spec.Ingress.Config,
+	}
+	config.Target = &protocol.EndpointSpec{
+		Location: spec.Target.Location,
+		ClientID: spec.Target.ClientID,
+		Type:     spec.Target.Type,
+		Config:   spec.Target.Config,
+	}
 	config.ActualTransport = spec.ActualTransport
 	config.TransportPolicy = spec.TransportPolicy
 	if len(spec.Issues) > 0 {

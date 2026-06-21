@@ -2,7 +2,11 @@ import { describe, expect, test } from 'bun:test';
 
 import { ApiError } from '@/lib/api';
 
-import { buildLegacyClientTunnelPath, shouldUseLegacyTunnelEndpoint } from './use-tunnel-mutations';
+import {
+  buildLegacyClientTunnelPath,
+  canFallbackToLegacyTunnelEndpoint,
+  shouldUseLegacyTunnelEndpoint,
+} from './use-tunnel-mutations';
 
 describe('shouldUseLegacyTunnelEndpoint', () => {
   test('allows legacy fallback for old server-expose endpoints', () => {
@@ -22,5 +26,29 @@ describe('shouldUseLegacyTunnelEndpoint', () => {
   test('encodes legacy client tunnel path segments', () => {
     expect(buildLegacyClientTunnelPath('client/with?#chars')).toBe('/api/clients/client%2Fwith%3F%23chars/tunnels');
     expect(buildLegacyClientTunnelPath('client/with?#chars', '/tun%2F1/resume')).toBe('/api/clients/client%2Fwith%3F%23chars/tunnels/tun%2F1/resume');
+  });
+});
+
+describe('canFallbackToLegacyTunnelEndpoint', () => {
+  test('allows fallback only when no unified-only security config would be dropped', () => {
+    expect(canFallbackToLegacyTunnelEndpoint(
+      { type: 'http', topology: 'server_expose' },
+      new ApiError(404, 'Not Found'),
+    )).toBe(true);
+    expect(canFallbackToLegacyTunnelEndpoint(
+      { type: 'http', topology: 'server_expose', allowed_source_cidrs: ['0.0.0.0/0', '::/0'] },
+      new ApiError(404, 'Not Found'),
+    )).toBe(true);
+  });
+
+  test('does not fallback when HTTP auth or custom source CIDRs would be lost', () => {
+    expect(canFallbackToLegacyTunnelEndpoint(
+      { type: 'http', topology: 'server_expose', http_auth: { enabled: true, username: 'alice', password: 'secret' } },
+      new ApiError(404, 'Not Found'),
+    )).toBe(false);
+    expect(canFallbackToLegacyTunnelEndpoint(
+      { type: 'tcp', topology: 'server_expose', allowed_source_cidrs: ['203.0.113.0/24'] },
+      new ApiError(404, 'Not Found'),
+    )).toBe(false);
   });
 });

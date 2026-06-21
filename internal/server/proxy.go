@@ -15,13 +15,14 @@ import (
 
 // ProxyTunnel represents an active proxy tunnel.
 type ProxyTunnel struct {
-	Config   protocol.ProxyConfig
-	Listener net.Listener   // public listener on RemotePort (TCP tunnels only)
-	UDPState *UDPProxyState // UDP proxy runtime state (nil for TCP tunnels)
-	runtime  tunnelRuntimeSnapshot
-	limits   *directionalBandwidthRuntime
-	done     chan struct{}
-	once     sync.Once
+	Config      protocol.ProxyConfig
+	Listener    net.Listener   // public listener on RemotePort (TCP tunnels only)
+	UDPState    *UDPProxyState // UDP proxy runtime state (nil for TCP tunnels)
+	sourceCIDRs []*net.IPNet
+	runtime     tunnelRuntimeSnapshot
+	limits      *directionalBandwidthRuntime
+	done        chan struct{}
+	once        sync.Once
 }
 
 type proxyRequestValidationError struct {
@@ -301,13 +302,22 @@ func (s *Server) activatePreparedTunnel(client *ClientConn, tunnel *ProxyTunnel)
 		return err
 	}
 
+	if isSOCKS5ServerExpose(tunnel.Config) {
+		return s.activatePreparedSOCKS5ServerExposeTunnel(client, tunnel)
+	}
+
 	if tunnel.Config.Type == protocol.ProxyTypeHTTP {
+		policy, err := decodeIngressAccessPolicyFromProxyConfig(tunnel.Config)
+		if err != nil {
+			return fmt.Errorf("decode HTTP ingress policy: %w", err)
+		}
 		client.proxyMu.Lock()
 		current, exists := client.proxies[name]
 		if !exists || current != tunnel {
 			client.proxyMu.Unlock()
 			return fmt.Errorf("proxy tunnel %q not found", name)
 		}
+		current.sourceCIDRs = policy.sourceCIDRs
 		setProxyConfigStates(&current.Config, protocol.ProxyDesiredStateRunning, protocol.ProxyRuntimeStateExposed, "")
 		markTunnelServerRelayActive(current, client.ID, time.Now())
 		client.proxyMu.Unlock()
@@ -336,6 +346,11 @@ func (s *Server) activatePreparedTunnel(client *ClientConn, tunnel *ProxyTunnel)
 	if err != nil {
 		return fmt.Errorf("failed to listen on %s: %w", addr, err)
 	}
+	policy, err := decodeIngressAccessPolicyFromProxyConfig(tunnel.Config)
+	if err != nil {
+		_ = ln.Close()
+		return fmt.Errorf("decode TCP ingress policy: %w", err)
+	}
 
 	actualPort := ln.Addr().(*net.TCPAddr).Port
 
@@ -349,6 +364,7 @@ func (s *Server) activatePreparedTunnel(client *ClientConn, tunnel *ProxyTunnel)
 	tunnel.Listener = ln
 	tunnel.done = make(chan struct{})
 	tunnel.once = sync.Once{}
+	tunnel.sourceCIDRs = policy.sourceCIDRs
 	tunnel.Config.RemotePort = actualPort
 	bindIP := normalizeServerBindIP(tunnel.Config.BindIP)
 	setProxyConfigStates(&tunnel.Config, protocol.ProxyDesiredStateRunning, protocol.ProxyRuntimeStateExposed, "")
@@ -487,6 +503,11 @@ func (s *Server) proxyAcceptLoop(client *ClientConn, tunnel *ProxyTunnel, listen
 func (s *Server) handleProxyConn(client *ClientConn, tunnel *ProxyTunnel, listener net.Listener, extConn net.Conn) {
 	defer func() { _ = extConn.Close() }()
 
+	if !sourceAddressAllowed(extConn.RemoteAddr(), sourceCIDRsForTunnel(tunnel)) {
+		log.Printf("⚠️ proxy [%s] rejected source: %s", tunnel.Config.Name, rejectSourceAddressMessage(extConn.RemoteAddr()))
+		return
+	}
+
 	stream, err := s.openStreamToClient(client, tunnel.Config.Name)
 	if err != nil {
 		log.Printf("⚠️ proxy [%s] open stream failed: %v", tunnel.Config.Name, err)
@@ -501,6 +522,26 @@ func (s *Server) handleProxyConn(client *ClientConn, tunnel *ProxyTunnel, listen
 		}
 	}
 	_, _ = relayTunnelPayload(stream, extConn, client.BandwidthRuntime(), tunnel.limits, recordTraffic)
+}
+
+func decodeIngressAccessPolicyFromProxyConfig(config protocol.ProxyConfig) (ingressAccessPolicy, error) {
+	if config.Ingress == nil {
+		return parseIngressAccessPolicy(nil, true)
+	}
+	return decodeIngressAccessPolicy(config.Ingress.Config, true)
+}
+
+func sourceCIDRsForTunnel(tunnel *ProxyTunnel) []*net.IPNet {
+	if tunnel != nil && len(tunnel.sourceCIDRs) > 0 {
+		return tunnel.sourceCIDRs
+	}
+	if tunnel != nil {
+		if policy, err := decodeIngressAccessPolicyFromProxyConfig(tunnel.Config); err == nil {
+			return policy.sourceCIDRs
+		}
+	}
+	policy, _ := parseIngressAccessPolicy(nil, true)
+	return policy.sourceCIDRs
 }
 
 func (s *Server) tunnelBandwidthRuntime(client *ClientConn, name string) *directionalBandwidthRuntime {

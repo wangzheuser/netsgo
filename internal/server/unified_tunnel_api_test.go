@@ -50,25 +50,21 @@ func readControlMessageOfType(t *testing.T, conn interface {
 	ReadJSON(any) error
 }, wantType string) protocol.Message {
 	t.Helper()
-	deadline := time.Now().Add(2 * time.Second)
-	for time.Now().Before(deadline) {
-		if err := conn.SetReadDeadline(time.Now().Add(250 * time.Millisecond)); err != nil {
-			t.Fatalf("set read deadline: %v", err)
-		}
+	if err := conn.SetReadDeadline(time.Now().Add(2 * time.Second)); err != nil {
+		t.Fatalf("set read deadline: %v", err)
+	}
+	defer func() {
+		_ = conn.SetReadDeadline(time.Time{})
+	}()
+	for {
 		var msg protocol.Message
 		if err := conn.ReadJSON(&msg); err != nil {
-			var netErr net.Error
-			if !errors.As(err, &netErr) || !netErr.Timeout() {
-				t.Fatalf("read control message %s: %v", wantType, err)
-			}
-			continue
+			t.Fatalf("read control message %s: %v", wantType, err)
 		}
 		if msg.Type == wantType {
 			return msg
 		}
 	}
-	t.Fatalf("did not receive control message %s", wantType)
-	return protocol.Message{}
 }
 
 func readTunnelUnprovision(t *testing.T, conn interface {
@@ -163,6 +159,34 @@ func respondPreflight(t *testing.T, conn interface {
 	if err := conn.WriteJSON(resp); err != nil {
 		t.Fatalf("write preflight response: %v", err)
 	}
+}
+
+func acceptPreflight(t *testing.T, conn interface {
+	SetReadDeadline(time.Time) error
+	ReadJSON(any) error
+	WriteJSON(any) error
+}) protocol.TunnelPreflightRequest {
+	t.Helper()
+	msg := readControlMessageOfType(t, conn, protocol.MsgTypeTunnelPreflight)
+	var req protocol.TunnelPreflightRequest
+	if err := msg.ParsePayload(&req); err != nil {
+		t.Fatalf("parse preflight payload: %v", err)
+	}
+	resp, err := protocol.NewMessage(protocol.MsgTypeTunnelPreflightResp, protocol.TunnelPreflightResponse{
+		RequestID: req.RequestID,
+		TunnelID:  req.TunnelID,
+		Revision:  req.Revision,
+		Role:      req.Role,
+		Accepted:  true,
+		Message:   "ok",
+	})
+	if err != nil {
+		t.Fatalf("build preflight response: %v", err)
+	}
+	if err := conn.WriteJSON(resp); err != nil {
+		t.Fatalf("write preflight response: %v", err)
+	}
+	return req
 }
 
 func rejectPreflight(t *testing.T, conn interface {
@@ -263,7 +287,7 @@ func unifiedCreatePayload(name, clientID string, port int) []byte {
 	return []byte(`{
 		"name":"` + name + `",
 		"topology":"server_expose",
-		"ingress":{"location":"server","type":"tcp_listen","config":{"bind_ip":"0.0.0.0","port":` + strconv.Itoa(port) + `}},
+		"ingress":{"location":"server","type":"tcp_listen","config":{"bind_ip":"0.0.0.0","port":` + strconv.Itoa(port) + `,"allowed_source_cidrs":["0.0.0.0/0","::/0"]}},
 		"target":{"location":"client","client_id":"` + clientID + `","type":"tcp_service","config":{"ip":"127.0.0.1","port":22}},
 		"transport_policy":"server_relay_only",
 		"bandwidth_settings":{"ingress_bps":0,"egress_bps":0}
@@ -350,6 +374,609 @@ func TestAPI_UnifiedTunnelCreateDerivesOwnerAndListsByClientRole(t *testing.T) {
 	}
 }
 
+func TestAPI_UnifiedTunnelDefaultsMissingSourceCIDRsAndRejectsEmptyList(t *testing.T) {
+	s, handler, token, cleanup := setupTestServerWithStores(t, true)
+	defer cleanup()
+
+	target := createUnifiedAPITestClient(t, s, "install-source-policy-default", "source-policy-default")
+	base := func(ingressType, config string) []byte {
+		targetType := tunnelTargetTypeTCPService
+		if ingressType == tunnelIngressTypeUDPListen {
+			targetType = tunnelTargetTypeUDPService
+		}
+		targetConfig := `{"ip":"127.0.0.1","port":22}`
+		if targetType == tunnelTargetTypeUDPService {
+			targetConfig = `{"ip":"127.0.0.1","port":53}`
+		}
+		return []byte(`{
+			"name":"missing-source-policy-` + ingressType + `",
+			"topology":"server_expose",
+			"ingress":{"location":"server","type":"` + ingressType + `","config":` + config + `},
+			"target":{"location":"client","client_id":"` + target.ID + `","type":"` + targetType + `","config":` + targetConfig + `},
+			"transport_policy":"server_relay_only"
+		}`)
+	}
+
+	for _, tc := range []struct {
+		name         string
+		ingressType  string
+		config       string
+		wantStatus   int
+		wantAllowAll bool
+	}{
+		{name: "tcp missing", ingressType: tunnelIngressTypeTCPListen, config: `{"bind_ip":"0.0.0.0","port":` + strconv.Itoa(reserveTCPPort(t)) + `}`, wantStatus: http.StatusCreated, wantAllowAll: true},
+		{name: "tcp empty", ingressType: tunnelIngressTypeTCPListen, config: `{"bind_ip":"0.0.0.0","port":` + strconv.Itoa(reserveTCPPort(t)) + `,"allowed_source_cidrs":[]}`, wantStatus: http.StatusBadRequest},
+		{name: "udp missing", ingressType: tunnelIngressTypeUDPListen, config: `{"bind_ip":"0.0.0.0","port":` + strconv.Itoa(reserveUDPPort(t)) + `}`, wantStatus: http.StatusCreated, wantAllowAll: true},
+		{name: "http missing", ingressType: tunnelIngressTypeHTTPHost, config: `{"domain":"missing-source-policy.example.com"}`, wantStatus: http.StatusCreated, wantAllowAll: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			resp := doMuxRequest(t, handler, http.MethodPost, "/api/tunnels", token, base(tc.ingressType, tc.config))
+			if resp.Code != tc.wantStatus {
+				t.Fatalf("source CIDR validation: want %d, got %d body=%s", tc.wantStatus, resp.Code, resp.Body.String())
+			}
+			if tc.wantStatus == http.StatusBadRequest {
+				var body tunnelMutationErrorResponse
+				if err := mustDecodeJSON(t, resp.Body, &body); err != nil {
+					t.Fatalf("decode source CIDR error: %v", err)
+				}
+				if body.Field != "ingress.config.allowed_source_cidrs" {
+					t.Fatalf("source CIDR error field mismatch: %+v", body)
+				}
+				return
+			}
+			var created tunnelSpecAPI
+			if err := mustDecodeJSON(t, resp.Body, &created); err != nil {
+				t.Fatalf("decode created tunnel: %v", err)
+			}
+			if tc.wantAllowAll {
+				policy, err := decodeIngressAccessPolicy(created.Ingress.Config, false)
+				if err != nil {
+					t.Fatalf("decode response source policy: %v", err)
+				}
+				if got, want := strings.Join(policy.allowedSourceCIDRs, ","), "0.0.0.0/0,::/0"; got != want {
+					t.Fatalf("default response source CIDRs: got %q want %q", got, want)
+				}
+			}
+		})
+	}
+}
+
+func TestAPI_UnifiedTunnelPreservesSourceCIDRs(t *testing.T) {
+	s, handler, token, cleanup := setupTestServerWithStores(t, true)
+	defer cleanup()
+
+	target := createUnifiedAPITestClient(t, s, "install-source-policy-preserve", "source-policy-preserve")
+	body := []byte(`{
+		"name":"source-policy-preserve",
+		"topology":"server_expose",
+		"ingress":{"location":"server","type":"tcp_listen","config":{"bind_ip":"0.0.0.0","port":` + strconv.Itoa(reserveTCPPort(t)) + `,"allowed_source_cidrs":["127.0.0.0/8","10.0.0.0/8"]}},
+		"target":{"location":"client","client_id":"` + target.ID + `","type":"tcp_service","config":{"ip":"127.0.0.1","port":22}},
+		"transport_policy":"server_relay_only"
+	}`)
+	resp := doMuxRequest(t, handler, http.MethodPost, "/api/tunnels", token, body)
+	if resp.Code != http.StatusCreated {
+		t.Fatalf("source CIDR create: want 201, got %d body=%s", resp.Code, resp.Body.String())
+	}
+	var created tunnelSpecAPI
+	if err := mustDecodeJSON(t, resp.Body, &created); err != nil {
+		t.Fatalf("decode source CIDR tunnel: %v", err)
+	}
+	var cfg tcpListenConfigAPI
+	if err := json.Unmarshal(created.Ingress.Config, &cfg); err != nil {
+		t.Fatalf("decode response ingress config: %v", err)
+	}
+	if got, want := strings.Join(cfg.AllowedSourceCIDRs, ","), "127.0.0.0/8,10.0.0.0/8"; got != want {
+		t.Fatalf("response source CIDRs: got %q want %q", got, want)
+	}
+	stored, err := s.store.GetTunnelByIDE(target.ID, created.ID)
+	if err != nil {
+		t.Fatalf("load stored source CIDR tunnel: %v", err)
+	}
+	if err := json.Unmarshal(stored.Ingress.Config, &cfg); err != nil {
+		t.Fatalf("decode stored ingress config: %v", err)
+	}
+	if got, want := strings.Join(cfg.AllowedSourceCIDRs, ","), "127.0.0.0/8,10.0.0.0/8"; got != want {
+		t.Fatalf("stored source CIDRs: got %q want %q", got, want)
+	}
+}
+
+func TestAPI_UnifiedTunnelCreateSOCKS5ServerExpose(t *testing.T) {
+	s, handler, token, cleanup := setupTestServerWithStores(t, true)
+	defer cleanup()
+
+	target := createUnifiedAPITestClient(t, s, "install-socks5-target", "socks5-target")
+	port := reserveTCPPort(t)
+	body := []byte(`{
+		"name":"socks5",
+		"topology":"server_expose",
+		"ingress":{"location":"server","type":"socks5_listen","config":{
+			"bind_ip":"0.0.0.0",
+			"port":` + strconv.Itoa(port) + `,
+			"allowed_source_cidrs":["0.0.0.0/0","::/0"],
+			"auth":{"type":"none"}
+		}},
+		"target":{"location":"client","client_id":"` + target.ID + `","type":"socks5_connect_handler","config":{
+			"allowed_target_cidrs":["0.0.0.0/0","::/0"],
+			"allowed_target_hosts":["example.com"],
+			"allowed_target_ports":[443],
+			"dial_timeout_seconds":9
+		}},
+		"transport_policy":"server_relay_only",
+		"confirm_no_auth_risk":true,
+		"bandwidth_settings":{"ingress_bps":0,"egress_bps":0}
+	}`)
+	resp := doMuxRequest(t, handler, http.MethodPost, "/api/tunnels", token, body)
+	if resp.Code != http.StatusCreated {
+		t.Fatalf("SOCKS5 create: want 201, got %d body=%s", resp.Code, resp.Body.String())
+	}
+	var created tunnelSpecAPI
+	if err := mustDecodeJSON(t, resp.Body, &created); err != nil {
+		t.Fatalf("decode SOCKS5 create response: %v", err)
+	}
+	if created.Ingress.Type != protocol.IngressTypeSOCKS5Listen || created.Target.Type != protocol.TargetTypeSOCKS5ConnectHandler {
+		t.Fatalf("SOCKS5 endpoint types mismatch: %+v -> %+v", created.Ingress, created.Target)
+	}
+	if bytes.Contains(resp.Body.Bytes(), []byte(`"local_ip"`)) || bytes.Contains(resp.Body.Bytes(), []byte(`"local_port"`)) {
+		t.Fatalf("unified SOCKS5 response should be endpoint-spec based, got %s", resp.Body.String())
+	}
+
+	stored, err := s.store.GetTunnelByIDE(target.ID, created.ID)
+	if err != nil {
+		t.Fatalf("load stored SOCKS5 tunnel: %v", err)
+	}
+	if stored.LocalIP != "" || stored.LocalPort != 0 {
+		t.Fatalf("SOCKS5 must not store dynamic target in LocalIP/LocalPort: %+v", stored.ProxyNewRequest)
+	}
+	if stored.Target.Type != protocol.TargetTypeSOCKS5ConnectHandler {
+		t.Fatalf("stored target endpoint mismatch: %+v", stored.Target)
+	}
+}
+
+func TestAPI_UnifiedTunnelSOCKS5NoAuthRequiresSubmitConfirmation(t *testing.T) {
+	s, handler, token, cleanup := setupTestServerWithStores(t, true)
+	defer cleanup()
+
+	target := createUnifiedAPITestClient(t, s, "install-socks5-no-auth-target", "socks5-no-auth-target")
+	body := []byte(`{
+		"name":"socks5-no-confirm",
+		"topology":"server_expose",
+		"ingress":{"location":"server","type":"socks5_listen","config":{
+			"bind_ip":"0.0.0.0",
+			"port":` + strconv.Itoa(reserveTCPPort(t)) + `,
+			"allowed_source_cidrs":["0.0.0.0/0","::/0"],
+			"auth":{"type":"none"}
+		}},
+		"target":{"location":"client","client_id":"` + target.ID + `","type":"socks5_connect_handler","config":{
+			"allowed_target_cidrs":["0.0.0.0/0","::/0"],
+			"dial_timeout_seconds":10
+		}},
+		"transport_policy":"server_relay_only"
+	}`)
+	resp := doMuxRequest(t, handler, http.MethodPost, "/api/tunnels", token, body)
+	if resp.Code != http.StatusBadRequest {
+		t.Fatalf("SOCKS5 no-auth without confirmation: want 400, got %d body=%s", resp.Code, resp.Body.String())
+	}
+	if _, err := s.store.GetTunnelE(target.ID, "socks5-no-confirm"); !errors.Is(err, ErrTunnelNotFound) {
+		t.Fatalf("missing no-auth confirmation must not persist config, got err=%v", err)
+	}
+}
+
+func TestAPI_UnifiedTunnelSOCKS5PasswordIsWriteOnly(t *testing.T) {
+	s, handler, token, cleanup := setupTestServerWithStores(t, true)
+	defer cleanup()
+
+	target := createUnifiedAPITestClient(t, s, "install-socks5-password-target", "socks5-password-target")
+	secret := "super-secret-password"
+	body := []byte(`{
+		"name":"socks5-password",
+		"topology":"server_expose",
+		"ingress":{"location":"server","type":"socks5_listen","config":{
+			"bind_ip":"0.0.0.0",
+			"port":` + strconv.Itoa(reserveTCPPort(t)) + `,
+			"allowed_source_cidrs":["127.0.0.0/8"],
+			"auth":{"type":"username_password","username":"alice","password":"` + secret + `"}
+		}},
+		"target":{"location":"client","client_id":"` + target.ID + `","type":"socks5_connect_handler","config":{
+			"allowed_target_cidrs":["0.0.0.0/0","::/0"],
+			"dial_timeout_seconds":10
+		}},
+		"transport_policy":"server_relay_only"
+	}`)
+	resp := doMuxRequest(t, handler, http.MethodPost, "/api/tunnels", token, body)
+	if resp.Code != http.StatusCreated {
+		t.Fatalf("SOCKS5 password create: want 201, got %d body=%s", resp.Code, resp.Body.String())
+	}
+	if bytes.Contains(resp.Body.Bytes(), []byte(secret)) || bytes.Contains(resp.Body.Bytes(), []byte(`"password"`)) {
+		t.Fatalf("SOCKS5 create response must not echo password, got %s", resp.Body.String())
+	}
+	var created tunnelSpecAPI
+	if err := mustDecodeJSON(t, resp.Body, &created); err != nil {
+		t.Fatalf("decode created tunnel: %v", err)
+	}
+	stored, err := s.store.GetTunnelByIDE(target.ID, created.ID)
+	if err != nil {
+		t.Fatalf("load stored SOCKS5 tunnel: %v", err)
+	}
+	if bytes.Contains(stored.Ingress.Config, []byte(secret)) || bytes.Contains(stored.Ingress.Config, []byte(`"password"`)) {
+		t.Fatalf("stored ingress config must not contain plaintext password: %s", string(stored.Ingress.Config))
+	}
+	if !bytes.Contains(stored.Ingress.Config, []byte(`"password_hash"`)) {
+		t.Fatalf("stored ingress config should contain password hash: %s", string(stored.Ingress.Config))
+	}
+	var storedIngress protocol.SOCKS5ListenConfig
+	if err := json.Unmarshal(stored.Ingress.Config, &storedIngress); err != nil {
+		t.Fatalf("decode stored ingress config: %v", err)
+	}
+	originalHash := storedIngress.Auth.PasswordHash
+	if originalHash == "" {
+		t.Fatalf("stored ingress config should contain password hash: %s", string(stored.Ingress.Config))
+	}
+
+	update := []byte(`{"expected_revision":` + strconv.FormatInt(created.Revision, 10) + `,"spec":{
+		"name":"socks5-password",
+		"topology":"server_expose",
+		"ingress":{"location":"server","type":"socks5_listen","config":{
+			"bind_ip":"0.0.0.0",
+			"port":` + strconv.Itoa(stored.RemotePort) + `,
+			"allowed_source_cidrs":["127.0.0.0/8"],
+			"auth":{"type":"username_password","username":"alice"}
+		}},
+		"target":{"location":"client","client_id":"` + target.ID + `","type":"socks5_connect_handler","config":{
+			"allowed_target_cidrs":["0.0.0.0/0","::/0"],
+			"dial_timeout_seconds":20
+		}},
+		"transport_policy":"server_relay_only"
+	}}`)
+	updateResp := doMuxRequest(t, handler, http.MethodPut, "/api/tunnels/"+created.ID, token, update)
+	if updateResp.Code != http.StatusOK {
+		t.Fatalf("SOCKS5 password update without new password: want 200, got %d body=%s", updateResp.Code, updateResp.Body.String())
+	}
+	if bytes.Contains(updateResp.Body.Bytes(), []byte(secret)) ||
+		bytes.Contains(updateResp.Body.Bytes(), []byte(`"password"`)) ||
+		bytes.Contains(updateResp.Body.Bytes(), []byte(`"password_hash"`)) {
+		t.Fatalf("SOCKS5 update response must not echo password material, got %s", updateResp.Body.String())
+	}
+	updated, err := s.store.GetTunnelByIDE(target.ID, created.ID)
+	if err != nil {
+		t.Fatalf("load updated SOCKS5 tunnel: %v", err)
+	}
+	var updatedIngress protocol.SOCKS5ListenConfig
+	if err := json.Unmarshal(updated.Ingress.Config, &updatedIngress); err != nil {
+		t.Fatalf("decode updated ingress config: %v", err)
+	}
+	if updatedIngress.Auth.PasswordHash != originalHash {
+		t.Fatalf("SOCKS5 update without new password should preserve password hash")
+	}
+}
+
+func TestAPI_UnifiedTunnelSOCKS5PasswordPreserveRejectsUnknownIngressField(t *testing.T) {
+	s, handler, token, cleanup := setupTestServerWithStores(t, true)
+	defer cleanup()
+
+	target := createUnifiedAPITestClient(t, s, "install-socks5-password-unknown-target", "socks5-password-unknown-target")
+	secret := "super-secret-password"
+	create := []byte(`{
+		"name":"socks5-password-unknown",
+		"topology":"server_expose",
+		"ingress":{"location":"server","type":"socks5_listen","config":{
+			"bind_ip":"0.0.0.0",
+			"port":` + strconv.Itoa(reserveTCPPort(t)) + `,
+			"allowed_source_cidrs":["127.0.0.0/8"],
+			"auth":{"type":"username_password","username":"alice","password":"` + secret + `"}
+		}},
+		"target":{"location":"client","client_id":"` + target.ID + `","type":"socks5_connect_handler","config":{
+			"allowed_target_cidrs":["0.0.0.0/0","::/0"],
+			"dial_timeout_seconds":10
+		}},
+		"transport_policy":"server_relay_only"
+	}`)
+	resp := doMuxRequest(t, handler, http.MethodPost, "/api/tunnels", token, create)
+	if resp.Code != http.StatusCreated {
+		t.Fatalf("SOCKS5 password create: want 201, got %d body=%s", resp.Code, resp.Body.String())
+	}
+	var created tunnelSpecAPI
+	if err := mustDecodeJSON(t, resp.Body, &created); err != nil {
+		t.Fatalf("decode created tunnel: %v", err)
+	}
+	stored, err := s.store.GetTunnelByIDE(target.ID, created.ID)
+	if err != nil {
+		t.Fatalf("load stored SOCKS5 tunnel: %v", err)
+	}
+	var before protocol.SOCKS5ListenConfig
+	if err := json.Unmarshal(stored.Ingress.Config, &before); err != nil {
+		t.Fatalf("decode stored ingress config: %v", err)
+	}
+
+	update := []byte(`{"expected_revision":` + strconv.FormatInt(created.Revision, 10) + `,"spec":{
+		"name":"socks5-password-unknown",
+		"topology":"server_expose",
+		"ingress":{"location":"server","type":"socks5_listen","config":{
+			"bind_ip":"0.0.0.0",
+			"port":` + strconv.Itoa(stored.RemotePort) + `,
+			"allowed_source_cidrs":["127.0.0.0/8"],
+			"unexpected":true,
+			"auth":{"type":"username_password","username":"alice"}
+		}},
+		"target":{"location":"client","client_id":"` + target.ID + `","type":"socks5_connect_handler","config":{
+			"allowed_target_cidrs":["0.0.0.0/0","::/0"],
+			"dial_timeout_seconds":20
+		}},
+		"transport_policy":"server_relay_only"
+	}}`)
+	updateResp := doMuxRequest(t, handler, http.MethodPut, "/api/tunnels/"+created.ID, token, update)
+	if updateResp.Code != http.StatusBadRequest {
+		t.Fatalf("SOCKS5 password preserve with unknown field: want 400, got %d body=%s", updateResp.Code, updateResp.Body.String())
+	}
+	after, err := s.store.GetTunnelByIDE(target.ID, created.ID)
+	if err != nil {
+		t.Fatalf("load tunnel after rejected update: %v", err)
+	}
+	if after.Revision != stored.Revision {
+		t.Fatalf("rejected update should keep revision %d, got %d", stored.Revision, after.Revision)
+	}
+	var afterCfg protocol.SOCKS5ListenConfig
+	if err := json.Unmarshal(after.Ingress.Config, &afterCfg); err != nil {
+		t.Fatalf("decode post-reject ingress config: %v", err)
+	}
+	if afterCfg.Auth.PasswordHash != before.Auth.PasswordHash {
+		t.Fatal("rejected update should keep existing password hash")
+	}
+}
+
+func TestStoredTunnelViewConfigRedactsSOCKS5PasswordHash(t *testing.T) {
+	s, _, _, cleanup := setupTestServerWithStores(t, true)
+	defer cleanup()
+
+	stored := StoredTunnel{
+		ProxyNewRequest: protocol.ProxyNewRequest{
+			ID:         "socks5-view-redact-id",
+			Name:       "socks5-view-redact",
+			Type:       protocol.ProxyTypeTCP,
+			RemotePort: 1080,
+		},
+		ClientID:        "target-client",
+		OwnerClientID:   "target-client",
+		Binding:         TunnelBindingClientID,
+		Revision:        1,
+		Topology:        TunnelTopologyServerExpose,
+		DesiredState:    protocol.ProxyDesiredStateRunning,
+		RuntimeState:    protocol.ProxyRuntimeStateOffline,
+		TransportPolicy: protocol.TransportPolicyServerRelayOnly,
+		ActualTransport: protocol.ActualTransportUnknown,
+		P2P:             P2PState{State: TunnelP2PStateIdle},
+		Ingress: EndpointSpec{
+			Location: protocol.EndpointLocationServer,
+			Type:     protocol.IngressTypeSOCKS5Listen,
+			Config: mustRawJSON(protocol.SOCKS5ListenConfig{
+				BindIP:             "0.0.0.0",
+				Port:               1080,
+				AllowedSourceCIDRs: []string{"0.0.0.0/0", "::/0"},
+				Auth: protocol.SOCKS5AuthConfig{
+					Type:         protocol.SOCKS5AuthTypeUsernamePassword,
+					Username:     "alice",
+					PasswordHash: "$argon2id$v=19$m=65536,t=3,p=1$c2FsdA$Ynl0ZXM",
+				},
+			}),
+		},
+		Target: EndpointSpec{
+			Location: protocol.EndpointLocationClient,
+			ClientID: "target-client",
+			Type:     protocol.TargetTypeSOCKS5ConnectHandler,
+			Config: mustRawJSON(protocol.SOCKS5ConnectHandlerConfig{
+				AllowedTargetCIDRs: []string{"0.0.0.0/0", "::/0"},
+				DialTimeoutSeconds: 10,
+			}),
+		},
+		CreatedAt: time.Now().UTC(),
+		UpdatedAt: time.Now().UTC(),
+	}
+	if err := stored.normalize(); err != nil {
+		t.Fatalf("normalize stored tunnel: %v", err)
+	}
+	view := s.storedTunnelViewConfig(stored)
+	raw, err := json.Marshal(view)
+	if err != nil {
+		t.Fatalf("marshal view: %v", err)
+	}
+	if bytes.Contains(raw, []byte("password_hash")) || bytes.Contains(raw, []byte("$argon2id")) {
+		t.Fatalf("stored tunnel view should redact password hash: %s", string(raw))
+	}
+}
+
+func TestStoredTunnelViewConfigBackfillsMissingSourceCIDRs(t *testing.T) {
+	s, _, _, cleanup := setupTestServerWithStores(t, true)
+	defer cleanup()
+
+	stored := StoredTunnel{
+		ProxyNewRequest: protocol.ProxyNewRequest{
+			ID:         "legacy-view-id",
+			Name:       "legacy-view",
+			Type:       protocol.ProxyTypeTCP,
+			RemotePort: 18080,
+			LocalIP:    "127.0.0.1",
+			LocalPort:  22,
+		},
+		ClientID:        "target-client",
+		OwnerClientID:   "target-client",
+		Binding:         TunnelBindingClientID,
+		Revision:        1,
+		Topology:        TunnelTopologyServerExpose,
+		DesiredState:    protocol.ProxyDesiredStateRunning,
+		RuntimeState:    protocol.ProxyRuntimeStateOffline,
+		TransportPolicy: protocol.TransportPolicyServerRelayOnly,
+		ActualTransport: protocol.ActualTransportUnknown,
+		P2P:             P2PState{State: TunnelP2PStateIdle},
+		Ingress: EndpointSpec{
+			Location: protocol.EndpointLocationServer,
+			Type:     protocol.IngressTypeTCPListen,
+			Config:   mustRawJSON(tcpListenConfigAPI{BindIP: "0.0.0.0", Port: 18080}),
+		},
+		Target: EndpointSpec{
+			Location: protocol.EndpointLocationClient,
+			ClientID: "target-client",
+			Type:     protocol.TargetTypeTCPService,
+			Config:   mustRawJSON(serviceConfigAPI{IP: "127.0.0.1", Port: 22}),
+		},
+		CreatedAt: time.Now().UTC(),
+		UpdatedAt: time.Now().UTC(),
+	}
+	if err := stored.normalize(); err != nil {
+		t.Fatalf("normalize stored tunnel: %v", err)
+	}
+
+	view := s.storedTunnelViewConfig(stored)
+	if view.Ingress == nil {
+		t.Fatal("view should include ingress config")
+	}
+	var cfg tcpListenConfigAPI
+	if err := json.Unmarshal(view.Ingress.Config, &cfg); err != nil {
+		t.Fatalf("decode view ingress config: %v", err)
+	}
+	if got, want := strings.Join(cfg.AllowedSourceCIDRs, ","), "0.0.0.0/0,::/0"; got != want {
+		t.Fatalf("view source CIDRs: got %q want %q", got, want)
+	}
+}
+
+func TestAPI_UnifiedTunnelHTTPBasicAuthHashesAndRedacts(t *testing.T) {
+	s, handler, token, cleanup := setupTestServerWithStores(t, true)
+	defer cleanup()
+
+	target := createUnifiedAPITestClient(t, s, "install-http-basic-auth-target", "http-basic-auth-target")
+	secret := "http-secret-password"
+	body := []byte(`{
+		"name":"http-basic-auth",
+		"topology":"server_expose",
+		"ingress":{"location":"server","type":"http_host","config":{
+			"domain":"basic-auth.example.com",
+			"allowed_source_cidrs":["0.0.0.0/0","::/0"],
+			"auth":{"type":"basic","username":"alice","password":"` + secret + `"}
+		}},
+		"target":{"location":"client","client_id":"` + target.ID + `","type":"tcp_service","config":{"ip":"127.0.0.1","port":8080}},
+		"transport_policy":"server_relay_only"
+	}`)
+
+	resp := doMuxRequest(t, handler, http.MethodPost, "/api/tunnels", token, body)
+	if resp.Code != http.StatusCreated {
+		t.Fatalf("HTTP Basic create: want 201, got %d body=%s", resp.Code, resp.Body.String())
+	}
+	if bytes.Contains(resp.Body.Bytes(), []byte(secret)) || bytes.Contains(resp.Body.Bytes(), []byte("password_hash")) {
+		t.Fatalf("HTTP Basic create response must not echo password material: %s", resp.Body.String())
+	}
+	var created tunnelSpecAPI
+	if err := mustDecodeJSON(t, resp.Body, &created); err != nil {
+		t.Fatalf("decode HTTP Basic create response: %v", err)
+	}
+
+	stored, err := s.store.GetTunnelByIDE(created.OwnerClientID, created.ID)
+	if err != nil {
+		t.Fatalf("load stored HTTP Basic tunnel: %v", err)
+	}
+	if bytes.Contains(stored.Ingress.Config, []byte(secret)) || bytes.Contains(stored.Ingress.Config, []byte(`"password"`)) {
+		t.Fatalf("stored HTTP ingress config must not contain plaintext password: %s", string(stored.Ingress.Config))
+	}
+	if !bytes.Contains(stored.Ingress.Config, []byte(`"password_hash"`)) {
+		t.Fatalf("stored HTTP ingress config should contain password hash: %s", string(stored.Ingress.Config))
+	}
+
+	updateBody := []byte(fmt.Sprintf(`{
+		"expected_revision":%d,
+		"spec":{
+			"name":"http-basic-auth",
+			"topology":"server_expose",
+			"ingress":{"location":"server","type":"http_host","config":{
+				"domain":"basic-auth.example.com",
+				"allowed_source_cidrs":["0.0.0.0/0","::/0"],
+				"auth":{"type":"basic","username":"alice"}
+			}},
+			"target":{"location":"client","client_id":"%s","type":"tcp_service","config":{"ip":"127.0.0.1","port":8080}},
+			"transport_policy":"server_relay_only"
+		}
+	}`, created.Revision, target.ID))
+	updateResp := doMuxRequest(t, handler, http.MethodPut, "/api/tunnels/"+created.ID, token, updateBody)
+	if updateResp.Code != http.StatusOK {
+		t.Fatalf("HTTP Basic update without new password: want 200, got %d body=%s", updateResp.Code, updateResp.Body.String())
+	}
+	updated, err := s.store.GetTunnelByIDE(created.OwnerClientID, created.ID)
+	if err != nil {
+		t.Fatalf("load updated HTTP Basic tunnel: %v", err)
+	}
+	if !bytes.Contains(updated.Ingress.Config, []byte(`"password_hash"`)) {
+		t.Fatalf("HTTP Basic update should preserve password hash: %s", string(updated.Ingress.Config))
+	}
+}
+
+func TestAPI_UnifiedTunnelHTTPBasicPasswordPreserveRejectsUnknownIngressField(t *testing.T) {
+	s, handler, token, cleanup := setupTestServerWithStores(t, true)
+	defer cleanup()
+
+	target := createUnifiedAPITestClient(t, s, "install-http-basic-unknown-target", "http-basic-unknown-target")
+	secret := "http-secret-password"
+	create := []byte(`{
+		"name":"http-basic-unknown",
+		"topology":"server_expose",
+		"ingress":{"location":"server","type":"http_host","config":{
+			"domain":"basic-unknown.example.com",
+			"allowed_source_cidrs":["0.0.0.0/0","::/0"],
+			"auth":{"type":"basic","username":"alice","password":"` + secret + `"}
+		}},
+		"target":{"location":"client","client_id":"` + target.ID + `","type":"tcp_service","config":{"ip":"127.0.0.1","port":8080}},
+		"transport_policy":"server_relay_only"
+	}`)
+	resp := doMuxRequest(t, handler, http.MethodPost, "/api/tunnels", token, create)
+	if resp.Code != http.StatusCreated {
+		t.Fatalf("HTTP Basic create: want 201, got %d body=%s", resp.Code, resp.Body.String())
+	}
+	var created tunnelSpecAPI
+	if err := mustDecodeJSON(t, resp.Body, &created); err != nil {
+		t.Fatalf("decode HTTP Basic create response: %v", err)
+	}
+	stored, err := s.store.GetTunnelByIDE(created.OwnerClientID, created.ID)
+	if err != nil {
+		t.Fatalf("load stored HTTP Basic tunnel: %v", err)
+	}
+	var before httpHostConfigAPI
+	if err := json.Unmarshal(stored.Ingress.Config, &before); err != nil {
+		t.Fatalf("decode stored HTTP ingress config: %v", err)
+	}
+	if before.Auth.PasswordHash == "" {
+		t.Fatalf("stored HTTP ingress config should contain password hash: %s", string(stored.Ingress.Config))
+	}
+
+	update := []byte(fmt.Sprintf(`{
+		"expected_revision":%d,
+		"spec":{
+			"name":"http-basic-unknown",
+			"topology":"server_expose",
+			"ingress":{"location":"server","type":"http_host","config":{
+				"domain":"basic-unknown.example.com",
+				"allowed_source_cidrs":["0.0.0.0/0","::/0"],
+				"unexpected":true,
+				"auth":{"type":"basic","username":"alice"}
+			}},
+			"target":{"location":"client","client_id":"%s","type":"tcp_service","config":{"ip":"127.0.0.1","port":8080}},
+			"transport_policy":"server_relay_only"
+		}
+	}`, created.Revision, target.ID))
+	updateResp := doMuxRequest(t, handler, http.MethodPut, "/api/tunnels/"+created.ID, token, update)
+	if updateResp.Code != http.StatusBadRequest {
+		t.Fatalf("HTTP Basic preserve with unknown field: want 400, got %d body=%s", updateResp.Code, updateResp.Body.String())
+	}
+	after, err := s.store.GetTunnelByIDE(created.OwnerClientID, created.ID)
+	if err != nil {
+		t.Fatalf("load tunnel after rejected update: %v", err)
+	}
+	if after.Revision != stored.Revision {
+		t.Fatalf("rejected update should keep revision %d, got %d", stored.Revision, after.Revision)
+	}
+	var afterCfg httpHostConfigAPI
+	if err := json.Unmarshal(after.Ingress.Config, &afterCfg); err != nil {
+		t.Fatalf("decode post-reject HTTP ingress config: %v", err)
+	}
+	if afterCfg.Auth.PasswordHash != before.Auth.PasswordHash {
+		t.Fatal("rejected update should keep existing HTTP Basic password hash")
+	}
+}
+
 func TestAPI_UnifiedTunnelRejectsFutureTargetsAndDirectPolicies(t *testing.T) {
 	s, handler, token, cleanup := setupTestServerWithStores(t, true)
 	defer cleanup()
@@ -359,7 +986,7 @@ func TestAPI_UnifiedTunnelRejectsFutureTargetsAndDirectPolicies(t *testing.T) {
 	futureBody := []byte(`{
 		"name":"future-target",
 		"topology":"server_expose",
-		"ingress":{"location":"server","type":"tcp_listen","config":{"bind_ip":"0.0.0.0","port":22002}},
+		"ingress":{"location":"server","type":"tcp_listen","config":{"bind_ip":"0.0.0.0","port":22002,"allowed_source_cidrs":["0.0.0.0/0","::/0"]}},
 		"target":{"location":"client","client_id":"` + record.ID + `","type":"static_file","config":{"root":"/tmp"}},
 		"transport_policy":"server_relay_only"
 	}`)
@@ -381,7 +1008,7 @@ func TestAPI_UnifiedTunnelRejectsFutureTargetsAndDirectPolicies(t *testing.T) {
 	directBody := []byte(`{
 		"name":"direct-policy",
 		"topology":"client_to_client",
-		"ingress":{"location":"client","client_id":"` + record.ID + `","type":"tcp_listen","config":{"bind_ip":"127.0.0.1","port":22003}},
+		"ingress":{"location":"client","client_id":"` + record.ID + `","type":"tcp_listen","config":{"bind_ip":"127.0.0.1","port":22003,"allowed_source_cidrs":["0.0.0.0/0","::/0"]}},
 		"target":{"location":"client","client_id":"` + record.ID + `","type":"tcp_service","config":{"ip":"127.0.0.1","port":22}},
 		"transport_policy":"direct_only"
 	}`)
@@ -405,7 +1032,7 @@ func TestAPI_UnifiedTunnelRejectsFutureTargetsAndDirectPolicies(t *testing.T) {
 	clientRelayBody := []byte(`{
 		"name":"client-relay-direct",
 		"topology":"client_to_client",
-		"ingress":{"location":"client","client_id":"` + ingress.ID + `","type":"tcp_listen","config":{"bind_ip":"127.0.0.1","port":22003}},
+		"ingress":{"location":"client","client_id":"` + ingress.ID + `","type":"tcp_listen","config":{"bind_ip":"127.0.0.1","port":22003,"allowed_source_cidrs":["0.0.0.0/0","::/0"]}},
 		"target":{"location":"client","client_id":"` + source.ID + `","type":"tcp_service","config":{"ip":"127.0.0.1","port":22}},
 		"transport_policy":"direct_only"
 	}`)
@@ -432,7 +1059,7 @@ func TestAPI_UnifiedTunnelCreateClientToClientPersistsOwnerAndRoles(t *testing.T
 	body := []byte(`{
 		"name":"source-to-ingress",
 		"topology":"client_to_client",
-		"ingress":{"location":"client","client_id":"` + ingress.ID + `","type":"tcp_listen","config":{"bind_ip":"127.0.0.1","port":23001}},
+		"ingress":{"location":"client","client_id":"` + ingress.ID + `","type":"tcp_listen","config":{"bind_ip":"127.0.0.1","port":23001,"allowed_source_cidrs":["0.0.0.0/0","::/0"]}},
 		"target":{"location":"client","client_id":"` + source.ID + `","type":"tcp_service","config":{"host":"a2","port":8080}},
 		"transport_policy":"server_relay_only"
 	}`)
@@ -499,7 +1126,7 @@ func TestAPI_UnifiedTunnelRejectsSameClientToClientParticipants(t *testing.T) {
 	body := []byte(`{
 		"name":"bad-same-client",
 		"topology":"client_to_client",
-		"ingress":{"location":"client","client_id":"` + record.ID + `","type":"tcp_listen","config":{"bind_ip":"127.0.0.1","port":23002}},
+		"ingress":{"location":"client","client_id":"` + record.ID + `","type":"tcp_listen","config":{"bind_ip":"127.0.0.1","port":23002,"allowed_source_cidrs":["0.0.0.0/0","::/0"]}},
 		"target":{"location":"client","client_id":"` + record.ID + `","type":"tcp_service","config":{"ip":"127.0.0.1","port":22}},
 		"transport_policy":"server_relay_only"
 	}`)
@@ -534,7 +1161,7 @@ func TestAPI_UnifiedTunnelUpdateRequiresExpectedRevisionAndHardDelete(t *testing
 	staleUpdate := []byte(`{"expected_revision":99,"spec":{
 		"name":"revise-me",
 		"topology":"server_expose",
-		"ingress":{"location":"server","type":"tcp_listen","config":{"bind_ip":"0.0.0.0","port":22004}},
+		"ingress":{"location":"server","type":"tcp_listen","config":{"bind_ip":"0.0.0.0","port":22004,"allowed_source_cidrs":["0.0.0.0/0","::/0"]}},
 		"target":{"location":"client","client_id":"` + record.ID + `","type":"tcp_service","config":{"ip":"127.0.0.1","port":2222}},
 		"transport_policy":"server_relay_only"
 	}}`)
@@ -561,7 +1188,7 @@ func TestAPI_UnifiedTunnelUpdateRequiresExpectedRevisionAndHardDelete(t *testing
 	missingRevisionResp := doMuxRequest(t, handler, http.MethodPut, "/api/tunnels/"+created.ID, token, []byte(`{"spec":{
 		"name":"revise-me",
 		"topology":"server_expose",
-		"ingress":{"location":"server","type":"tcp_listen","config":{"bind_ip":"0.0.0.0","port":22004}},
+		"ingress":{"location":"server","type":"tcp_listen","config":{"bind_ip":"0.0.0.0","port":22004,"allowed_source_cidrs":["0.0.0.0/0","::/0"]}},
 		"target":{"location":"client","client_id":"`+record.ID+`","type":"tcp_service","config":{"ip":"127.0.0.1","port":2222}},
 		"transport_policy":"server_relay_only"
 	}}`))
@@ -587,7 +1214,7 @@ func TestAPI_UnifiedTunnelUpdateRequiresExpectedRevisionAndHardDelete(t *testing
 	validUpdate := []byte(`{"expected_revision":1,"spec":{
 		"name":"revise-me",
 		"topology":"server_expose",
-		"ingress":{"location":"server","type":"tcp_listen","config":{"bind_ip":"0.0.0.0","port":22005}},
+		"ingress":{"location":"server","type":"tcp_listen","config":{"bind_ip":"0.0.0.0","port":22005,"allowed_source_cidrs":["0.0.0.0/0","::/0"]}},
 		"target":{"location":"client","client_id":"` + record.ID + `","type":"tcp_service","config":{"ip":"127.0.0.1","port":2222}},
 		"transport_policy":"server_relay_only",
 		"bandwidth_settings":{"ingress_bps":128,"egress_bps":256}
@@ -648,7 +1275,7 @@ func TestAPI_UnifiedTunnelUpdateUnprovisionsOldServerExposeTarget(t *testing.T) 
 	create := []byte(fmt.Sprintf(`{
 		"name":"server-expose-update",
 		"topology":"server_expose",
-		"ingress":{"location":"server","type":"tcp_listen","config":{"bind_ip":"0.0.0.0","port":%d}},
+		"ingress":{"location":"server","type":"tcp_listen","config":{"bind_ip":"0.0.0.0","port":%d,"allowed_source_cidrs":["0.0.0.0/0","::/0"]}},
 		"target":{"location":"client","client_id":"%s","type":"tcp_service","config":{"ip":"127.0.0.1","port":22}},
 		"transport_policy":"server_relay_only"
 	}`, reserveTCPPort(t), targetAuth.ClientID))
@@ -668,7 +1295,7 @@ func TestAPI_UnifiedTunnelUpdateUnprovisionsOldServerExposeTarget(t *testing.T) 
 	update := []byte(fmt.Sprintf(`{"expected_revision":%d,"spec":{
 		"name":"server-expose-update",
 		"topology":"server_expose",
-		"ingress":{"location":"server","type":"tcp_listen","config":{"bind_ip":"0.0.0.0","port":%d}},
+		"ingress":{"location":"server","type":"tcp_listen","config":{"bind_ip":"0.0.0.0","port":%d,"allowed_source_cidrs":["0.0.0.0/0","::/0"]}},
 		"target":{"location":"client","client_id":"%s","type":"tcp_service","config":{"ip":"127.0.0.1","port":2222}},
 		"transport_policy":"server_relay_only"
 	}}`, created.Revision, reserveTCPPort(t), targetAuth.ClientID))
@@ -698,7 +1325,7 @@ func TestAPI_UnifiedTunnelDeleteUnprovisionsServerExposeTarget(t *testing.T) {
 	create := []byte(fmt.Sprintf(`{
 		"name":"server-expose-delete",
 		"topology":"server_expose",
-		"ingress":{"location":"server","type":"tcp_listen","config":{"bind_ip":"0.0.0.0","port":%d}},
+		"ingress":{"location":"server","type":"tcp_listen","config":{"bind_ip":"0.0.0.0","port":%d,"allowed_source_cidrs":["0.0.0.0/0","::/0"]}},
 		"target":{"location":"client","client_id":"%s","type":"tcp_service","config":{"ip":"127.0.0.1","port":22}},
 		"transport_policy":"server_relay_only"
 	}`, reserveTCPPort(t), targetAuth.ClientID))
@@ -754,7 +1381,7 @@ func TestAPI_UnifiedTunnelDeleteUnprovisionsClientToClientParticipants(t *testin
 	create := []byte(fmt.Sprintf(`{
 		"name":"c2c-delete",
 		"topology":"client_to_client",
-		"ingress":{"location":"client","client_id":"%s","type":"tcp_listen","config":{"bind_ip":"127.0.0.1","port":%d}},
+		"ingress":{"location":"client","client_id":"%s","type":"tcp_listen","config":{"bind_ip":"127.0.0.1","port":%d,"allowed_source_cidrs":["0.0.0.0/0","::/0"]}},
 		"target":{"location":"client","client_id":"%s","type":"tcp_service","config":{"ip":"127.0.0.1","port":22}},
 		"transport_policy":"server_relay_only"
 	}`, ingressAuth.ClientID, reserveTCPPort(t), targetAuth.ClientID))
@@ -810,7 +1437,7 @@ func TestAPI_UnifiedTunnelUpdateUnprovisionsOldClientToClientParticipants(t *tes
 	create := []byte(fmt.Sprintf(`{
 		"name":"c2c-update",
 		"topology":"client_to_client",
-		"ingress":{"location":"client","client_id":"%s","type":"tcp_listen","config":{"bind_ip":"127.0.0.1","port":%d}},
+		"ingress":{"location":"client","client_id":"%s","type":"tcp_listen","config":{"bind_ip":"127.0.0.1","port":%d,"allowed_source_cidrs":["0.0.0.0/0","::/0"]}},
 		"target":{"location":"client","client_id":"%s","type":"tcp_service","config":{"ip":"127.0.0.1","port":22}},
 		"transport_policy":"server_relay_only"
 	}`, ingressAuth.ClientID, reserveTCPPort(t), targetAuth.ClientID))
@@ -830,7 +1457,7 @@ func TestAPI_UnifiedTunnelUpdateUnprovisionsOldClientToClientParticipants(t *tes
 	update := []byte(fmt.Sprintf(`{"expected_revision":%d,"spec":{
 		"name":"c2c-update",
 		"topology":"client_to_client",
-		"ingress":{"location":"client","client_id":"%s","type":"tcp_listen","config":{"bind_ip":"127.0.0.1","port":%d}},
+		"ingress":{"location":"client","client_id":"%s","type":"tcp_listen","config":{"bind_ip":"127.0.0.1","port":%d,"allowed_source_cidrs":["0.0.0.0/0","::/0"]}},
 		"target":{"location":"client","client_id":"%s","type":"tcp_service","config":{"ip":"127.0.0.1","port":2222}},
 		"transport_policy":"server_relay_only"
 	}}`, created.Revision, ingressAuth.ClientID, reserveTCPPort(t), targetAuth.ClientID))
@@ -871,7 +1498,7 @@ func TestAPI_UnifiedTunnelStopUnprovisionsClientToClientParticipants(t *testing.
 	create := []byte(fmt.Sprintf(`{
 		"name":"c2c-stop",
 		"topology":"client_to_client",
-		"ingress":{"location":"client","client_id":"%s","type":"tcp_listen","config":{"bind_ip":"127.0.0.1","port":%d}},
+		"ingress":{"location":"client","client_id":"%s","type":"tcp_listen","config":{"bind_ip":"127.0.0.1","port":%d,"allowed_source_cidrs":["0.0.0.0/0","::/0"]}},
 		"target":{"location":"client","client_id":"%s","type":"tcp_service","config":{"ip":"127.0.0.1","port":22}},
 		"transport_policy":"server_relay_only"
 	}`, ingressAuth.ClientID, reserveTCPPort(t), targetAuth.ClientID))
@@ -926,7 +1553,7 @@ func TestAPI_UnifiedTunnelCreateDoesNotWaitForServerExposeProvisionAck(t *testin
 	create := []byte(fmt.Sprintf(`{
 		"name":"server-expose-async",
 		"topology":"server_expose",
-		"ingress":{"location":"server","type":"tcp_listen","config":{"bind_ip":"0.0.0.0","port":%d}},
+		"ingress":{"location":"server","type":"tcp_listen","config":{"bind_ip":"0.0.0.0","port":%d,"allowed_source_cidrs":["0.0.0.0/0","::/0"]}},
 		"target":{"location":"client","client_id":"%s","type":"tcp_service","config":{"ip":"127.0.0.1","port":22}},
 		"transport_policy":"server_relay_only"
 	}`, reserveTCPPort(t), targetAuth.ClientID))
@@ -968,7 +1595,7 @@ func TestAPI_UnifiedTunnelCreatePersistsProvisionRuntimeFailure(t *testing.T) {
 	create := []byte(fmt.Sprintf(`{
 		"name":"c2c-provision-timeout",
 		"topology":"client_to_client",
-		"ingress":{"location":"client","client_id":"%s","type":"tcp_listen","config":{"bind_ip":"127.0.0.1","port":%d}},
+		"ingress":{"location":"client","client_id":"%s","type":"tcp_listen","config":{"bind_ip":"127.0.0.1","port":%d,"allowed_source_cidrs":["0.0.0.0/0","::/0"]}},
 		"target":{"location":"client","client_id":"%s","type":"tcp_service","config":{"ip":"127.0.0.1","port":22}},
 		"transport_policy":"server_relay_only"
 	}`, ingressAuth.ClientID, reserveTCPPort(t), targetAuth.ClientID))
@@ -1025,7 +1652,7 @@ func TestAPI_UnifiedTunnelServerExposeProvisionTimeoutProjectsIssue(t *testing.T
 	create := []byte(fmt.Sprintf(`{
 		"name":"server-expose-provision-timeout",
 		"topology":"server_expose",
-		"ingress":{"location":"server","type":"tcp_listen","config":{"bind_ip":"0.0.0.0","port":%d}},
+		"ingress":{"location":"server","type":"tcp_listen","config":{"bind_ip":"0.0.0.0","port":%d,"allowed_source_cidrs":["0.0.0.0/0","::/0"]}},
 		"target":{"location":"client","client_id":"%s","type":"tcp_service","config":{"ip":"127.0.0.1","port":22}},
 		"transport_policy":"server_relay_only"
 	}`, reserveTCPPort(t), targetAuth.ClientID))
@@ -1105,7 +1732,7 @@ func TestAPI_UnifiedTunnelServerExposeListenFailureProjectsIssue(t *testing.T) {
 	create := []byte(fmt.Sprintf(`{
 		"name":"server-expose-listen-race",
 		"topology":"server_expose",
-		"ingress":{"location":"server","type":"tcp_listen","config":{"bind_ip":"0.0.0.0","port":%d}},
+		"ingress":{"location":"server","type":"tcp_listen","config":{"bind_ip":"0.0.0.0","port":%d,"allowed_source_cidrs":["0.0.0.0/0","::/0"]}},
 		"target":{"location":"client","client_id":"%s","type":"tcp_service","config":{"ip":"127.0.0.1","port":22}},
 		"transport_policy":"server_relay_only"
 	}`, port, target.ID))
@@ -1180,7 +1807,7 @@ func TestAPI_UnifiedTunnelUpdateSameIngressPortSkipsSelfPreflightConflict(t *tes
 	create := []byte(fmt.Sprintf(`{
 		"name":"c2c-same-port",
 		"topology":"client_to_client",
-		"ingress":{"location":"client","client_id":"%s","type":"tcp_listen","config":{"bind_ip":"127.0.0.1","port":%d}},
+		"ingress":{"location":"client","client_id":"%s","type":"tcp_listen","config":{"bind_ip":"127.0.0.1","port":%d,"allowed_source_cidrs":["0.0.0.0/0","::/0"]}},
 		"target":{"location":"client","client_id":"%s","type":"tcp_service","config":{"ip":"127.0.0.1","port":22}},
 		"transport_policy":"server_relay_only"
 	}`, ingressAuth.ClientID, ingressPort, targetAuth.ClientID))
@@ -1200,7 +1827,7 @@ func TestAPI_UnifiedTunnelUpdateSameIngressPortSkipsSelfPreflightConflict(t *tes
 	update := []byte(fmt.Sprintf(`{"expected_revision":%d,"spec":{
 		"name":"c2c-same-port",
 		"topology":"client_to_client",
-		"ingress":{"location":"client","client_id":"%s","type":"tcp_listen","config":{"bind_ip":"127.0.0.1","port":%d}},
+		"ingress":{"location":"client","client_id":"%s","type":"tcp_listen","config":{"bind_ip":"127.0.0.1","port":%d,"allowed_source_cidrs":["0.0.0.0/0","::/0"]}},
 		"target":{"location":"client","client_id":"%s","type":"tcp_service","config":{"ip":"127.0.0.1","port":2222}},
 		"transport_policy":"server_relay_only"
 	}}`, created.Revision, ingressAuth.ClientID, ingressPort, targetAuth.ClientID))
@@ -1242,7 +1869,7 @@ func TestAPI_UnifiedTunnelUpdatePreflightFailureKeepsOldClientToClientConfig(t *
 	create := []byte(fmt.Sprintf(`{
 		"name":"c2c-preflight-update",
 		"topology":"client_to_client",
-		"ingress":{"location":"client","client_id":"%s","type":"tcp_listen","config":{"bind_ip":"127.0.0.1","port":%d}},
+		"ingress":{"location":"client","client_id":"%s","type":"tcp_listen","config":{"bind_ip":"127.0.0.1","port":%d,"allowed_source_cidrs":["0.0.0.0/0","::/0"]}},
 		"target":{"location":"client","client_id":"%s","type":"tcp_service","config":{"ip":"127.0.0.1","port":22}},
 		"transport_policy":"server_relay_only"
 	}`, ingressAuth.ClientID, ingressPort, targetAuth.ClientID))
@@ -1262,7 +1889,7 @@ func TestAPI_UnifiedTunnelUpdatePreflightFailureKeepsOldClientToClientConfig(t *
 	update := []byte(fmt.Sprintf(`{"expected_revision":%d,"spec":{
 		"name":"c2c-preflight-update",
 		"topology":"client_to_client",
-		"ingress":{"location":"client","client_id":"%s","type":"tcp_listen","config":{"bind_ip":"127.0.0.1","port":%d}},
+		"ingress":{"location":"client","client_id":"%s","type":"tcp_listen","config":{"bind_ip":"127.0.0.1","port":%d,"allowed_source_cidrs":["0.0.0.0/0","::/0"]}},
 		"target":{"location":"client","client_id":"%s","type":"tcp_service","config":{"ip":"127.0.0.1","port":2222}},
 		"transport_policy":"server_relay_only"
 	}}`, created.Revision, ingressAuth.ClientID, reserveTCPPort(t), targetAuth.ClientID))
@@ -1426,7 +2053,11 @@ func addUnifiedC2CTestTunnel(t *testing.T, s *Server, name, ingressClientID, tar
 			Location: tunnelEndpointLocationClient,
 			ClientID: ingressClientID,
 			Type:     tunnelIngressTypeTCPListen,
-			Config:   mustRawJSON(tcpListenConfigAPI{BindIP: "127.0.0.1", Port: ingressPort}),
+			Config: mustRawJSON(tcpListenConfigAPI{
+				BindIP:             "127.0.0.1",
+				Port:               ingressPort,
+				AllowedSourceCIDRs: allowAllSourceCIDRs(),
+			}),
 		},
 		Target: endpointSpecAPI{
 			Location: tunnelEndpointLocationClient,
@@ -1655,7 +2286,7 @@ func TestAPI_UnifiedTunnelSuppressesRuntimeReportIssuesWhenClientOffline(t *test
 	body := []byte(`{
 		"name":"issue-offline-c2c",
 		"topology":"client_to_client",
-		"ingress":{"location":"client","client_id":"` + ingress.ID + `","type":"tcp_listen","config":{"bind_ip":"127.0.0.1","port":24002}},
+		"ingress":{"location":"client","client_id":"` + ingress.ID + `","type":"tcp_listen","config":{"bind_ip":"127.0.0.1","port":24002,"allowed_source_cidrs":["0.0.0.0/0","::/0"]}},
 		"target":{"location":"client","client_id":"` + target.ID + `","type":"tcp_service","config":{"ip":"127.0.0.1","port":22}},
 		"transport_policy":"server_relay_only"
 	}`)
@@ -1699,7 +2330,7 @@ func TestAPI_UnifiedTunnelRejectsClientIngressResourceConflictBeforePersist(t *t
 	first := []byte(`{
 		"name":"first-c2c",
 		"topology":"client_to_client",
-		"ingress":{"location":"client","client_id":"` + ingress.ID + `","type":"tcp_listen","config":{"bind_ip":"0.0.0.0","port":25001}},
+		"ingress":{"location":"client","client_id":"` + ingress.ID + `","type":"tcp_listen","config":{"bind_ip":"0.0.0.0","port":25001,"allowed_source_cidrs":["0.0.0.0/0","::/0"]}},
 		"target":{"location":"client","client_id":"` + targetA.ID + `","type":"tcp_service","config":{"ip":"127.0.0.1","port":22}},
 		"transport_policy":"server_relay_only"
 	}`)
@@ -1711,7 +2342,7 @@ func TestAPI_UnifiedTunnelRejectsClientIngressResourceConflictBeforePersist(t *t
 	conflict := []byte(`{
 		"name":"conflict-c2c",
 		"topology":"client_to_client",
-		"ingress":{"location":"client","client_id":"` + ingress.ID + `","type":"tcp_listen","config":{"bind_ip":"127.0.0.1","port":25001}},
+		"ingress":{"location":"client","client_id":"` + ingress.ID + `","type":"tcp_listen","config":{"bind_ip":"127.0.0.1","port":25001,"allowed_source_cidrs":["0.0.0.0/0","::/0"]}},
 		"target":{"location":"client","client_id":"` + targetB.ID + `","type":"tcp_service","config":{"ip":"127.0.0.1","port":22}},
 		"transport_policy":"server_relay_only"
 	}`)
@@ -1746,7 +2377,7 @@ func TestAPI_UnifiedTunnelRejectsOccupiedServerExposePortBeforePersist(t *testin
 	body := []byte(`{
 		"name":"server-port-busy",
 		"topology":"server_expose",
-		"ingress":{"location":"server","type":"tcp_listen","config":{"bind_ip":"0.0.0.0","port":` + strconv.Itoa(port) + `}},
+		"ingress":{"location":"server","type":"tcp_listen","config":{"bind_ip":"0.0.0.0","port":` + strconv.Itoa(port) + `,"allowed_source_cidrs":["0.0.0.0/0","::/0"]}},
 		"target":{"location":"client","client_id":"` + target.ID + `","type":"tcp_service","config":{"ip":"127.0.0.1","port":22}},
 		"transport_policy":"server_relay_only"
 	}`)
@@ -1775,7 +2406,7 @@ func TestAPI_UnifiedTunnelAllowsServerExposeTCPAndUDPSamePort(t *testing.T) {
 	tcpBody := []byte(`{
 		"name":"server-shared-tcp",
 		"topology":"server_expose",
-		"ingress":{"location":"server","type":"tcp_listen","config":{"bind_ip":"0.0.0.0","port":` + strconv.Itoa(port) + `}},
+		"ingress":{"location":"server","type":"tcp_listen","config":{"bind_ip":"0.0.0.0","port":` + strconv.Itoa(port) + `,"allowed_source_cidrs":["0.0.0.0/0","::/0"]}},
 		"target":{"location":"client","client_id":"` + target.ID + `","type":"tcp_service","config":{"ip":"127.0.0.1","port":22}},
 		"transport_policy":"server_relay_only"
 	}`)
@@ -1787,13 +2418,60 @@ func TestAPI_UnifiedTunnelAllowsServerExposeTCPAndUDPSamePort(t *testing.T) {
 	udpBody := []byte(`{
 		"name":"server-shared-udp",
 		"topology":"server_expose",
-		"ingress":{"location":"server","type":"udp_listen","config":{"bind_ip":"0.0.0.0","port":` + strconv.Itoa(port) + `}},
+		"ingress":{"location":"server","type":"udp_listen","config":{"bind_ip":"0.0.0.0","port":` + strconv.Itoa(port) + `,"allowed_source_cidrs":["0.0.0.0/0","::/0"]}},
 		"target":{"location":"client","client_id":"` + target.ID + `","type":"udp_service","config":{"ip":"127.0.0.1","port":5353}},
 		"transport_policy":"server_relay_only"
 	}`)
 	resp = doMuxRequest(t, handler, http.MethodPost, "/api/tunnels", token, udpBody)
 	if resp.Code != http.StatusCreated {
 		t.Fatalf("server UDP same-port create: want 201, got %d body=%s", resp.Code, resp.Body.String())
+	}
+}
+
+func TestAPI_UnifiedTunnelRejectsServerExposeTCPAndSOCKS5SamePort(t *testing.T) {
+	s, handler, token, cleanup := setupTestServerWithStores(t, true)
+	defer cleanup()
+
+	target := createUnifiedAPITestClient(t, s, "install-server-socks5-conflict-target", "server-socks5-conflict-target")
+	port := reserveTCPPort(t)
+	tcpBody := []byte(`{
+		"name":"server-conflict-tcp",
+		"topology":"server_expose",
+		"ingress":{"location":"server","type":"tcp_listen","config":{"bind_ip":"0.0.0.0","port":` + strconv.Itoa(port) + `,"allowed_source_cidrs":["0.0.0.0/0","::/0"]}},
+		"target":{"location":"client","client_id":"` + target.ID + `","type":"tcp_service","config":{"ip":"127.0.0.1","port":22}},
+		"transport_policy":"server_relay_only"
+	}`)
+	resp := doMuxRequest(t, handler, http.MethodPost, "/api/tunnels", token, tcpBody)
+	if resp.Code != http.StatusCreated {
+		t.Fatalf("server TCP create: want 201, got %d body=%s", resp.Code, resp.Body.String())
+	}
+
+	socksBody := []byte(`{
+		"name":"server-conflict-socks5",
+		"topology":"server_expose",
+		"ingress":{"location":"server","type":"socks5_listen","config":{
+			"bind_ip":"0.0.0.0",
+			"port":` + strconv.Itoa(port) + `,
+			"allowed_source_cidrs":["0.0.0.0/0","::/0"],
+			"auth":{"type":"none"}
+		}},
+		"target":{"location":"client","client_id":"` + target.ID + `","type":"socks5_connect_handler","config":{
+			"allowed_target_cidrs":["0.0.0.0/0","::/0"],
+			"dial_timeout_seconds":10
+		}},
+		"transport_policy":"server_relay_only",
+		"confirm_no_auth_risk":true
+	}`)
+	resp = doMuxRequest(t, handler, http.MethodPost, "/api/tunnels", token, socksBody)
+	if resp.Code != http.StatusConflict {
+		t.Fatalf("server SOCKS5 same TCP port create: want 409, got %d body=%s", resp.Code, resp.Body.String())
+	}
+	var bodyResp tunnelMutationErrorResponse
+	if err := mustDecodeJSON(t, resp.Body, &bodyResp); err != nil {
+		t.Fatalf("decode conflict error: %v", err)
+	}
+	if bodyResp.ErrorCode != protocol.TunnelMutationErrorCodeIngressResourceConflict || bodyResp.Field != "ingress.config.port" {
+		t.Fatalf("conflict error mismatch: %+v", bodyResp)
 	}
 }
 
@@ -1813,7 +2491,7 @@ func TestAPI_UnifiedTunnelOnlineIngressPreflightFailureDoesNotPersist(t *testing
 	body := []byte(`{
 		"name":"preflight-c2c",
 		"topology":"client_to_client",
-		"ingress":{"location":"client","client_id":"` + ingress.ID + `","type":"tcp_listen","config":{"bind_ip":"127.0.0.1","port":26001}},
+		"ingress":{"location":"client","client_id":"` + ingress.ID + `","type":"tcp_listen","config":{"bind_ip":"127.0.0.1","port":26001,"allowed_source_cidrs":["0.0.0.0/0","::/0"]}},
 		"target":{"location":"client","client_id":"` + target.ID + `","type":"tcp_service","config":{"ip":"127.0.0.1","port":22}},
 		"transport_policy":"server_relay_only"
 	}`)
@@ -1833,6 +2511,64 @@ func TestAPI_UnifiedTunnelOnlineIngressPreflightFailureDoesNotPersist(t *testing
 	}
 }
 
+func TestAPI_UnifiedTunnelSOCKS5ClientIngressPreflightUsesMinimalConfig(t *testing.T) {
+	s := New(0)
+	initTestAdminStore(t, s)
+	s.store = newTestTunnelStore(t)
+	ts := httptest.NewServer(s.newHTTPMux())
+	defer ts.Close()
+	token := loginAdminTokenLocal(t, s.StartHTTPOnly(), "admin", "password123")
+
+	targetConn, targetAuth := connectAndAuthWithInstallID(t, ts, "socks5-preflight-target", "install-socks5-preflight-target")
+	defer mustClose(t, targetConn)
+	ingressConn, ingressAuth := connectAndAuthWithInstallID(t, ts, "socks5-preflight-ingress", "install-socks5-preflight-ingress")
+	defer mustClose(t, ingressConn)
+	setLiveClientDefaultCapabilities(t, s, targetAuth.ClientID)
+	setLiveClientDefaultCapabilities(t, s, ingressAuth.ClientID)
+
+	secret := "preflight-secret"
+	port := reserveTCPPort(t)
+	create := []byte(fmt.Sprintf(`{
+		"name":"socks5-preflight-c2c",
+		"topology":"client_to_client",
+		"ingress":{"location":"client","client_id":"%s","type":"socks5_listen","config":{
+			"bind_ip":"127.0.0.1",
+			"port":%d,
+			"allowed_source_cidrs":["127.0.0.0/8"],
+			"auth":{"type":"username_password","username":"alice","password":"%s"}
+		}},
+		"target":{"location":"client","client_id":"%s","type":"socks5_connect_handler","config":{
+			"allowed_target_cidrs":["0.0.0.0/0","::/0"],
+			"dial_timeout_seconds":10
+		}},
+		"transport_policy":"server_relay_only"
+	}`, ingressAuth.ClientID, port, secret, targetAuth.ClientID))
+	respCh := doMuxRequestAsync(t, s.StartHTTPOnly(), http.MethodPost, "/api/tunnels", token, create)
+	preflightReq := acceptPreflight(t, ingressConn)
+	if preflightReq.Ingress.Type != protocol.IngressTypeSOCKS5Listen {
+		t.Fatalf("SOCKS5 preflight type mismatch: %+v", preflightReq.Ingress)
+	}
+	if bytes.Contains(preflightReq.Ingress.Config, []byte(secret)) ||
+		bytes.Contains(preflightReq.Ingress.Config, []byte(`"auth"`)) ||
+		bytes.Contains(preflightReq.Ingress.Config, []byte(`"password_hash"`)) ||
+		bytes.Contains(preflightReq.Ingress.Config, []byte(`"password"`)) {
+		t.Fatalf("SOCKS5 preflight must not carry auth material, got %s", string(preflightReq.Ingress.Config))
+	}
+	var bind tcpListenConfigAPI
+	if err := json.Unmarshal(preflightReq.Ingress.Config, &bind); err != nil {
+		t.Fatalf("decode preflight bind config: %v", err)
+	}
+	if bind.BindIP != "127.0.0.1" || bind.Port != port {
+		t.Fatalf("preflight bind config mismatch: %+v", bind)
+	}
+	ackProvisionMessages(t, targetConn, 1)
+	ackProvisionMessages(t, ingressConn, 1)
+	resp := awaitMuxResponse(t, respCh)
+	if resp.Code != http.StatusCreated {
+		t.Fatalf("SOCKS5 c2c create: want 201, got %d body=%s", resp.Code, resp.Body.String())
+	}
+}
+
 func TestReconcileUnifiedTunnelRoutesClientToClientThroughSingleEntry(t *testing.T) {
 	s, _, _, cleanup := setupTestServerWithStores(t, true)
 	defer cleanup()
@@ -1847,7 +2583,7 @@ func TestReconcileUnifiedTunnelRoutesClientToClientThroughSingleEntry(t *testing
 			Location: tunnelEndpointLocationClient,
 			ClientID: ingress.ID,
 			Type:     tunnelIngressTypeTCPListen,
-			Config:   mustRawJSON(tcpListenConfigAPI{BindIP: "127.0.0.1", Port: 27001}),
+			Config:   mustRawJSON(tcpListenConfigAPI{BindIP: "127.0.0.1", Port: 27001, AllowedSourceCIDRs: allowAllSourceCIDRs()}),
 		},
 		Target: endpointSpecAPI{
 			Location: tunnelEndpointLocationClient,
@@ -1958,7 +2694,7 @@ func TestAPI_UnifiedTunnelAcceptsAllServerRelayCloseoutShapes(t *testing.T) {
 				return []byte(`{
 				"name":"shape-server-tcp",
 				"topology":"server_expose",
-				"ingress":{"location":"server","type":"tcp_listen","config":{"bind_ip":"0.0.0.0","port":` + strconv.Itoa(reserveTCPPort(t)) + `}},
+				"ingress":{"location":"server","type":"tcp_listen","config":{"bind_ip":"0.0.0.0","port":` + strconv.Itoa(reserveTCPPort(t)) + `,"allowed_source_cidrs":["0.0.0.0/0","::/0"]}},
 				"target":{"location":"client","client_id":"` + target.ID + `","type":"tcp_service","config":{"ip":"127.0.0.1","port":22}},
 				"transport_policy":"server_relay_only"
 			}`)
@@ -1971,7 +2707,7 @@ func TestAPI_UnifiedTunnelAcceptsAllServerRelayCloseoutShapes(t *testing.T) {
 				return []byte(`{
 				"name":"shape-server-udp",
 				"topology":"server_expose",
-				"ingress":{"location":"server","type":"udp_listen","config":{"bind_ip":"0.0.0.0","port":` + strconv.Itoa(reserveUDPPort(t)) + `}},
+				"ingress":{"location":"server","type":"udp_listen","config":{"bind_ip":"0.0.0.0","port":` + strconv.Itoa(reserveUDPPort(t)) + `,"allowed_source_cidrs":["0.0.0.0/0","::/0"]}},
 				"target":{"location":"client","client_id":"` + target.ID + `","type":"udp_service","config":{"ip":"127.0.0.1","port":5353}},
 				"transport_policy":"server_relay_only"
 			}`)
@@ -1984,7 +2720,7 @@ func TestAPI_UnifiedTunnelAcceptsAllServerRelayCloseoutShapes(t *testing.T) {
 				return []byte(`{
 				"name":"shape-server-http",
 				"topology":"server_expose",
-				"ingress":{"location":"server","type":"http_host","config":{"domain":"shape-http.example.com"}},
+				"ingress":{"location":"server","type":"http_host","config":{"domain":"shape-http.example.com","allowed_source_cidrs":["0.0.0.0/0","::/0"]}},
 				"target":{"location":"client","client_id":"` + target.ID + `","type":"tcp_service","config":{"ip":"127.0.0.1","port":8080}},
 				"transport_policy":"server_relay_only"
 			}`)
@@ -1997,7 +2733,7 @@ func TestAPI_UnifiedTunnelAcceptsAllServerRelayCloseoutShapes(t *testing.T) {
 				return []byte(`{
 				"name":"shape-c2c-tcp",
 				"topology":"client_to_client",
-				"ingress":{"location":"client","client_id":"` + ingress.ID + `","type":"tcp_listen","config":{"bind_ip":"127.0.0.1","port":` + strconv.Itoa(reserveTCPPort(t)) + `}},
+				"ingress":{"location":"client","client_id":"` + ingress.ID + `","type":"tcp_listen","config":{"bind_ip":"127.0.0.1","port":` + strconv.Itoa(reserveTCPPort(t)) + `,"allowed_source_cidrs":["0.0.0.0/0","::/0"]}},
 				"target":{"location":"client","client_id":"` + target.ID + `","type":"tcp_service","config":{"ip":"127.0.0.1","port":22}},
 				"transport_policy":"server_relay_only"
 			}`)
@@ -2010,7 +2746,7 @@ func TestAPI_UnifiedTunnelAcceptsAllServerRelayCloseoutShapes(t *testing.T) {
 				return []byte(`{
 				"name":"shape-c2c-udp",
 				"topology":"client_to_client",
-				"ingress":{"location":"client","client_id":"` + ingress.ID + `","type":"udp_listen","config":{"bind_ip":"127.0.0.1","port":` + strconv.Itoa(reserveUDPPort(t)) + `}},
+				"ingress":{"location":"client","client_id":"` + ingress.ID + `","type":"udp_listen","config":{"bind_ip":"127.0.0.1","port":` + strconv.Itoa(reserveUDPPort(t)) + `,"allowed_source_cidrs":["0.0.0.0/0","::/0"]}},
 				"target":{"location":"client","client_id":"` + target.ID + `","type":"udp_service","config":{"ip":"127.0.0.1","port":5353}},
 				"transport_policy":"server_relay_only"
 			}`)
@@ -2151,7 +2887,7 @@ func TestAPI_UnifiedTunnelRejectsServerExposeUnsupportedTargetCapability(t *test
 	body := []byte(`{
 		"name":"server-expose-unsupported-target",
 		"topology":"server_expose",
-		"ingress":{"location":"server","type":"tcp_listen","config":{"bind_ip":"0.0.0.0","port":` + strconv.Itoa(reserveTCPPort(t)) + `}},
+		"ingress":{"location":"server","type":"tcp_listen","config":{"bind_ip":"0.0.0.0","port":` + strconv.Itoa(reserveTCPPort(t)) + `,"allowed_source_cidrs":["0.0.0.0/0","::/0"]}},
 		"target":{"location":"client","client_id":"` + record.ID + `","type":"tcp_service","config":{"ip":"127.0.0.1","port":22}},
 		"transport_policy":"server_relay_only"
 	}`)

@@ -1,5 +1,5 @@
 import { bpsToMbpsInput } from '@/lib/format';
-import type { Client, ProxyConfig, ProxyType, TunnelTopology } from '@/types';
+import type { Client, ProxyConfig, TunnelFormType, TunnelTopology } from '@/types';
 
 /** 编辑模式下传入的隧道数据 */
 export interface TunnelDialogEditData extends ProxyConfig {
@@ -12,13 +12,25 @@ export interface TunnelFormState {
   targetClientId: string;
   ingressClientId: string;
   bindIp: string;
-  type: ProxyType;
+  type: TunnelFormType;
   localIp: string;
   localPort: string;
   remotePort: string;
   domain: string;
   ingressBps: string;
   egressBps: string;
+  sourceCidrs: string;
+  socks5AuthEnabled: boolean;
+  socks5Username: string;
+  socks5Password: string;
+  httpAuthEnabled: boolean;
+  httpUsername: string;
+  httpPassword: string;
+  socks5TargetCidrs: string;
+  socks5TargetHosts: string;
+  socks5TargetPorts: string;
+  socks5DialTimeout: string;
+  confirmNoAuthRisk: boolean;
 }
 
 type TunnelInitialFormProps =
@@ -40,16 +52,44 @@ export function getInitialTunnelFormState(props: TunnelInitialFormProps): Tunnel
       topology: props.tunnel.topology ?? 'server_expose',
       targetClientId: props.tunnel.target?.client_id ?? props.tunnel.owner_client_id ?? props.tunnel.client_id ?? props.tunnel.clientId,
       ingressClientId: props.tunnel.ingress?.client_id ?? '',
-      bindIp: props.tunnel.ingress?.type === 'tcp_listen' || props.tunnel.ingress?.type === 'udp_listen'
+      bindIp: props.tunnel.ingress?.type === 'tcp_listen' || props.tunnel.ingress?.type === 'udp_listen' || props.tunnel.ingress?.type === 'socks5_listen'
         ? props.tunnel.ingress.config.bind_ip
         : '0.0.0.0',
-      type: props.tunnel.type,
+      type: getInitialType(props.tunnel),
       localIp: getInitialTargetHost(props.tunnel),
       localPort: String(getInitialTargetPort(props.tunnel) || ''),
       remotePort: String(getInitialIngressPort(props.tunnel) || ''),
       domain: props.tunnel.domain || '',
       ingressBps: bpsToMbpsInput(props.tunnel.ingress_bps),
       egressBps: bpsToMbpsInput(props.tunnel.egress_bps),
+      sourceCidrs: getInitialSourceCIDRs(props.tunnel),
+      socks5AuthEnabled: props.tunnel.ingress?.type === 'socks5_listen'
+        ? props.tunnel.ingress.config.auth.type === 'username_password'
+        : false,
+      socks5Username: props.tunnel.ingress?.type === 'socks5_listen'
+        ? props.tunnel.ingress.config.auth.username ?? ''
+        : '',
+      socks5Password: '',
+      httpAuthEnabled: props.tunnel.ingress?.type === 'http_host'
+        ? props.tunnel.ingress.config.auth?.type === 'basic'
+        : false,
+      httpUsername: props.tunnel.ingress?.type === 'http_host'
+        ? props.tunnel.ingress.config.auth?.username ?? ''
+        : '',
+      httpPassword: '',
+      socks5TargetCidrs: props.tunnel.target?.type === 'socks5_connect_handler'
+        ? props.tunnel.target.config.allowed_target_cidrs.join(', ')
+        : '0.0.0.0/0, ::/0',
+      socks5TargetHosts: props.tunnel.target?.type === 'socks5_connect_handler'
+        ? props.tunnel.target.config.allowed_target_hosts.join(', ')
+        : '',
+      socks5TargetPorts: props.tunnel.target?.type === 'socks5_connect_handler'
+        ? props.tunnel.target.config.allowed_target_ports.join(', ')
+        : '',
+      socks5DialTimeout: props.tunnel.target?.type === 'socks5_connect_handler'
+        ? String(props.tunnel.target.config.dial_timeout_seconds || 10)
+        : '10',
+      confirmNoAuthRisk: false,
     };
   }
 
@@ -66,14 +106,49 @@ export function getInitialTunnelFormState(props: TunnelInitialFormProps): Tunnel
     domain: '',
     ingressBps: '',
     egressBps: '',
+    sourceCidrs: '0.0.0.0/0, ::/0',
+    socks5AuthEnabled: false,
+    socks5Username: '',
+    socks5Password: '',
+    httpAuthEnabled: false,
+    httpUsername: '',
+    httpPassword: '',
+    socks5TargetCidrs: '0.0.0.0/0, ::/0',
+    socks5TargetHosts: '',
+    socks5TargetPorts: '',
+    socks5DialTimeout: '10',
+    confirmNoAuthRisk: false,
   };
 }
 
 function getInitialIngressPort(tunnel: TunnelDialogEditData) {
-  if (tunnel.ingress?.type === 'tcp_listen' || tunnel.ingress?.type === 'udp_listen') {
+  if (tunnel.ingress?.type === 'tcp_listen' || tunnel.ingress?.type === 'udp_listen' || tunnel.ingress?.type === 'socks5_listen') {
     return tunnel.ingress.config.port;
   }
   return tunnel.remote_port;
+}
+
+function getInitialType(tunnel: TunnelDialogEditData): TunnelFormType {
+  if (tunnel.ingress?.type === 'socks5_listen' || tunnel.target?.type === 'socks5_connect_handler') {
+    return 'socks5';
+  }
+  return tunnel.type;
+}
+
+function getInitialSourceCIDRs(tunnel: TunnelDialogEditData) {
+  const ingress = tunnel.ingress;
+  if (
+    ingress?.type === 'tcp_listen'
+    || ingress?.type === 'udp_listen'
+    || ingress?.type === 'http_host'
+    || ingress?.type === 'socks5_listen'
+  ) {
+    const cidrs = ingress.config.allowed_source_cidrs ?? [];
+    if (cidrs.length > 0) {
+      return cidrs.join(', ');
+    }
+  }
+  return '0.0.0.0/0, ::/0';
 }
 
 function getInitialTargetHost(tunnel: TunnelDialogEditData) {

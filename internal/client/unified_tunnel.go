@@ -21,6 +21,7 @@ type clientTunnelRuntime struct {
 	role                string
 	listener            net.Listener
 	packetConn          net.PacketConn
+	sourceCIDRs         []*net.IPNet
 	wg                  sync.WaitGroup
 	runMu               sync.Mutex
 	closing             bool
@@ -255,7 +256,7 @@ func (c *Client) handleTunnelPreflight(req protocol.TunnelPreflightRequest) prot
 	}
 	addr := net.JoinHostPort(cfg.BindIP, fmt.Sprintf("%d", cfg.Port))
 	switch req.Ingress.Type {
-	case protocol.IngressTypeTCPListen:
+	case protocol.IngressTypeTCPListen, protocol.IngressTypeSOCKS5Listen:
 		ln, err := net.Listen("tcp", addr)
 		if err != nil {
 			resp.Accepted = false
@@ -297,6 +298,16 @@ func (c *Client) handleTunnelProvision(rt *sessionRuntime, req protocol.TunnelPr
 
 	switch req.Role {
 	case protocol.DataStreamRoleTarget:
+		if req.Spec.Target.Type == protocol.TargetTypeSOCKS5ConnectHandler {
+			targetRuntime, err := newClientSOCKS5TargetRuntime(req)
+			if err != nil {
+				ack.Accepted = false
+				ack.Message = err.Error()
+				return ack
+			}
+			c.socks5Targets.Store(req.TunnelID, &targetRuntime)
+			return ack
+		}
 		proxyReq, err := proxyRequestFromTunnelSpec(req.Spec)
 		if err != nil {
 			ack.Accepted = false
@@ -330,7 +341,19 @@ func (c *Client) handleTunnelUnprovision(req protocol.TunnelUnprovisionRequest) 
 	}
 
 	if req.Role == protocol.DataStreamRoleTarget || req.Role == "" {
+		c.deleteSOCKS5TargetByTunnelUnprovision(req)
 		c.deleteProxyByTunnelUnprovision(req)
+	}
+}
+
+func (c *Client) deleteSOCKS5TargetByTunnelUnprovision(req protocol.TunnelUnprovisionRequest) {
+	if req.TunnelID == "" {
+		return
+	}
+	if value, ok := c.socks5Targets.Load(req.TunnelID); ok {
+		if target, ok := value.(*clientSOCKS5TargetRuntime); ok && target != nil && tunnelUnprovisionCoversRevision(req.Revision, target.revision) {
+			c.socks5Targets.CompareAndDelete(req.TunnelID, value)
+		}
 	}
 }
 
@@ -389,6 +412,11 @@ func (c *Client) startIngressTunnelRuntime(rt *sessionRuntime, req protocol.Tunn
 		role:     req.Role,
 		done:     make(chan struct{}),
 	}
+	policy, err := decodeIngressAccessPolicy(req.Spec.Ingress.Config, true)
+	if err != nil {
+		return fmt.Errorf("decode ingress access policy: %w", err)
+	}
+	runtime.sourceCIDRs = policy.sourceCIDRs
 
 	switch req.Spec.Ingress.Type {
 	case protocol.IngressTypeTCPListen:
@@ -403,6 +431,12 @@ func (c *Client) startIngressTunnelRuntime(rt *sessionRuntime, req protocol.Tunn
 			return fmt.Errorf("listen udp %s: %w", addr, err)
 		}
 		runtime.packetConn = conn
+	case protocol.IngressTypeSOCKS5Listen:
+		ln, err := net.Listen("tcp", addr)
+		if err != nil {
+			return fmt.Errorf("listen %s: %w", addr, err)
+		}
+		runtime.listener = ln
 	default:
 		return fmt.Errorf("unsupported ingress type %s", req.Spec.Ingress.Type)
 	}
@@ -418,6 +452,8 @@ func (c *Client) startIngressTunnelRuntime(rt *sessionRuntime, req protocol.Tunn
 		runtime.run(func() { c.acceptIngressTCP(rt, req, runtime) })
 	case protocol.IngressTypeUDPListen:
 		runtime.run(func() { c.acceptIngressUDP(rt, req, runtime) })
+	case protocol.IngressTypeSOCKS5Listen:
+		runtime.run(func() { c.acceptIngressSOCKS5(rt, req, runtime) })
 	}
 	return nil
 }
@@ -515,6 +551,9 @@ func (c *Client) reapIngressUDPAssociations(runtime *clientTunnelRuntime) {
 
 func (c *Client) handleIngressUDPDatagram(rt *sessionRuntime, req protocol.TunnelProvisionRequest, runtime *clientTunnelRuntime, srcAddr net.Addr, payload []byte) {
 	if runtime == nil || runtime.packetConn == nil || srcAddr == nil {
+		return
+	}
+	if !sourceAddrAllowed(srcAddr, runtime.sourceCIDRs) {
 		return
 	}
 	assoc, ok := c.getOrCreateIngressUDPAssociation(rt, req, runtime, srcAddr)
@@ -666,6 +705,9 @@ func (c *Client) handleIngressTCPConn(rt *sessionRuntime, req protocol.TunnelPro
 		runtime.removeTCPConn(conn)
 		_ = conn.Close()
 	}()
+	if !sourceAddrAllowed(conn.RemoteAddr(), runtime.sourceCIDRs) {
+		return
+	}
 
 	rt.dataMu.RLock()
 	session := rt.dataSession

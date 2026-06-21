@@ -9,6 +9,7 @@ import (
 	"sync"
 	"time"
 
+	"netsgo/internal/socks5wire"
 	"netsgo/pkg/mux"
 	"netsgo/pkg/protocol"
 )
@@ -82,7 +83,9 @@ func (s *Server) reconcileClientRelayTunnel(stored StoredTunnel) error {
 		s.unifiedRuntime.clearTunnelIssues(stored.ID)
 		return s.updateStoredTunnelRuntime(stored, protocol.ProxyRuntimeStateIdle, "")
 	}
-	if stored.Ingress.Type != TunnelIngressTypeTCPListen && stored.Ingress.Type != TunnelIngressTypeUDPListen {
+	if stored.Ingress.Type != TunnelIngressTypeTCPListen &&
+		stored.Ingress.Type != TunnelIngressTypeUDPListen &&
+		stored.Ingress.Type != TunnelIngressTypeSOCKS5Listen {
 		return nil
 	}
 	if !s.isClientOnline(stored.Ingress.ClientID) || !s.isClientOnline(stored.Target.ClientID) {
@@ -132,7 +135,7 @@ func (s *Server) reconcileClientRelayTunnel(stored StoredTunnel) error {
 		TunnelID: stored.ID,
 		Revision: stored.Revision,
 		Role:     protocol.DataStreamRoleTarget,
-		Spec:     tunnelSpecProtocolFromStored(stored, protocol.ProxyRuntimeStatePending),
+		Spec:     tunnelSpecProtocolForRole(stored, protocol.ProxyRuntimeStatePending, protocol.DataStreamRoleTarget),
 	}); err != nil {
 		if cleanupErr := s.unprovisionClientRelayTunnel(stored, "target_provision_failed"); cleanupErr != nil {
 			log.Printf("⚠️ failed to clean up client relay tunnel %s after target provision failure: %v", stored.ID, cleanupErr)
@@ -145,7 +148,7 @@ func (s *Server) reconcileClientRelayTunnel(stored StoredTunnel) error {
 		TunnelID: stored.ID,
 		Revision: stored.Revision,
 		Role:     protocol.DataStreamRoleIngress,
-		Spec:     tunnelSpecProtocolFromStored(stored, protocol.ProxyRuntimeStatePending),
+		Spec:     tunnelSpecProtocolForRole(stored, protocol.ProxyRuntimeStatePending, protocol.DataStreamRoleIngress),
 	}); err != nil {
 		if cleanupErr := s.unprovisionClientRelayTunnel(stored, "ingress_provision_failed"); cleanupErr != nil {
 			log.Printf("⚠️ failed to clean up client relay tunnel %s after ingress provision failure: %v", stored.ID, cleanupErr)
@@ -273,7 +276,7 @@ func (s *Server) notifyClientTunnelUnprovision(client *ClientConn, tunnelID stri
 	return s.writeControlMessage(client, msg)
 }
 
-func tunnelSpecProtocolFromStored(stored StoredTunnel, runtimeState string) protocol.TunnelSpec {
+func tunnelSpecProtocolForRole(stored StoredTunnel, runtimeState, role string) protocol.TunnelSpec {
 	actual := stored.ActualTransport
 	if actual == "" {
 		actual = protocol.ActualTransportUnknown
@@ -290,8 +293,8 @@ func tunnelSpecProtocolFromStored(stored StoredTunnel, runtimeState string) prot
 		Revision:        stored.Revision,
 		Topology:        stored.Topology,
 		OwnerClientID:   stored.OwnerClientID,
-		Ingress:         endpointSpecProtocolFromStored(stored.Ingress),
-		Target:          endpointSpecProtocolFromStored(stored.Target),
+		Ingress:         endpointSpecProtocolFromStoredForRole(stored.Ingress, role),
+		Target:          endpointSpecProtocolFromStoredForRole(stored.Target, role),
 		TransportPolicy: stored.TransportPolicy,
 		ActualTransport: actual,
 		P2P:             protocol.P2PState{State: stored.P2P.State, Error: stored.P2P.Error, SessionID: stored.P2P.SessionID},
@@ -307,11 +310,24 @@ func tunnelSpecProtocolFromStored(stored StoredTunnel, runtimeState string) prot
 }
 
 func endpointSpecProtocolFromStored(endpoint EndpointSpec) protocol.EndpointSpec {
+	return endpointSpecProtocolFromStoredForRole(endpoint, "")
+}
+
+func endpointSpecProtocolFromStoredForRole(endpoint EndpointSpec, role string) protocol.EndpointSpec {
+	config := endpoint.Config
+	if role == protocol.DataStreamRoleTarget {
+		switch endpoint.Type {
+		case protocol.IngressTypeSOCKS5Listen:
+			config = redactSOCKS5ListenConfig(endpoint.Config)
+		case protocol.IngressTypeHTTPHost:
+			config = redactHTTPHostConfig(endpoint.Config)
+		}
+	}
 	return protocol.EndpointSpec{
 		Location: endpoint.Location,
 		ClientID: endpoint.ClientID,
 		Type:     endpoint.Type,
-		Config:   endpoint.Config,
+		Config:   config,
 	}
 }
 
@@ -331,10 +347,16 @@ func (s *Server) handleClientOpenedDataStream(openClient *ClientConn, openStream
 	if !ok {
 		log.Printf("⚠️ client relay target offline: %s", stored.Target.ClientID)
 		_ = s.updateStoredTunnelRuntime(stored, protocol.ProxyRuntimeStateOffline, "")
+		if stored.Ingress.Type == TunnelIngressTypeSOCKS5Listen {
+			_ = socks5wire.WriteDialResult(openStream, protocol.SOCKS5DialResult{
+				Status:  protocol.SOCKS5DialStatusNetworkUnreachable,
+				Message: "target client offline",
+			})
+		}
 		return
 	}
 
-	targetStream, err := s.openRelayStreamToTarget(targetClient, stored)
+	targetStream, err := s.openRelayStreamToTarget(targetClient, stored, header)
 	if err != nil {
 		log.Printf("⚠️ client relay open target stream failed: %v", err)
 		s.unifiedRuntime.recordServerIssue(stored.ID, protocol.TunnelIssue{
@@ -347,6 +369,12 @@ func (s *Server) handleClientOpenedDataStream(openClient *ClientConn, openStream
 			ObservedAt: time.Now().UTC(),
 		})
 		_ = s.updateStoredTunnelRuntime(stored, protocol.ProxyRuntimeStateError, err.Error())
+		if stored.Ingress.Type == TunnelIngressTypeSOCKS5Listen {
+			_ = socks5wire.WriteDialResult(openStream, protocol.SOCKS5DialResult{
+				Status:  protocol.SOCKS5DialStatusGeneralFailure,
+				Message: err.Error(),
+			})
+		}
 		return
 	}
 	defer func() { _ = targetStream.Close() }()
@@ -355,10 +383,24 @@ func (s *Server) handleClientOpenedDataStream(openClient *ClientConn, openStream
 		s.relayClientUDPFrames(stored, targetStream, openStream, targetClient.BandwidthRuntime(), s.c2c.limits(stored.ID))
 		return
 	}
+	if stored.Ingress.Type == TunnelIngressTypeSOCKS5Listen {
+		if err := relaySOCKS5DialResultFrame(openStream, targetStream); err != nil {
+			log.Printf("⚠️ client relay SOCKS5 dial result failed [%s]: %v", stored.ID, err)
+			return
+		}
+	}
 
 	_, _ = relayTunnelPayload(targetStream, openStream, targetClient.BandwidthRuntime(), s.c2c.limits(stored.ID), func(ingressBytes, egressBytes uint64) {
 		s.recordStoredTunnelTrafficAt(time.Now(), stored, ingressBytes, egressBytes)
 	})
+}
+
+func relaySOCKS5DialResultFrame(ingressStream, targetStream net.Conn) error {
+	result, err := socks5wire.ReadDialResult(targetStream)
+	if err != nil {
+		return err
+	}
+	return socks5wire.WriteDialResult(ingressStream, result)
 }
 
 func (s *Server) relayClientUDPFrames(stored StoredTunnel, targetStream, ingressStream net.Conn, clientRuntime, tunnelRuntime *directionalBandwidthRuntime) {
@@ -433,10 +475,20 @@ func validateClientRelayHeader(stored StoredTunnel, openClientID string, header 
 	if header.Transport != protocol.ActualTransportServerRelay {
 		return fmt.Errorf("invalid relay transport %s", header.Transport)
 	}
+	if stored.Ingress.Type == TunnelIngressTypeSOCKS5Listen {
+		if header.TargetHost == "" || header.TargetPort < 1 || header.TargetPort > 65535 {
+			return fmt.Errorf("missing SOCKS5 dynamic target for tunnel %s", stored.ID)
+		}
+		if header.TargetAddrType != protocol.SOCKS5AddrTypeIPv4 &&
+			header.TargetAddrType != protocol.SOCKS5AddrTypeIPv6 &&
+			header.TargetAddrType != protocol.SOCKS5AddrTypeDomain {
+			return fmt.Errorf("invalid SOCKS5 target address type %q", header.TargetAddrType)
+		}
+	}
 	return nil
 }
 
-func (s *Server) openRelayStreamToTarget(client *ClientConn, stored StoredTunnel) (net.Conn, error) {
+func (s *Server) openRelayStreamToTarget(client *ClientConn, stored StoredTunnel, ingressHeader protocol.DataStreamHeader) (net.Conn, error) {
 	if client.generation != 0 && !s.isCurrentLive(client.ID, client.generation) {
 		return nil, fmt.Errorf("client [%s] is not online", client.ID)
 	}
@@ -466,6 +518,10 @@ func (s *Server) openRelayStreamToTarget(client *ClientConn, stored StoredTunnel
 		Direction:        protocol.DataStreamDirectionIngressToTarget,
 		Transport:        protocol.ActualTransportServerRelay,
 		ServerAuthorized: true,
+		TargetHost:       ingressHeader.TargetHost,
+		TargetPort:       ingressHeader.TargetPort,
+		TargetAddrType:   ingressHeader.TargetAddrType,
+		OriginalHost:     ingressHeader.OriginalHost,
 	}
 	if err := protocol.EncodeDataStreamHeader(stream, header); err != nil {
 		_ = stream.Close()

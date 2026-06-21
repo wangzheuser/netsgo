@@ -1,6 +1,7 @@
 package server
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
@@ -72,7 +73,7 @@ func (s *Server) preflightClientIngress(req tunnelCreateRequestAPI, existingID s
 	if req.Topology != tunnelTopologyClientToClient || req.Ingress.Location != tunnelEndpointLocationClient {
 		return nil
 	}
-	if req.Ingress.Type != tunnelIngressTypeTCPListen && req.Ingress.Type != tunnelIngressTypeUDPListen {
+	if req.Ingress.Type != tunnelIngressTypeTCPListen && req.Ingress.Type != tunnelIngressTypeUDPListen && req.Ingress.Type != tunnelIngressTypeSOCKS5Listen {
 		return nil
 	}
 	client, ok := s.loadLiveClient(req.Ingress.ClientID)
@@ -100,12 +101,7 @@ func (s *Server) preflightClientIngress(req tunnelCreateRequestAPI, existingID s
 		TunnelID:  existingID,
 		Revision:  revision,
 		Role:      protocol.DataStreamRoleIngress,
-		Ingress: protocol.EndpointSpec{
-			Location: req.Ingress.Location,
-			ClientID: req.Ingress.ClientID,
-			Type:     req.Ingress.Type,
-			Config:   req.Ingress.Config,
-		},
+		Ingress:   preflightIngressEndpointSpec(req),
 	})
 	if err != nil {
 		code := protocol.TunnelMutationErrorCodeIngressPreflightRejected
@@ -134,6 +130,35 @@ func (s *Server) preflightClientIngress(req tunnelCreateRequestAPI, existingID s
 	return nil
 }
 
+func preflightIngressEndpointSpec(req tunnelCreateRequestAPI) protocol.EndpointSpec {
+	cfg, err := decodeListenEndpointConfig(req.Ingress, req.Topology)
+	if err != nil {
+		return protocol.EndpointSpec{
+			Location: req.Ingress.Location,
+			ClientID: req.Ingress.ClientID,
+			Type:     req.Ingress.Type,
+			Config:   req.Ingress.Config,
+		}
+	}
+	return protocol.EndpointSpec{
+		Location: req.Ingress.Location,
+		ClientID: req.Ingress.ClientID,
+		Type:     req.Ingress.Type,
+		Config:   preflightIngressConfigRaw(req.Ingress.Type, cfg),
+	}
+}
+
+func preflightIngressConfigRaw(endpointType string, cfg ingressEndpointConfigAPI) json.RawMessage {
+	if endpointType == tunnelIngressTypeSOCKS5Listen {
+		return mustRawJSON(tcpListenConfigAPI{
+			BindIP:             cfg.BindIP,
+			Port:               cfg.Port,
+			AllowedSourceCIDRs: cfg.AllowedSourceCIDRs,
+		})
+	}
+	return normalizedIngressConfigRaw(endpointType, cfg)
+}
+
 func sameClientIngressResource(current EndpointSpec, next endpointSpecAPI, currentTopology, nextTopology string) bool {
 	if current.Location != protocol.EndpointLocationClient || next.Location != protocol.EndpointLocationClient {
 		return false
@@ -141,7 +166,7 @@ func sameClientIngressResource(current EndpointSpec, next endpointSpecAPI, curre
 	if current.ClientID != next.ClientID || current.Type != next.Type {
 		return false
 	}
-	if current.Type != protocol.IngressTypeTCPListen && current.Type != protocol.IngressTypeUDPListen {
+	if current.Type != protocol.IngressTypeTCPListen && current.Type != protocol.IngressTypeUDPListen && current.Type != protocol.IngressTypeSOCKS5Listen {
 		return false
 	}
 	currentCfg, err := decodeListenEndpointConfig(endpointSpecAPI(current), currentTopology)

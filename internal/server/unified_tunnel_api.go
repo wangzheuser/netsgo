@@ -23,12 +23,14 @@ const (
 	tunnelEndpointLocationServer = protocol.EndpointLocationServer
 	tunnelEndpointLocationClient = protocol.EndpointLocationClient
 
-	tunnelIngressTypeTCPListen = protocol.IngressTypeTCPListen
-	tunnelIngressTypeUDPListen = protocol.IngressTypeUDPListen
-	tunnelIngressTypeHTTPHost  = protocol.IngressTypeHTTPHost
+	tunnelIngressTypeTCPListen    = protocol.IngressTypeTCPListen
+	tunnelIngressTypeUDPListen    = protocol.IngressTypeUDPListen
+	tunnelIngressTypeHTTPHost     = protocol.IngressTypeHTTPHost
+	tunnelIngressTypeSOCKS5Listen = protocol.IngressTypeSOCKS5Listen
 
-	tunnelTargetTypeTCPService = protocol.TargetTypeTCPService
-	tunnelTargetTypeUDPService = protocol.TargetTypeUDPService
+	tunnelTargetTypeTCPService           = protocol.TargetTypeTCPService
+	tunnelTargetTypeUDPService           = protocol.TargetTypeUDPService
+	tunnelTargetTypeSOCKS5ConnectHandler = protocol.TargetTypeSOCKS5ConnectHandler
 
 	tunnelTransportPolicyServerRelayOnly = protocol.TransportPolicyServerRelayOnly
 	tunnelTransportPolicyDirectPreferred = protocol.TransportPolicyDirectPreferred
@@ -116,6 +118,7 @@ type tunnelCreateRequestAPI struct {
 	Target            endpointSpecAPI            `json:"target"`
 	TransportPolicy   string                     `json:"transport_policy"`
 	BandwidthSettings protocol.BandwidthSettings `json:"bandwidth_settings"`
+	ConfirmNoAuthRisk bool                       `json:"confirm_no_auth_risk,omitempty"`
 }
 
 type tunnelUpdateRequestAPI struct {
@@ -124,24 +127,31 @@ type tunnelUpdateRequestAPI struct {
 }
 
 type tcpListenConfigAPI struct {
-	BindIP string `json:"bind_ip"`
-	Port   int    `json:"port"`
+	BindIP             string   `json:"bind_ip"`
+	Port               int      `json:"port"`
+	AllowedSourceCIDRs []string `json:"allowed_source_cidrs"`
 }
 
 type ingressEndpointConfigAPI struct {
-	BindIP string
-	Port   int
-	Domain string
+	BindIP             string
+	Port               int
+	Domain             string
+	AllowedSourceCIDRs []string
+	HTTPAuth           protocol.HTTPAuthConfig
+	SOCKS5             *protocol.SOCKS5ListenConfig
 }
 
 type httpHostConfigAPI struct {
-	Domain string `json:"domain"`
+	Domain             string                  `json:"domain"`
+	AllowedSourceCIDRs []string                `json:"allowed_source_cidrs"`
+	Auth               protocol.HTTPAuthConfig `json:"auth,omitempty"`
 }
 
 type serviceConfigAPI struct {
-	IP   string `json:"ip,omitempty"`
-	Host string `json:"host,omitempty"`
-	Port int    `json:"port"`
+	IP     string                               `json:"ip,omitempty"`
+	Host   string                               `json:"host,omitempty"`
+	Port   int                                  `json:"port"`
+	SOCKS5 *protocol.SOCKS5ConnectHandlerConfig `json:"-"`
 }
 
 func (s *Server) handleUnifiedTunnelCollection(w http.ResponseWriter, r *http.Request) {
@@ -467,7 +477,7 @@ func validateUnifiedEndpointCombination(topology string, ingress, target endpoin
 	if strings.TrimSpace(target.ClientID) == "" {
 		return newProxyRequestValidationError(fmt.Errorf("target.client_id is required"), "target.client_id", "missing_client_id", http.StatusBadRequest)
 	}
-	if target.Type != tunnelTargetTypeTCPService && target.Type != tunnelTargetTypeUDPService {
+	if target.Type != tunnelTargetTypeTCPService && target.Type != tunnelTargetTypeUDPService && target.Type != tunnelTargetTypeSOCKS5ConnectHandler {
 		return newProxyRequestValidationError(fmt.Errorf("unsupported target type %q", target.Type), "target.type", protocol.TunnelMutationErrorCodeUnsupportedEndpointType, http.StatusBadRequest)
 	}
 
@@ -479,7 +489,7 @@ func validateUnifiedEndpointCombination(topology string, ingress, target endpoin
 		if strings.TrimSpace(ingress.ClientID) != "" {
 			return newProxyRequestValidationError(fmt.Errorf("server ingress cannot include client_id"), "ingress.client_id", "invalid_client_id", http.StatusBadRequest)
 		}
-		if ingress.Type != tunnelIngressTypeTCPListen && ingress.Type != tunnelIngressTypeUDPListen && ingress.Type != tunnelIngressTypeHTTPHost {
+		if ingress.Type != tunnelIngressTypeTCPListen && ingress.Type != tunnelIngressTypeUDPListen && ingress.Type != tunnelIngressTypeHTTPHost && ingress.Type != tunnelIngressTypeSOCKS5Listen {
 			return newProxyRequestValidationError(fmt.Errorf("unsupported ingress type %q", ingress.Type), "ingress.type", protocol.TunnelMutationErrorCodeUnsupportedEndpointType, http.StatusBadRequest)
 		}
 	case tunnelTopologyClientToClient:
@@ -495,7 +505,7 @@ func validateUnifiedEndpointCombination(topology string, ingress, target endpoin
 		if ingress.Type == tunnelIngressTypeHTTPHost {
 			return newProxyRequestValidationError(fmt.Errorf("client_to_client does not support http_host ingress"), "ingress.type", protocol.TunnelMutationErrorCodeUnsupportedEndpointType, http.StatusBadRequest)
 		}
-		if ingress.Type != tunnelIngressTypeTCPListen && ingress.Type != tunnelIngressTypeUDPListen {
+		if ingress.Type != tunnelIngressTypeTCPListen && ingress.Type != tunnelIngressTypeUDPListen && ingress.Type != tunnelIngressTypeSOCKS5Listen {
 			return newProxyRequestValidationError(fmt.Errorf("unsupported ingress type %q", ingress.Type), "ingress.type", protocol.TunnelMutationErrorCodeUnsupportedEndpointType, http.StatusBadRequest)
 		}
 	default:
@@ -515,11 +525,23 @@ func validateUnifiedEndpointCombination(topology string, ingress, target endpoin
 		if target.Type != tunnelTargetTypeUDPService {
 			return newProxyRequestValidationError(fmt.Errorf("udp_listen ingress requires udp_service target"), "target.type", "invalid_target_type", http.StatusBadRequest)
 		}
+	case tunnelIngressTypeSOCKS5Listen:
+		if target.Type != tunnelTargetTypeSOCKS5ConnectHandler {
+			return newProxyRequestValidationError(fmt.Errorf("socks5_listen ingress requires socks5_connect_handler target"), "target.type", "invalid_target_type", http.StatusBadRequest)
+		}
 	}
 	return nil
 }
 
 func decodeListenEndpointConfig(endpoint endpointSpecAPI, topology string) (ingressEndpointConfigAPI, error) {
+	return decodeListenEndpointConfigWithOptions(endpoint, topology, true, true)
+}
+
+func decodeListenEndpointConfigForMutation(endpoint endpointSpecAPI, topology string, skipNoAuthConfirmation bool) (ingressEndpointConfigAPI, error) {
+	return decodeListenEndpointConfigWithOptions(endpoint, topology, skipNoAuthConfirmation, true)
+}
+
+func decodeListenEndpointConfigWithOptions(endpoint endpointSpecAPI, topology string, skipNoAuthConfirmation bool, allowMissingSourceCIDRs bool) (ingressEndpointConfigAPI, error) {
 	switch endpoint.Type {
 	case tunnelIngressTypeHTTPHost:
 		var cfg httpHostConfigAPI
@@ -530,7 +552,16 @@ func decodeListenEndpointConfig(endpoint endpointSpecAPI, topology string) (ingr
 		if err := validateDomain(cfg.Domain); err != nil {
 			return ingressEndpointConfigAPI{}, newProxyRequestValidationError(err, protocol.TunnelMutationFieldDomain, protocol.TunnelMutationErrorCodeDomainInvalid, http.StatusBadRequest)
 		}
-		return ingressEndpointConfigAPI{Domain: cfg.Domain}, nil
+		auth, err := normalizeHTTPAuthConfig(cfg.Auth)
+		if err != nil {
+			return ingressEndpointConfigAPI{}, newProxyRequestValidationError(err, "ingress.config.auth", "invalid_endpoint_config", http.StatusBadRequest)
+		}
+		cfg.Auth = auth
+		sourcePolicy, err := parseIngressAccessPolicy(cfg.AllowedSourceCIDRs, allowMissingSourceCIDRs)
+		if err != nil {
+			return ingressEndpointConfigAPI{}, newProxyRequestValidationError(err, "ingress.config.allowed_source_cidrs", "invalid_endpoint_config", http.StatusBadRequest)
+		}
+		return ingressEndpointConfigAPI{Domain: cfg.Domain, AllowedSourceCIDRs: sourcePolicy.allowedSourceCIDRs, HTTPAuth: cfg.Auth}, nil
 	case tunnelIngressTypeTCPListen, tunnelIngressTypeUDPListen:
 		var cfg tcpListenConfigAPI
 		if err := decodeStrictEndpointConfig(endpoint.Config, &cfg); err != nil {
@@ -549,7 +580,17 @@ func decodeListenEndpointConfig(endpoint endpointSpecAPI, topology string) (ingr
 		if cfg.Port < 1 || cfg.Port > 65535 {
 			return ingressEndpointConfigAPI{}, newProxyRequestValidationError(fmt.Errorf("port must be in range 1-65535"), "ingress.config.port", "invalid_endpoint_config", http.StatusBadRequest)
 		}
-		return ingressEndpointConfigAPI{BindIP: cfg.BindIP, Port: cfg.Port}, nil
+		sourcePolicy, err := parseIngressAccessPolicy(cfg.AllowedSourceCIDRs, allowMissingSourceCIDRs)
+		if err != nil {
+			return ingressEndpointConfigAPI{}, newProxyRequestValidationError(err, "ingress.config.allowed_source_cidrs", "invalid_endpoint_config", http.StatusBadRequest)
+		}
+		return ingressEndpointConfigAPI{BindIP: cfg.BindIP, Port: cfg.Port, AllowedSourceCIDRs: sourcePolicy.allowedSourceCIDRs}, nil
+	case tunnelIngressTypeSOCKS5Listen:
+		cfg, err := normalizeSOCKS5ListenConfig(endpoint.Config, !skipNoAuthConfirmation)
+		if err != nil {
+			return ingressEndpointConfigAPI{}, newProxyRequestValidationError(fmt.Errorf("invalid socks5_listen config: %w", err), "ingress.config", "invalid_endpoint_config", http.StatusBadRequest)
+		}
+		return ingressEndpointConfigAPI{BindIP: cfg.BindIP, Port: cfg.Port, AllowedSourceCIDRs: cfg.AllowedSourceCIDRs, SOCKS5: &cfg}, nil
 	default:
 		return ingressEndpointConfigAPI{}, newProxyRequestValidationError(fmt.Errorf("unsupported ingress type %q", endpoint.Type), "ingress.type", protocol.TunnelMutationErrorCodeUnsupportedEndpointType, http.StatusBadRequest)
 	}
@@ -564,6 +605,13 @@ func normalizeServerBindIP(bindIP string) string {
 }
 
 func decodeServiceEndpointConfig(endpoint endpointSpecAPI) (serviceConfigAPI, error) {
+	if endpoint.Type == tunnelTargetTypeSOCKS5ConnectHandler {
+		cfg, err := normalizeSOCKS5ConnectHandlerConfig(endpoint.Config)
+		if err != nil {
+			return serviceConfigAPI{}, newProxyRequestValidationError(fmt.Errorf("invalid socks5_connect_handler config: %w", err), "target.config", "invalid_endpoint_config", http.StatusBadRequest)
+		}
+		return serviceConfigAPI{SOCKS5: &cfg}, nil
+	}
 	var cfg serviceConfigAPI
 	if err := decodeStrictEndpointConfig(endpoint.Config, &cfg); err != nil {
 		return serviceConfigAPI{}, newProxyRequestValidationError(fmt.Errorf("invalid service config: %w", err), "target.config", "invalid_endpoint_config", http.StatusBadRequest)
@@ -639,6 +687,12 @@ func validateEndpointConfigComplexity(raw json.RawMessage) error {
 }
 
 func (s *Server) createUnifiedStoredTunnel(req tunnelCreateRequestAPI) (StoredTunnel, error) {
+	if err := prepareHTTPHostMutationRequest(&req, nil); err != nil {
+		return StoredTunnel{}, err
+	}
+	if err := prepareSOCKS5MutationRequest(&req, nil); err != nil {
+		return StoredTunnel{}, err
+	}
 	stored, err := s.storedTunnelFromUnifiedRequest(req, "")
 	if err != nil {
 		return StoredTunnel{}, err
@@ -658,13 +712,6 @@ func (s *Server) createUnifiedStoredTunnel(req tunnelCreateRequestAPI) (StoredTu
 }
 
 func (s *Server) updateUnifiedStoredTunnel(current tunnelSpecAPI, expectedRevision int64, req tunnelCreateRequestAPI) (StoredTunnel, error) {
-	stored, err := s.storedTunnelFromUnifiedRequest(req, current.ID)
-	if err != nil {
-		return StoredTunnel{}, err
-	}
-	if stored.OwnerClientID != current.OwnerClientID {
-		return StoredTunnel{}, newProxyRequestValidationError(fmt.Errorf("tunnel owner cannot be changed"), "target.client_id", "owner_change_not_supported", http.StatusBadRequest)
-	}
 	if s.store == nil {
 		return StoredTunnel{}, fmt.Errorf("tunnel store not initialized")
 	}
@@ -675,6 +722,20 @@ func (s *Server) updateUnifiedStoredTunnel(current tunnelSpecAPI, expectedRevisi
 	}
 	if existing.Revision != expectedRevision {
 		return StoredTunnel{}, ErrTunnelRevisionConflict
+	}
+	if err := prepareHTTPHostMutationRequest(&req, &existing); err != nil {
+		return StoredTunnel{}, err
+	}
+	if err := prepareSOCKS5MutationRequest(&req, &existing); err != nil {
+		return StoredTunnel{}, err
+	}
+
+	stored, err := s.storedTunnelFromUnifiedRequest(req, current.ID)
+	if err != nil {
+		return StoredTunnel{}, err
+	}
+	if stored.OwnerClientID != current.OwnerClientID {
+		return StoredTunnel{}, newProxyRequestValidationError(fmt.Errorf("tunnel owner cannot be changed"), "target.client_id", "owner_change_not_supported", http.StatusBadRequest)
 	}
 	stored.Revision = expectedRevision + 1
 	stored.CreatedAt = existing.CreatedAt
@@ -698,6 +759,64 @@ func (s *Server) updateUnifiedStoredTunnel(current tunnelSpecAPI, expectedRevisi
 	}
 	s.emitTunnelChanged(stored.OwnerClientID, storedTunnelToProxyConfig(stored), "updated")
 	return stored, nil
+}
+
+func prepareHTTPHostMutationRequest(req *tunnelCreateRequestAPI, existing *StoredTunnel) error {
+	if req == nil || req.Ingress.Type != tunnelIngressTypeHTTPHost {
+		return nil
+	}
+	var cfg httpHostConfigAPI
+	if err := decodeStrictEndpointConfig(req.Ingress.Config, &cfg); err != nil {
+		return newProxyRequestValidationError(fmt.Errorf("invalid http_host config: %w", err), "ingress.config", "invalid_endpoint_config", http.StatusBadRequest)
+	}
+	if cfg.Auth.PasswordHash != "" {
+		return newProxyRequestValidationError(fmt.Errorf("auth.password_hash is server-owned and cannot be submitted"), "ingress.config.auth.password_hash", "server_owned_field", http.StatusBadRequest)
+	}
+	if existing == nil ||
+		existing.Ingress.Type != tunnelIngressTypeHTTPHost ||
+		cfg.Auth.Type != protocol.HTTPAuthTypeBasic ||
+		cfg.Auth.Password != "" {
+		return nil
+	}
+	var existingCfg httpHostConfigAPI
+	if err := json.Unmarshal(existing.Ingress.Config, &existingCfg); err != nil {
+		return nil
+	}
+	if existingCfg.Auth.Type != protocol.HTTPAuthTypeBasic || existingCfg.Auth.PasswordHash == "" {
+		return nil
+	}
+	cfg.Auth.PasswordHash = existingCfg.Auth.PasswordHash
+	req.Ingress.Config = mustRawJSON(cfg)
+	return nil
+}
+
+func prepareSOCKS5MutationRequest(req *tunnelCreateRequestAPI, existing *StoredTunnel) error {
+	if req == nil || req.Ingress.Type != tunnelIngressTypeSOCKS5Listen {
+		return nil
+	}
+	var cfg protocol.SOCKS5ListenConfig
+	if err := decodeStrictEndpointConfig(req.Ingress.Config, &cfg); err != nil {
+		return newProxyRequestValidationError(fmt.Errorf("invalid socks5_listen config: %w", err), "ingress.config", "invalid_endpoint_config", http.StatusBadRequest)
+	}
+	if cfg.Auth.PasswordHash != "" {
+		return newProxyRequestValidationError(fmt.Errorf("auth.password_hash is server-owned and cannot be submitted"), "ingress.config.auth.password_hash", "server_owned_field", http.StatusBadRequest)
+	}
+	if existing == nil ||
+		existing.Ingress.Type != tunnelIngressTypeSOCKS5Listen ||
+		cfg.Auth.Type != protocol.SOCKS5AuthTypeUsernamePassword ||
+		cfg.Auth.Password != "" {
+		return nil
+	}
+	var existingCfg protocol.SOCKS5ListenConfig
+	if err := json.Unmarshal(existing.Ingress.Config, &existingCfg); err != nil {
+		return nil
+	}
+	if existingCfg.Auth.Type != protocol.SOCKS5AuthTypeUsernamePassword || existingCfg.Auth.PasswordHash == "" {
+		return nil
+	}
+	cfg.Auth.PasswordHash = existingCfg.Auth.PasswordHash
+	req.Ingress.Config = mustRawJSON(cfg)
+	return nil
 }
 
 func (s *Server) storedTunnelFromUnifiedRequest(req tunnelCreateRequestAPI, existingID string) (StoredTunnel, error) {
@@ -726,7 +845,8 @@ func (s *Server) storedTunnelFromUnifiedRequest(req tunnelCreateRequestAPI, exis
 	if err != nil {
 		return StoredTunnel{}, err
 	}
-	ingressConfig, err := decodeListenEndpointConfig(req.Ingress, req.Topology)
+	skipNoAuthConfirmation := req.ConfirmNoAuthRisk || req.Topology != tunnelTopologyServerExpose
+	ingressConfig, err := decodeListenEndpointConfigForMutation(req.Ingress, req.Topology, skipNoAuthConfirmation)
 	if err != nil {
 		return StoredTunnel{}, err
 	}
@@ -769,19 +889,30 @@ func (s *Server) storedTunnelFromUnifiedRequest(req tunnelCreateRequestAPI, exis
 		Type:     req.Ingress.Type,
 		Config:   normalizedIngressConfigRaw(req.Ingress.Type, ingressConfig),
 	}
+	targetRaw := mustRawJSON(serviceConfigAPI{Host: targetConfig.Host, IP: targetConfig.Host, Port: targetConfig.Port})
+	localIP := targetConfig.Host
+	localPort := targetConfig.Port
+	if req.Target.Type == tunnelTargetTypeSOCKS5ConnectHandler {
+		if targetConfig.SOCKS5 == nil {
+			return StoredTunnel{}, newProxyRequestValidationError(fmt.Errorf("missing socks5 target config"), "target.config", "invalid_endpoint_config", http.StatusBadRequest)
+		}
+		targetRaw = mustRawJSON(*targetConfig.SOCKS5)
+		localIP = ""
+		localPort = 0
+	}
 	target := EndpointSpec{
 		Location: req.Target.Location,
 		ClientID: req.Target.ClientID,
 		Type:     req.Target.Type,
-		Config:   mustRawJSON(serviceConfigAPI{Host: targetConfig.Host, IP: targetConfig.Host, Port: targetConfig.Port}),
+		Config:   targetRaw,
 	}
 	stored := StoredTunnel{
 		ProxyNewRequest: protocol.ProxyNewRequest{
 			ID:                id,
 			Name:              strings.TrimSpace(req.Name),
 			Type:              proxyType,
-			LocalIP:           targetConfig.Host,
-			LocalPort:         targetConfig.Port,
+			LocalIP:           localIP,
+			LocalPort:         localPort,
 			RemotePort:        ingressConfig.Port,
 			BindIP:            normalizeServerBindIP(ingressConfig.BindIP),
 			Domain:            ingressConfig.Domain,
@@ -817,9 +948,20 @@ func (s *Server) storedTunnelFromUnifiedRequest(req tunnelCreateRequestAPI, exis
 
 func normalizedIngressConfigRaw(endpointType string, cfg ingressEndpointConfigAPI) json.RawMessage {
 	if endpointType == tunnelIngressTypeHTTPHost {
-		return mustRawJSON(httpHostConfigAPI{Domain: cfg.Domain})
+		return mustRawJSON(httpHostConfigAPI{Domain: cfg.Domain, AllowedSourceCIDRs: cfg.AllowedSourceCIDRs, Auth: cfg.HTTPAuth})
 	}
-	return mustRawJSON(tcpListenConfigAPI{BindIP: cfg.BindIP, Port: cfg.Port})
+	if endpointType == tunnelIngressTypeSOCKS5Listen {
+		if cfg.SOCKS5 == nil {
+			return mustRawJSON(protocol.SOCKS5ListenConfig{
+				BindIP:             cfg.BindIP,
+				Port:               cfg.Port,
+				AllowedSourceCIDRs: allowAllCIDRs,
+				Auth:               protocol.SOCKS5AuthConfig{Type: protocol.SOCKS5AuthTypeNone},
+			})
+		}
+		return mustRawJSON(*cfg.SOCKS5)
+	}
+	return mustRawJSON(tcpListenConfigAPI{BindIP: cfg.BindIP, Port: cfg.Port, AllowedSourceCIDRs: cfg.AllowedSourceCIDRs})
 }
 
 func ingressResourceCandidateFromUnifiedRequest(req tunnelCreateRequestAPI, id string) (StoredTunnel, error) {
@@ -864,7 +1006,7 @@ func (s *Server) validateUnifiedIngressResourceAvailable(req tunnelCreateRequest
 		return nil
 	}
 	switch req.Ingress.Type {
-	case tunnelIngressTypeTCPListen, tunnelIngressTypeUDPListen, tunnelIngressTypeHTTPHost:
+	case tunnelIngressTypeTCPListen, tunnelIngressTypeUDPListen, tunnelIngressTypeHTTPHost, tunnelIngressTypeSOCKS5Listen:
 	default:
 		return nil
 	}
@@ -919,7 +1061,7 @@ func ingressResourceConflictField(ingressType string) string {
 	switch ingressType {
 	case tunnelIngressTypeHTTPHost:
 		return protocol.TunnelMutationFieldDomain
-	case tunnelIngressTypeTCPListen, tunnelIngressTypeUDPListen:
+	case tunnelIngressTypeTCPListen, tunnelIngressTypeUDPListen, tunnelIngressTypeSOCKS5Listen:
 		return "ingress.config.port"
 	default:
 		return "ingress.config"
@@ -941,7 +1083,7 @@ func sameUnifiedIngressResource(current EndpointSpec, next endpointSpecAPI, curr
 			return false
 		}
 		return canonicalHost(currentCfg.Domain) == canonicalHost(nextCfg.Domain)
-	case tunnelIngressTypeTCPListen, tunnelIngressTypeUDPListen:
+	case tunnelIngressTypeTCPListen, tunnelIngressTypeUDPListen, tunnelIngressTypeSOCKS5Listen:
 		currentCfg, err := decodeListenEndpointConfig(endpointSpecAPI(current), currentTopology)
 		if err != nil {
 			return false
@@ -960,7 +1102,7 @@ func (s *Server) preflightServerIngressResource(req tunnelCreateRequestAPI) erro
 	switch req.Ingress.Type {
 	case tunnelIngressTypeHTTPHost:
 		return nil
-	case tunnelIngressTypeTCPListen, tunnelIngressTypeUDPListen:
+	case tunnelIngressTypeTCPListen, tunnelIngressTypeUDPListen, tunnelIngressTypeSOCKS5Listen:
 	default:
 		return nil
 	}
@@ -1066,17 +1208,17 @@ func unifiedSpecFromProxyConfig(config protocol.ProxyConfig) tunnelSpecAPI {
 	switch config.Type {
 	case protocol.ProxyTypeUDP:
 		ingress.Type = tunnelIngressTypeUDPListen
-		ingress.Config = mustRawJSON(tcpListenConfigAPI{BindIP: normalizeServerBindIP(config.BindIP), Port: config.RemotePort})
+		ingress.Config = mustRawJSON(tcpListenConfigAPI{BindIP: normalizeServerBindIP(config.BindIP), Port: config.RemotePort, AllowedSourceCIDRs: allowAllSourceCIDRs()})
 		target.Type = tunnelTargetTypeUDPService
 		target.Config = mustRawJSON(serviceConfigAPI{IP: config.LocalIP, Port: config.LocalPort})
 	case protocol.ProxyTypeHTTP:
 		ingress.Type = tunnelIngressTypeHTTPHost
-		ingress.Config = mustRawJSON(httpHostConfigAPI{Domain: config.Domain})
+		ingress.Config = mustRawJSON(httpHostConfigAPI{Domain: config.Domain, AllowedSourceCIDRs: allowAllSourceCIDRs()})
 		target.Type = tunnelTargetTypeTCPService
 		target.Config = mustRawJSON(serviceConfigAPI{IP: config.LocalIP, Port: config.LocalPort})
 	default:
 		ingress.Type = tunnelIngressTypeTCPListen
-		ingress.Config = mustRawJSON(tcpListenConfigAPI{BindIP: normalizeServerBindIP(config.BindIP), Port: config.RemotePort})
+		ingress.Config = mustRawJSON(tcpListenConfigAPI{BindIP: normalizeServerBindIP(config.BindIP), Port: config.RemotePort, AllowedSourceCIDRs: allowAllSourceCIDRs()})
 		target.Type = tunnelTargetTypeTCPService
 		target.Config = mustRawJSON(serviceConfigAPI{IP: config.LocalIP, Port: config.LocalPort})
 	}
@@ -1145,13 +1287,13 @@ func specFromStoredTunnel(stored StoredTunnel, s *Server) tunnelSpecAPI {
 		Location: stored.Ingress.Location,
 		ClientID: stored.Ingress.ClientID,
 		Type:     stored.Ingress.Type,
-		Config:   stored.Ingress.Config,
+		Config:   endpointConfigForView(stored.Ingress),
 	}
 	spec.Target = endpointSpecAPI{
 		Location: stored.Target.Location,
 		ClientID: stored.Target.ClientID,
 		Type:     stored.Target.Type,
-		Config:   stored.Target.Config,
+		Config:   endpointConfigForView(stored.Target),
 	}
 	spec.TransportPolicy = stored.TransportPolicy
 	spec.ActualTransport = tunnelActualTransportUnknown
@@ -1176,6 +1318,23 @@ func specFromStoredTunnel(stored StoredTunnel, s *Server) tunnelSpecAPI {
 	}
 	spec.UpdatedAt = stored.UpdatedAt
 	return spec
+}
+
+func endpointConfigForView(endpoint EndpointSpec) json.RawMessage {
+	if endpoint.Type == tunnelIngressTypeSOCKS5Listen {
+		return redactSOCKS5ListenConfig(endpoint.Config)
+	}
+	if endpoint.Type == tunnelIngressTypeHTTPHost {
+		return redactHTTPHostConfig(endpoint.Config)
+	}
+	if endpoint.Type == tunnelIngressTypeTCPListen || endpoint.Type == tunnelIngressTypeUDPListen {
+		var cfg tcpListenConfigAPI
+		if err := json.Unmarshal(endpoint.Config, &cfg); err == nil && cfg.AllowedSourceCIDRs == nil {
+			cfg.AllowedSourceCIDRs = allowAllSourceCIDRs()
+			return mustRawJSON(cfg)
+		}
+	}
+	return endpoint.Config
 }
 
 func computedRuntimeStateForStoredTunnel(stored StoredTunnel, s *Server) string {

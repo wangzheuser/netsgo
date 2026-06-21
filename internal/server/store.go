@@ -22,19 +22,21 @@ var ErrTunnelNotFound = errors.New("tunnel not found")
 var ErrTunnelRevisionConflict = errors.New("tunnel revision conflict")
 
 const (
-	TunnelTopologyServerExpose       = protocol.TunnelTopologyServerExpose
-	TunnelTopologyClientToClient     = protocol.TunnelTopologyClientToClient
-	TunnelIngressTypeTCPListen       = protocol.IngressTypeTCPListen
-	TunnelIngressTypeUDPListen       = protocol.IngressTypeUDPListen
-	TunnelIngressTypeHTTPHost        = protocol.IngressTypeHTTPHost
-	TunnelTargetTypeTCPService       = protocol.TargetTypeTCPService
-	TunnelTargetTypeUDPService       = protocol.TargetTypeUDPService
-	TunnelTransportServerRelayOnly   = protocol.TransportPolicyServerRelayOnly
-	TunnelTransportDirectPreferred   = protocol.TransportPolicyDirectPreferred
-	TunnelTransportDirectOnly        = protocol.TransportPolicyDirectOnly
-	TunnelActualTransportUnknown     = protocol.ActualTransportUnknown
-	TunnelActualTransportServerRelay = protocol.ActualTransportServerRelay
-	TunnelP2PStateIdle               = protocol.P2PStateIdle
+	TunnelTopologyServerExpose           = protocol.TunnelTopologyServerExpose
+	TunnelTopologyClientToClient         = protocol.TunnelTopologyClientToClient
+	TunnelIngressTypeTCPListen           = protocol.IngressTypeTCPListen
+	TunnelIngressTypeUDPListen           = protocol.IngressTypeUDPListen
+	TunnelIngressTypeHTTPHost            = protocol.IngressTypeHTTPHost
+	TunnelIngressTypeSOCKS5Listen        = protocol.IngressTypeSOCKS5Listen
+	TunnelTargetTypeTCPService           = protocol.TargetTypeTCPService
+	TunnelTargetTypeUDPService           = protocol.TargetTypeUDPService
+	TunnelTargetTypeSOCKS5ConnectHandler = protocol.TargetTypeSOCKS5ConnectHandler
+	TunnelTransportServerRelayOnly       = protocol.TransportPolicyServerRelayOnly
+	TunnelTransportDirectPreferred       = protocol.TransportPolicyDirectPreferred
+	TunnelTransportDirectOnly            = protocol.TransportPolicyDirectOnly
+	TunnelActualTransportUnknown         = protocol.ActualTransportUnknown
+	TunnelActualTransportServerRelay     = protocol.ActualTransportServerRelay
+	TunnelP2PStateIdle                   = protocol.P2PStateIdle
 )
 
 // StoredTunnel is a tunnel configuration persisted to storage.
@@ -135,6 +137,12 @@ func NewTunnelStore(path string) (*TunnelStore, error) {
 // When closeDB is false the caller retains DB ownership.
 func newTunnelStoreWithDB(path string, db *sql.DB, closeDB bool) (*TunnelStore, error) {
 	store := &TunnelStore{path: path, db: db, closeDB: closeDB}
+	if err := store.validateLoadedState(); err != nil {
+		return nil, err
+	}
+	if err := store.backfillExplicitAllowAllSourceCIDRs(); err != nil {
+		return nil, err
+	}
 	if err := store.validateLoadedState(); err != nil {
 		return nil, err
 	}
@@ -273,6 +281,104 @@ func (s *TunnelStore) validateLoadedState() error {
 		return fmt.Errorf("failed to load tunnel config: %w", err)
 	}
 	return nil
+}
+
+func (s *TunnelStore) backfillExplicitAllowAllSourceCIDRs() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	rows, err := s.db.Query(`SELECT id, ingress_type, ingress_config FROM tunnels ORDER BY id`)
+	if err != nil {
+		return err
+	}
+	type update struct {
+		id     string
+		config string
+	}
+	var updates []update
+	for rows.Next() {
+		var id, ingressType, rawConfig string
+		if err := rows.Scan(&id, &ingressType, &rawConfig); err != nil {
+			_ = rows.Close()
+			return err
+		}
+		nextConfig, changed, err := backfillIngressSourceCIDRsConfig(ingressType, json.RawMessage(rawConfig))
+		if err != nil {
+			_ = rows.Close()
+			return fmt.Errorf("backfill source CIDRs for tunnel %s: %w", id, err)
+		}
+		if changed {
+			updates = append(updates, update{id: id, config: string(nextConfig)})
+		}
+	}
+	if err := rows.Close(); err != nil {
+		return err
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	if len(updates) == 0 {
+		return nil
+	}
+
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	committed := false
+	defer rollbackUnlessCommitted(tx, &committed)
+
+	for _, item := range updates {
+		if _, err := tx.Exec(`UPDATE tunnels SET ingress_config = ? WHERE id = ?`, item.config, item.id); err != nil {
+			return err
+		}
+	}
+	return commitTx(tx, &committed)
+}
+
+func backfillIngressSourceCIDRsConfig(ingressType string, raw json.RawMessage) (json.RawMessage, bool, error) {
+	switch ingressType {
+	case TunnelIngressTypeTCPListen, TunnelIngressTypeUDPListen:
+		var cfg tcpListenConfigAPI
+		if err := json.Unmarshal(raw, &cfg); err != nil {
+			return nil, false, err
+		}
+		if cfg.AllowedSourceCIDRs != nil {
+			return nil, false, nil
+		}
+		cfg.AllowedSourceCIDRs = allowAllSourceCIDRs()
+		return mustRawJSON(cfg), true, nil
+	case TunnelIngressTypeSOCKS5Listen:
+		var cfg protocol.SOCKS5ListenConfig
+		if err := json.Unmarshal(raw, &cfg); err != nil {
+			return nil, false, err
+		}
+		if cfg.AllowedSourceCIDRs != nil {
+			return nil, false, nil
+		}
+		cfg.AllowedSourceCIDRs = allowAllSourceCIDRs()
+		return mustRawJSON(cfg), true, nil
+	case TunnelIngressTypeHTTPHost:
+		var cfg httpHostConfigAPI
+		if err := json.Unmarshal(raw, &cfg); err != nil {
+			return nil, false, err
+		}
+		changed := false
+		if cfg.AllowedSourceCIDRs == nil {
+			cfg.AllowedSourceCIDRs = allowAllSourceCIDRs()
+			changed = true
+		}
+		if cfg.Auth.Type == "" {
+			cfg.Auth.Type = protocol.HTTPAuthTypeNone
+			changed = true
+		}
+		if !changed {
+			return nil, false, nil
+		}
+		return mustRawJSON(cfg), true, nil
+	default:
+		return nil, false, nil
+	}
 }
 
 func (s *TunnelStore) tunnelExists(clientID, name string) (bool, error) {
@@ -1055,12 +1161,12 @@ func validateUnifiedTunnelSpec(t StoredTunnel) error {
 		return fmt.Errorf("unsupported target location %q", t.Target.Location)
 	}
 	switch t.Ingress.Type {
-	case TunnelIngressTypeTCPListen, TunnelIngressTypeUDPListen, TunnelIngressTypeHTTPHost:
+	case TunnelIngressTypeTCPListen, TunnelIngressTypeUDPListen, TunnelIngressTypeHTTPHost, TunnelIngressTypeSOCKS5Listen:
 	default:
 		return fmt.Errorf("unsupported ingress type %q", t.Ingress.Type)
 	}
 	switch t.Target.Type {
-	case TunnelTargetTypeTCPService, TunnelTargetTypeUDPService:
+	case TunnelTargetTypeTCPService, TunnelTargetTypeUDPService, TunnelTargetTypeSOCKS5ConnectHandler:
 	default:
 		return fmt.Errorf("unsupported target type %q", t.Target.Type)
 	}
@@ -1231,7 +1337,7 @@ WHERE (` + strings.Join(clauses, " OR ") + `)`
 
 func tunnelIngressConflictPatterns(tunnel StoredTunnel) []string {
 	switch tunnel.Ingress.Type {
-	case TunnelIngressTypeTCPListen, TunnelIngressTypeUDPListen:
+	case TunnelIngressTypeTCPListen, TunnelIngressTypeUDPListen, TunnelIngressTypeSOCKS5Listen:
 	default:
 		return nil
 	}
@@ -1262,7 +1368,7 @@ func tunnelIngressConflictKeys(tunnel StoredTunnel) []string {
 		return nil
 	}
 	switch tunnel.Ingress.Type {
-	case TunnelIngressTypeTCPListen, TunnelIngressTypeUDPListen:
+	case TunnelIngressTypeTCPListen, TunnelIngressTypeUDPListen, TunnelIngressTypeSOCKS5Listen:
 	default:
 		return []string{key}
 	}
@@ -1298,7 +1404,7 @@ func tunnelIngressResourceLock(tunnel StoredTunnel) (key, kind, clientID string)
 		locationID += ":" + tunnel.Ingress.ClientID
 	}
 	switch tunnel.Ingress.Type {
-	case TunnelIngressTypeTCPListen:
+	case TunnelIngressTypeTCPListen, TunnelIngressTypeSOCKS5Listen:
 		port := tunnelIngressPort(tunnel)
 		if port <= 0 {
 			return "", "", ""
@@ -1332,11 +1438,15 @@ func tunnelIngressResourceLock(tunnel StoredTunnel) (key, kind, clientID string)
 func tunnelIngressConfig(t *StoredTunnel) map[string]any {
 	switch t.Type {
 	case protocol.ProxyTypeHTTP:
-		return map[string]any{"domain": t.Domain}
+		return map[string]any{
+			"domain":               t.Domain,
+			"allowed_source_cidrs": allowAllSourceCIDRs(),
+			"auth":                 protocol.HTTPAuthConfig{Type: protocol.HTTPAuthTypeNone},
+		}
 	case protocol.ProxyTypeUDP:
-		return map[string]any{"bind_ip": normalizeServerBindIP(t.BindIP), "port": t.RemotePort}
+		return map[string]any{"bind_ip": normalizeServerBindIP(t.BindIP), "port": t.RemotePort, "allowed_source_cidrs": allowAllSourceCIDRs()}
 	default:
-		return map[string]any{"bind_ip": normalizeServerBindIP(t.BindIP), "port": t.RemotePort}
+		return map[string]any{"bind_ip": normalizeServerBindIP(t.BindIP), "port": t.RemotePort, "allowed_source_cidrs": allowAllSourceCIDRs()}
 	}
 }
 
@@ -1396,6 +1506,13 @@ func tunnelTargetResourceKey(tunnel StoredTunnel) string {
 	if targetType == "" {
 		targetType = TunnelTargetTypeTCPService
 	}
+	targetClientID := tunnel.Target.ClientID
+	if targetClientID == "" {
+		targetClientID = tunnel.ClientID
+	}
+	if targetType == TunnelTargetTypeSOCKS5ConnectHandler {
+		return "target:client:" + targetClientID + ":" + targetType
+	}
 	host := tunnel.LocalIP
 	var cfg struct {
 		IP   string `json:"ip"`
@@ -1414,10 +1531,6 @@ func tunnelTargetResourceKey(tunnel StoredTunnel) string {
 	}
 	if ip := net.ParseIP(host); ip != nil {
 		host = ip.String()
-	}
-	targetClientID := tunnel.Target.ClientID
-	if targetClientID == "" {
-		targetClientID = tunnel.ClientID
 	}
 	return "target:client:" + targetClientID + ":" + targetType + ":" + host + ":" + strconv.Itoa(tunnel.LocalPort)
 }

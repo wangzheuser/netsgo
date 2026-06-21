@@ -194,6 +194,7 @@ describe('tunnel-model', () => {
         config: {
           bind_ip: '0.0.0.0',
           port: 18080,
+          allowed_source_cidrs: ['0.0.0.0/0', '::/0'],
         },
       },
       target: {
@@ -235,6 +236,7 @@ describe('tunnel-model', () => {
         config: {
           bind_ip: '127.0.0.1',
           port: 18080,
+          allowed_source_cidrs: ['0.0.0.0/0', '::/0'],
         },
       },
       target: {
@@ -277,6 +279,7 @@ describe('tunnel-model', () => {
         config: {
           bind_ip: '0.0.0.0',
           port: 1053,
+          allowed_source_cidrs: ['0.0.0.0/0', '::/0'],
         },
       },
       target: {
@@ -296,6 +299,93 @@ describe('tunnel-model', () => {
     });
   });
 
+  test('SOCKS5 server_expose 创建请求只使用 endpoint config', () => {
+    expect(
+      buildTunnelSpecCreateRequest({
+        clientId: 'client-b',
+        name: 'socks',
+        type: 'socks5',
+        local_ip: '',
+        local_port: 0,
+        remote_port: 1080,
+        allowed_source_cidrs: ['0.0.0.0/0', '::/0'],
+        socks5: {
+          auth_type: 'none',
+          allowed_target_cidrs: ['10.0.0.0/8'],
+          allowed_target_hosts: ['db.internal'],
+          allowed_target_ports: [443],
+          dial_timeout_seconds: 7,
+        },
+        confirm_no_auth_risk: true,
+      }),
+    ).toEqual({
+      name: 'socks',
+      topology: 'server_expose',
+      ingress: {
+        location: 'server',
+        type: 'socks5_listen',
+        config: {
+          bind_ip: '0.0.0.0',
+          port: 1080,
+          allowed_source_cidrs: ['0.0.0.0/0', '::/0'],
+          auth: { type: 'none' },
+        },
+      },
+      target: {
+        location: 'client',
+        client_id: 'client-b',
+        type: 'socks5_connect_handler',
+        config: {
+          allowed_target_cidrs: ['10.0.0.0/8'],
+          allowed_target_hosts: ['db.internal'],
+          allowed_target_ports: [443],
+          dial_timeout_seconds: 7,
+        },
+      },
+      transport_policy: 'server_relay_only',
+      bandwidth_settings: {
+        ingress_bps: 0,
+        egress_bps: 0,
+      },
+      confirm_no_auth_risk: true,
+    });
+  });
+
+  test('SOCKS5 client_to_client 创建请求使用 ingress/target endpoint type', () => {
+    expect(
+      buildClientToClientTunnelSpecCreateRequest({
+        ingressClientId: 'client-b',
+        targetClientId: 'client-a',
+        name: 'socks-c2c',
+        type: 'socks5',
+        bind_ip: '127.0.0.1',
+        local_ip: '',
+        local_port: 0,
+        remote_port: 1081,
+        allowed_source_cidrs: ['127.0.0.0/8'],
+        socks5: {
+          auth_type: 'username_password',
+          username: 'u',
+          password: 'p',
+          allowed_target_cidrs: ['0.0.0.0/0', '::/0'],
+          dial_timeout_seconds: 10,
+        },
+      }),
+    ).toMatchObject({
+      topology: 'client_to_client',
+      ingress: {
+        location: 'client',
+        client_id: 'client-b',
+        type: 'socks5_listen',
+      },
+      target: {
+        location: 'client',
+        client_id: 'client-a',
+        type: 'socks5_connect_handler',
+      },
+    });
+  });
+
   test('TunnelSpec 字段优先驱动拓扑、参与方、传输和绑定提示文案', () => {
     const view = buildTunnelViewModel(
       createTunnel({
@@ -307,6 +397,7 @@ describe('tunnel-model', () => {
           config: {
             bind_ip: '0.0.0.0',
             port: 10022,
+            allowed_source_cidrs: ['0.0.0.0/0', '::/0'],
           },
         },
         target: {
@@ -409,6 +500,20 @@ describe('tunnel-model', () => {
       field: 'target.type',
       message: 'This target type is not supported yet. Only TCP/UDP services are supported.',
       code: 'unsupported_endpoint_type',
+    });
+  });
+
+  test('invalid_target_type 使用 i18n 文案而非后端英文原文', () => {
+    const error = new ApiError(400, 'Bad Request', 'http_host ingress requires tcp_service target', {
+      field: 'target.type',
+      code: 'invalid_target_type',
+    });
+
+    expect(getTunnelMutationErrorMessage(error)).toBe('Ingress type and target type are not compatible.');
+    expect(getTunnelMutationFieldError(error)).toEqual({
+      field: 'target.type',
+      message: 'Ingress type and target type are not compatible.',
+      code: 'invalid_target_type',
     });
   });
 
