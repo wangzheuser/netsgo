@@ -3,6 +3,7 @@ import { describe, expect, test } from 'bun:test';
 import { ApiError } from '@/lib/api';
 
 import {
+  buildLegacyClientTunnelPath,
   canFallbackToLegacyTunnelEndpoint,
   shouldUseLegacyTunnelEndpoint,
 } from './use-tunnel-mutations';
@@ -20,6 +21,11 @@ describe('shouldUseLegacyTunnelEndpoint', () => {
   test('does not fallback for non endpoint-missing errors', () => {
     expect(shouldUseLegacyTunnelEndpoint(new ApiError(500, 'Internal Server Error'), 'server_expose')).toBe(false);
     expect(shouldUseLegacyTunnelEndpoint(new Error('network failed'), 'server_expose')).toBe(false);
+  });
+
+  test('encodes legacy client tunnel path segments', () => {
+    expect(buildLegacyClientTunnelPath('client/with?#chars')).toBe('/api/clients/client%2Fwith%3F%23chars/tunnels');
+    expect(buildLegacyClientTunnelPath('client/with?#chars', '/tun%2F1/resume')).toBe('/api/clients/client%2Fwith%3F%23chars/tunnels/tun%2F1/resume');
   });
 });
 

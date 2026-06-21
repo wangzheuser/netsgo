@@ -3,6 +3,7 @@ package server
 import (
 	"database/sql"
 	"errors"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -762,6 +763,30 @@ func TestCandidateAPIKeysForRawFallbackOnlyLoadsLegacyKeys(t *testing.T) {
 	}
 	if len(keys) != 1 || keys[0].ID != modern.ID {
 		t.Fatalf("matching digest should load only matching modern key, got %+v", keys)
+	}
+}
+
+func TestGenerateUUIDReturnsErrorOnRNGFailure(t *testing.T) {
+	original := cryptoRandRead
+	cryptoRandRead = func([]byte) (int, error) { return 0, io.ErrUnexpectedEOF }
+	t.Cleanup(func() { cryptoRandRead = original })
+
+	if id, err := generateUUIDE(); err == nil || id != "" {
+		t.Fatalf("generateUUIDE should fail without emitting an ID, id=%q err=%v", id, err)
+	}
+}
+
+func TestAdminStore_AddAPIKeyRNGFailureDoesNotPersist(t *testing.T) {
+	store := newInitializedAdminStore(t)
+	original := cryptoRandRead
+	cryptoRandRead = func([]byte) (int, error) { return 0, io.ErrUnexpectedEOF }
+	t.Cleanup(func() { cryptoRandRead = original })
+
+	if key, err := store.AddAPIKey("rng-fail", "sk-rng-fail", []string{"connect"}, nil); err == nil || key != nil {
+		t.Fatalf("AddAPIKey should fail on RNG failure without a key, key=%v err=%v", key, err)
+	}
+	if keys := store.GetAPIKeys(); len(keys) != 0 {
+		t.Fatalf("RNG failure should not persist API keys, got %d", len(keys))
 	}
 }
 

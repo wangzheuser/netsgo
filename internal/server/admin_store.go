@@ -21,6 +21,16 @@ import (
 	"golang.org/x/crypto/bcrypt"
 )
 
+var cryptoRandRead = rand.Read
+
+func randomBytes(n int) ([]byte, error) {
+	buf := make([]byte, n)
+	if _, err := cryptoRandRead(buf); err != nil {
+		return nil, err
+	}
+	return buf, nil
+}
+
 // AdminStore manages persistence of admin accounts, API Keys, and sessions.
 type AdminStore struct {
 	path      string
@@ -69,12 +79,22 @@ type dbExecer interface {
 }
 
 func generateUUID() string {
+	id, err := generateUUIDE()
+	if err != nil {
+		panic(err)
+	}
+	return id
+}
+
+func generateUUIDE() (string, error) {
 	var buf [16]byte
-	_, _ = rand.Read(buf[:])
+	if _, err := cryptoRandRead(buf[:]); err != nil {
+		return "", fmt.Errorf("failed to generate uuid: %w", err)
+	}
 	buf[6] = (buf[6] & 0x0f) | 0x40
 	buf[8] = (buf[8] & 0x3f) | 0x80
 	return fmt.Sprintf("%08x-%04x-%04x-%04x-%012x",
-		buf[0:4], buf[4:6], buf[6:8], buf[8:10], buf[10:16])
+		buf[0:4], buf[4:6], buf[6:8], buf[8:10], buf[10:16]), nil
 }
 
 // AdminStoreOptions configures admin store startup behavior.
@@ -304,14 +324,18 @@ func (s *AdminStore) Initialize(username, password, serverAddr string, allowedPo
 	}
 
 	secretBytes := make([]byte, 32)
-	if _, err := rand.Read(secretBytes); err != nil {
+	if _, err := cryptoRandRead(secretBytes); err != nil {
 		return fmt.Errorf("failed to generate JWT secret: %w", err)
 	}
 	jwtSecret := hex.EncodeToString(secretBytes)
 
 	now := time.Now()
+	userID, err := generateUUIDE()
+	if err != nil {
+		return err
+	}
 	user := AdminUser{
-		ID:           generateUUID(),
+		ID:           userID,
 		Username:     username,
 		PasswordHash: string(hash),
 		Role:         "admin",
@@ -627,8 +651,12 @@ func (s *AdminStore) ResetAdminUser(username, password string) error {
 	}
 
 	now := time.Now()
+	userID, err := generateUUIDE()
+	if err != nil {
+		return err
+	}
 	user := AdminUser{
-		ID:           generateUUID(),
+		ID:           userID,
 		Username:     username,
 		PasswordHash: string(hash),
 		Role:         "admin",
@@ -792,8 +820,12 @@ func getOrCreateClientInTx(tx *sql.Tx, installID string, info protocol.ClientInf
 		return RegisteredClient{}, err
 	}
 
+	clientID, err := generateUUIDE()
+	if err != nil {
+		return RegisteredClient{}, err
+	}
 	client = RegisteredClient{
-		ID:        generateUUID(),
+		ID:        clientID,
 		InstallID: installID,
 		Info:      info,
 		CreatedAt: now,
@@ -1362,8 +1394,12 @@ func (s *AdminStore) CreateSession(userID, username, role, ip, ua string) (*Admi
 	defer s.mu.Unlock()
 
 	now := time.Now()
+	sessionID, err := generateUUIDE()
+	if err != nil {
+		return nil, err
+	}
 	session := AdminSession{
-		ID:        generateUUID(),
+		ID:        sessionID,
 		UserID:    userID,
 		Username:  username,
 		Role:      role,
@@ -1793,7 +1829,7 @@ func hashToken(token string) string {
 // generateToken creates a random 256-bit token.
 func generateToken() (string, error) {
 	buf := make([]byte, 32)
-	if _, err := rand.Read(buf); err != nil {
+	if _, err := cryptoRandRead(buf); err != nil {
 		return "", fmt.Errorf("failed to generate token: %w", err)
 	}
 	return "tk-" + hex.EncodeToString(buf), nil
@@ -1927,8 +1963,12 @@ func exchangeTokenInTx(tx *sql.Tx, key, installID, clientID, ip string, now time
 		}
 	}
 
+	tokenID, err := generateUUIDE()
+	if err != nil {
+		return "", nil, err
+	}
 	clientToken := ClientToken{
-		ID:           generateUUID(),
+		ID:           tokenID,
 		TokenHash:    hashToken(newToken),
 		InstallID:    installID,
 		KeyID:        keyID,
@@ -2187,8 +2227,12 @@ func (s *AdminStore) AddAPIKey(name, keyString string, permissions []string, exp
 		return nil, err
 	}
 
+	keyID, err := generateUUIDE()
+	if err != nil {
+		return nil, err
+	}
 	k := APIKey{
-		ID:           generateUUID(),
+		ID:           keyID,
 		Name:         name,
 		KeyHash:      string(hash),
 		LookupDigest: apiKeyLookupDigest(keyString),

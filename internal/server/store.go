@@ -250,6 +250,7 @@ func scanStoredTunnel(row dbScanner) (StoredTunnel, error) {
 	if err := tunnel.normalize(); err != nil {
 		return StoredTunnel{}, err
 	}
+	tunnel.BindIP = tunnelIngressBindIP(tunnel)
 	return tunnel, nil
 }
 
@@ -407,7 +408,11 @@ func (s *TunnelStore) tunnelIDExists(clientID, id string) (bool, error) {
 // AddTunnel adds a tunnel configuration and persists it.
 func (s *TunnelStore) AddTunnel(tunnel StoredTunnel) error {
 	if tunnel.ID == "" {
-		tunnel.ID = generateUUID()
+		id, err := generateUUIDE()
+		if err != nil {
+			return err
+		}
+		tunnel.ID = id
 	}
 	if err := tunnel.normalize(); err != nil {
 		return err
@@ -1439,9 +1444,9 @@ func tunnelIngressConfig(t *StoredTunnel) map[string]any {
 			"auth":                 protocol.HTTPAuthConfig{Type: protocol.HTTPAuthTypeNone},
 		}
 	case protocol.ProxyTypeUDP:
-		return map[string]any{"bind_ip": "0.0.0.0", "port": t.RemotePort, "allowed_source_cidrs": allowAllSourceCIDRs()}
+		return map[string]any{"bind_ip": normalizeServerBindIP(t.BindIP), "port": t.RemotePort, "allowed_source_cidrs": allowAllSourceCIDRs()}
 	default:
-		return map[string]any{"bind_ip": "0.0.0.0", "port": t.RemotePort, "allowed_source_cidrs": allowAllSourceCIDRs()}
+		return map[string]any{"bind_ip": normalizeServerBindIP(t.BindIP), "port": t.RemotePort, "allowed_source_cidrs": allowAllSourceCIDRs()}
 	}
 }
 
