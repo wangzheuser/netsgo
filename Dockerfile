@@ -48,7 +48,11 @@ RUN set -eux; \
         -o /out/netsgo \
         ./cmd/netsgo
 
-FROM gcr.io/distroless/static-debian12:nonroot AS runtime
+FROM alpine:3.21 AS runtime
+
+RUN apk add --no-cache ca-certificates && \
+    mkdir -p /var/lib/netsgo/server /var/lib/netsgo/client /var/lib/netsgo/locks && \
+    chmod -R 750 /var/lib/netsgo
 
 WORKDIR /app
 
@@ -56,7 +60,10 @@ COPY --from=builder /out/netsgo /usr/local/bin/netsgo
 
 EXPOSE 9527
 
-ENV NETSGO_PORT=9527
+ENV NETSGO_PORT=9527 \
+    NETSGO_DATA_DIR=/var/lib/netsgo
+
+VOLUME ["/var/lib/netsgo"]
 
 ENTRYPOINT ["/usr/local/bin/netsgo"]
 CMD ["server"]
