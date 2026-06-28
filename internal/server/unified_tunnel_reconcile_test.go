@@ -89,12 +89,13 @@ func TestScheduleUnifiedTunnelReconcileAfterShutdownDoesNotMutateState(t *testin
 		t.Fatalf("parse unified_tunnel_reconcile.go: %v", err)
 	}
 	fn := findFuncDecl(file, "scheduleUnifiedTunnelReconcile")
-	if fn == nil {
+	if fn == nil || fn.Body == nil {
 		t.Fatal("scheduleUnifiedTunnelReconcile not found")
 	}
+	body := fn.Body
 
 	sawDoneGuardBeforeGo := false
-	for _, stmt := range fn.Body.List {
+	for _, stmt := range body.List {
 		if _, ok := stmt.(*ast.GoStmt); ok {
 			if !sawDoneGuardBeforeGo {
 				t.Fatal("scheduleUnifiedTunnelReconcile must check s.done before starting reconcile goroutine")
@@ -876,7 +877,7 @@ func TestUnifiedServerExposeReconcileRejectsStaleProvisionAckAfterRevisionAdvanc
 	next.Revision = stored.Revision + 1
 	next.RuntimeState = protocol.ProxyRuntimeStateOffline
 	next.Target.Config = mustRawJSON(serviceConfigAPI{IP: "127.0.0.1", Port: 65023})
-	next.ProxyNewRequest.LocalPort = 65023
+	next.LocalPort = 65023
 	next.UpdatedAt = time.Now().UTC()
 	if err := s.store.ReplaceTunnelByID(stored.OwnerClientID, stored.ID, stored.Revision, next); err != nil {
 		t.Fatalf("advance stored tunnel revision while old provision is pending: %v", err)
