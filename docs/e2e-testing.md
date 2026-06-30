@@ -146,7 +146,7 @@ Legacy managed tunnel behavior is covered by unit/in-process tests, not by the D
 
 CI syntax-checks these scripts and runs a cross-version smoke gate: stable-only baseline smoke followed by mixed-version compatibility smoke. Full cross-version execution is still intended for release or manual validation because it builds stable/current images and runs multiple Docker Compose stacks. PR CI should not be treated as proof of full cross-version data-path compatibility unless the manual `Cross-Version E2E` workflow or equivalent local commands have also passed.
 
-System E2E and cross-version harnesses never set `NETSGO_TDD_RED`. The payload-split focused targets `make test-tdd-red-client` and `make test-tdd-red-server` are now ordinary regression targets kept for historical command compatibility.
+System E2E and cross-version harnesses never set `NETSGO_TDD_RED`. The `make test-tdd-red-client` and `make test-tdd-red-server` targets are ordinary focused regression shortcuts kept for historical command compatibility.
 
 ## Playwright UI E2E
 

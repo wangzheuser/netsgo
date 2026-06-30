@@ -6,11 +6,13 @@ Open
 
 ## Severity
 
-Medium
+Low
 
 ## Why it matters
 
 legacy `ProxyConfig` 使用 `exposed`，unified `TunnelSpec` 与 DB 使用 `active`。两套状态名长期共存会让 SQL、事件、API DTO、前端展示和测试继续背负翻译成本。
+
+直白地说，这是同一个“隧道已经对外可用”的状态有两个名字：旧 API/前端习惯叫 `exposed`，新存储/unified API 叫 `active`。它主要是命名和兼容边界债务，不是当前运行态 bug。
 
 ## Current evidence
 
@@ -29,7 +31,7 @@ legacy `ProxyConfig` 使用 `exposed`，unified `TunnelSpec` 与 DB 使用 `acti
 
 ## Recommended direction
 
-单独决定最终命名。倾向统一到 `active`，因为 unified `TunnelSpec`、DB、E2E 脚本和新 API 已经以 `active` 为当前形态；如果要统一到 `exposed`，需要反向迁移 DB CHECK、E2E、unified DTO 和前端类型。无论选哪边，都必须保留旧值读取兼容窗口。
+如果要改，倾向统一到 `active`，因为 unified `TunnelSpec`、DB、E2E 脚本和新 API 已经以 `active` 为当前形态。风险不高的做法是只在 legacy `ProxyConfig` 边界继续读写 `exposed`，内部存储和新 API 全部保持 `active`；不要做会破坏旧 API 响应的硬切换。
 
 ## Validation needed
 

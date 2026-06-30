@@ -2,15 +2,17 @@
 
 ## Status
 
-Open for FK/CHECK hardening
+Open for optional DB constraint hardening
 
 ## Severity
 
-Medium
+Low
 
 ## Why it matters
 
 资源锁冲突检测已经承担端口/host 互斥，但 `tunnel_resource_locks` 表缺少 FK 和 `resource_kind` CHECK。崩溃、旧 bug 或手工写库仍可能留下孤儿锁或非法 kind。
+
+这不是当前功能缺口。正常 API 路径已经做了互斥检查和删除清理；剩余风险主要来自手工写库、历史脏数据或崩溃后不一致，所以优先级低。
 
 ## Current evidence
 
@@ -35,7 +37,7 @@ Medium
 
 ## Recommended direction
 
-单独做 DB constraint hardening。迁移必须先明确脏数据策略：迁移前检测并失败，或从 `tunnels` 表重建 locks。不要盲目 copy 旧 locks 到带约束的新表。
+可选地做 DB constraint hardening。迁移必须先明确脏数据策略：迁移前检测并失败，或从 `tunnels` 表重建 locks。不要盲目 copy 旧 locks 到带约束的新表。
 
 ## Validation needed
 
