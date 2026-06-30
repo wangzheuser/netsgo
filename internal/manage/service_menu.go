@@ -283,3 +283,7 @@ func suffixAfter(value, sep string) string {
 func lockPath(dataDir string) string {
 	return filepath.Join(dataDir, "locks")
 }
+
+func roleLockPath(layout svcmgr.ServiceLayout) string {
+	return filepath.Join(layout.DataDir, "locks", string(layout.Role)+".lock")
+}

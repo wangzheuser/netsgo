@@ -1,21 +1,28 @@
 package manage
 
 import (
+	"os"
+	"path/filepath"
+
 	"netsgo/internal/svcmgr"
 	"netsgo/internal/tui"
 )
 
 type uninstallAllDeps struct {
-	UI     uiProvider
-	Server serverDeps
-	Client clientDeps
+	UI                uiProvider
+	Server            serverDeps
+	Client            clientDeps
+	RemoveUser        func(string) error
+	RemoveSharedPaths func(paths ...string) error
 }
 
 func UninstallAll() error {
 	return uninstallAllWith(uninstallAllDeps{
-		UI:     defaultUI{},
-		Server: defaultServerDeps(),
-		Client: defaultClientDeps(),
+		UI:                defaultUI{},
+		Server:            defaultServerDeps(),
+		Client:            defaultClientDeps(),
+		RemoveUser:        svcmgr.RemoveUser,
+		RemoveSharedPaths: removePaths,
 	})
 }
 
@@ -35,7 +42,7 @@ func uninstallAllWith(deps uninstallAllDeps) error {
 	serverRows := [][2]string{{"模式", uninstallModeLabel(deleteServerData)}}
 	serverRows = appendRemovalRows(serverRows, "移除", serverLayout.UnitPath, serverLayout.EnvPath)
 	if deleteServerData {
-		serverRows = appendRemovalRows(serverRows, "移除", serverDataPath(serverLayout))
+		serverRows = appendRemovalRows(serverRows, "移除", serverDataPath(serverLayout), roleLockPath(serverLayout))
 	} else {
 		serverRows = append(serverRows, [2]string{"保留", serverDataPath(serverLayout)})
 	}
@@ -55,7 +62,13 @@ func uninstallAllWith(deps uninstallAllDeps) error {
 		{"结果", "重新安装 client 时请从 Web 控制台获取新的 client key"},
 		{"结果", "不会自动清理 server 端历史记录"},
 	}
-	clientRows = appendRemovalRows(clientRows, "移除", clientLayout.UnitPath, clientLayout.EnvPath, clientDataPath(clientLayout))
+	clientRows = appendRemovalRows(clientRows, "移除", clientLayout.UnitPath, clientLayout.EnvPath, clientDataPath(clientLayout), roleLockPath(clientLayout))
+	if deleteServerData {
+		clientRows = appendRemovalRows(clientRows, "移除", filepath.Join(svcmgr.ManagedDataDir, "locks"))
+		clientRows = appendRemovalRows(clientRows, "移除", svcmgr.ManagedDataDir)
+		clientRows = appendRemovalRows(clientRows, "移除", svcmgr.ServicesDir)
+		clientRows = append(clientRows, [2]string{"移除", "system 用户/组 " + svcmgr.SystemUser})
+	}
 	clientRows = append(clientRows, [2]string{"可选", "移除两个角色后，可选择是否移除共享二进制 " + svcmgr.BinaryPath})
 	deps.UI.PrintSummary("Client 卸载计划", clientRows)
 	ok, err = deps.UI.ConfirmWithOptions("在批量移除中包含 client 卸载？", tui.ConfirmOptions{ConfirmText: "uninstall client"})
@@ -72,7 +85,7 @@ func uninstallAllWith(deps uninstallAllDeps) error {
 	}
 	serverPaths := []string{serverLayout.UnitPath, serverLayout.EnvPath}
 	if deleteServerData {
-		serverPaths = append(serverPaths, serverDataPath(serverLayout))
+		serverPaths = append(serverPaths, serverDataPath(serverLayout), roleLockPath(serverLayout))
 	}
 	if err := deps.Server.RemovePaths(serverPaths...); err != nil {
 		return err
@@ -81,13 +94,21 @@ func uninstallAllWith(deps uninstallAllDeps) error {
 	if err := deps.Client.DisableAndStop(); err != nil {
 		return err
 	}
-	if err := deps.Client.RemovePaths(clientLayout.UnitPath, clientLayout.EnvPath, clientDataPath(clientLayout)); err != nil {
+	clientPaths := []string{clientLayout.UnitPath, clientLayout.EnvPath, clientDataPath(clientLayout), roleLockPath(clientLayout)}
+	if err := deps.Client.RemovePaths(clientPaths...); err != nil {
 		return err
 	}
 
 	if err := deps.Server.DaemonReload(); err != nil {
 		return err
 	}
+
+	if deleteServerData {
+		if err := cleanupSharedResources(deps); err != nil {
+			return err
+		}
+	}
+
 	ok, err = deps.UI.ConfirmWithOptions("未检测到其他托管角色。是否同时移除共享二进制 "+svcmgr.BinaryPath+"？", tui.ConfirmOptions{ConfirmText: "remove binary", CancelDescription: "保留共享二进制"})
 	if err != nil {
 		return err
@@ -104,4 +125,35 @@ func uninstallAllWith(deps uninstallAllDeps) error {
 		{"下一步", "需要时运行 netsgo install 重新安装托管角色"},
 	})
 	return errReturnToSelection
+}
+
+func cleanupSharedResources(deps uninstallAllDeps) error {
+	if deps.RemoveSharedPaths != nil {
+		sharedPaths := []string{
+			filepath.Join(svcmgr.ManagedDataDir, "locks"),
+			svcmgr.ManagedDataDir,
+		}
+		if err := deps.RemoveSharedPaths(sharedPaths...); err != nil {
+			return err
+		}
+	}
+	removeEmptyDir(svcmgr.ServicesDir)
+	removeEmptyDir(filepath.Dir(svcmgr.ServicesDir))
+	if deps.RemoveUser != nil {
+		if err := deps.RemoveUser(svcmgr.SystemUser); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func removeEmptyDir(path string) {
+	info, err := os.Lstat(path)
+	if err != nil {
+		return
+	}
+	if info.Mode()&os.ModeSymlink != 0 {
+		return
+	}
+	_ = os.Remove(path)
 }

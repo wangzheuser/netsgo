@@ -76,6 +76,9 @@ func TestManageServerUninstallKeepData(t *testing.T) {
 		if path == serverDataPath(spec) {
 			t.Fatalf("keep-data mode should not remove the server data dir: %v", removed)
 		}
+		if path == roleLockPath(spec) {
+			t.Fatalf("keep-data mode should not remove the server lock file: %v", removed)
+		}
 	}
 	if binaryRemoved {
 		t.Fatal("should not remove the shared binary while the client is still installed")
@@ -224,6 +227,29 @@ func TestManageServerUninstallLastRoleCanRemoveSharedBinary(t *testing.T) {
 	}
 	assertConfirmPhrase(t, ui.confirmCalls, "继续卸载 server？", "uninstall server")
 	assertConfirmPhrase(t, ui.confirmCalls, "未检测到其他托管角色。是否同时移除共享二进制 /usr/local/bin/netsgo？", "remove binary")
+}
+
+func TestManageServerUninstallDeleteDataRemovesLockFile(t *testing.T) {
+	ui := &fakeUI{selects: []int{6, 1}, confirms: []bool{true, true}}
+	removed := []string{}
+	deps, spec := newInstalledServerDeps(t, ui)
+	deps.DetectClient = func() svcmgr.InstallState { return svcmgr.StateNotInstalled }
+	deps.RemovePaths = func(paths ...string) error {
+		removed = append(removed, paths...)
+		return nil
+	}
+	deps.RemoveBinary = func() error { return nil }
+
+	err := ManageServerWith(deps)
+	assertSelectionExit(t, err)
+
+	if !containsPath(removed, serverDataPath(spec)) {
+		t.Fatalf("delete-data mode should remove server data dir: %v", removed)
+	}
+	if !containsPath(removed, roleLockPath(spec)) {
+		t.Fatalf("delete-data mode should remove server lock file: %v", removed)
+	}
+	assertConfirmPhrase(t, ui.confirmCalls, "继续卸载 server？", "remove server data")
 }
 
 func TestCleanupBrokenServerUsesCleanupPhraseWhenKeepingData(t *testing.T) {

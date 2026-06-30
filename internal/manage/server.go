@@ -156,7 +156,7 @@ func uninstallServer(deps serverDeps) (bool, error) {
 	rows := [][2]string{{"模式", uninstallModeLabel(deleteData)}}
 	rows = appendRemovalRows(rows, "移除", layout.UnitPath, layout.EnvPath)
 	if deleteData {
-		rows = appendRemovalRows(rows, "移除", serverDataPath(layout))
+		rows = appendRemovalRows(rows, "移除", serverDataPath(layout), roleLockPath(layout))
 	} else {
 		rows = append(rows, [2]string{"保留", serverDataPath(layout)})
 	}
@@ -176,7 +176,7 @@ func uninstallServer(deps serverDeps) (bool, error) {
 	}
 	paths := []string{layout.UnitPath, layout.EnvPath}
 	if deleteData {
-		paths = append(paths, serverDataPath(layout))
+		paths = append(paths, serverDataPath(layout), roleLockPath(layout))
 	}
 	if err := deps.RemovePaths(paths...); err != nil {
 		return false, err
@@ -264,7 +264,7 @@ func cleanupBrokenServer(deps serverDeps) (bool, error) {
 	rows := [][2]string{{"模式", uninstallModeLabel(deleteData)}}
 	rows = appendRemovalRows(rows, "移除", layout.UnitPath, layout.EnvPath)
 	if deleteData {
-		rows = appendRemovalRows(rows, "移除", serverDataPath(layout))
+		rows = appendRemovalRows(rows, "移除", serverDataPath(layout), roleLockPath(layout))
 	} else {
 		rows = append(rows, [2]string{"保留", serverDataPath(layout)})
 	}
@@ -281,7 +281,7 @@ func cleanupBrokenServer(deps serverDeps) (bool, error) {
 	}
 	paths := []string{layout.UnitPath, layout.EnvPath}
 	if deleteData {
-		paths = append(paths, serverDataPath(layout))
+		paths = append(paths, serverDataPath(layout), roleLockPath(layout))
 	}
 	if err := deps.RemovePaths(paths...); err != nil {
 		return false, err

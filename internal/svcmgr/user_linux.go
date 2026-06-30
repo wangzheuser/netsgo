@@ -22,7 +22,30 @@ func EnsureUser(username string) error {
 	return runUserCommand("useradd", "--system", "--no-create-home", "--shell", "/usr/sbin/nologin", "-g", username, username)
 }
 
-func runUserCommand(name string, args ...string) error {
+func RemoveUser(username string) error {
+	exists, err := UserExists(username)
+	if err != nil {
+		return err
+	}
+	if exists {
+		if err := runUserCommand("userdel", username); err != nil {
+			return err
+		}
+	}
+
+	groupExists, err := GroupExists(username)
+	if err != nil {
+		return err
+	}
+	if groupExists {
+		return runUserCommand("groupdel", username)
+	}
+	return nil
+}
+
+var runUserCommand = runUserCommandImpl
+
+func runUserCommandImpl(name string, args ...string) error {
 	cmd := exec.Command(name, args...)
 	output, err := cmd.CombinedOutput()
 	if err != nil {

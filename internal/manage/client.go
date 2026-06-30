@@ -136,7 +136,7 @@ func uninstallClient(deps clientDeps) (bool, error) {
 		{"结果", "重新安装 client 时请从 Web 控制台获取新的 client key"},
 		{"结果", "不会自动清理 server 端历史记录"},
 	}
-	rows = appendRemovalRows(rows, "移除", layout.UnitPath, layout.EnvPath, clientDataPath(layout))
+	rows = appendRemovalRows(rows, "移除", layout.UnitPath, layout.EnvPath, clientDataPath(layout), roleLockPath(layout))
 	rows = append(rows, sharedBinaryPlanRow(deps.DetectServer))
 	deps.UI.PrintSummary("Client 卸载计划", rows)
 
@@ -151,7 +151,7 @@ func uninstallClient(deps clientDeps) (bool, error) {
 	if err := deps.DisableAndStop(); err != nil {
 		return false, err
 	}
-	if err := deps.RemovePaths(layout.UnitPath, layout.EnvPath, clientDataPath(layout)); err != nil {
+	if err := deps.RemovePaths(layout.UnitPath, layout.EnvPath, clientDataPath(layout), roleLockPath(layout)); err != nil {
 		return false, err
 	}
 	if err := deps.DaemonReload(); err != nil {
@@ -208,7 +208,7 @@ func cleanupBrokenClient(deps clientDeps) (bool, error) {
 		{"影响", "移除异常 client 服务文件和本地连接状态"},
 		{"结果", "重新安装 client 时请从 Web 控制台获取新的 client key"},
 	}
-	rows = appendRemovalRows(rows, "移除", layout.UnitPath, layout.EnvPath, clientDataPath(layout))
+	rows = appendRemovalRows(rows, "移除", layout.UnitPath, layout.EnvPath, clientDataPath(layout), roleLockPath(layout))
 	rows = append(rows, sharedBinaryPlanRow(deps.DetectServer))
 	deps.UI.PrintSummary("异常 client 清理计划", rows)
 
@@ -220,7 +220,7 @@ func cleanupBrokenClient(deps clientDeps) (bool, error) {
 		printManageCancelled(deps.UI)
 		return false, nil
 	}
-	if err := deps.RemovePaths(layout.UnitPath, layout.EnvPath, clientDataPath(layout)); err != nil {
+	if err := deps.RemovePaths(layout.UnitPath, layout.EnvPath, clientDataPath(layout), roleLockPath(layout)); err != nil {
 		return false, err
 	}
 	if err := deps.DaemonReload(); err != nil {

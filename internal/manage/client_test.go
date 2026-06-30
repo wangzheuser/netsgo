@@ -75,13 +75,20 @@ func TestManageClientUninstallRemovesData(t *testing.T) {
 	assertSelectionExit(t, err)
 
 	found := false
+	lockFound := false
 	for _, path := range removed {
 		if path == clientDataPath(spec) {
 			found = true
 		}
+		if path == roleLockPath(spec) {
+			lockFound = true
+		}
 	}
 	if !found {
 		t.Fatalf("client uninstall should remove the client data dir: %v", removed)
+	}
+	if !lockFound {
+		t.Fatalf("client uninstall should remove the client lock file: %v", removed)
 	}
 	assertSummaryCallDoesNotContain(t, ui.summaries[0], "身份")
 	assertSummaryCallDoesNotContain(t, ui.summaries[len(ui.summaries)-1], "身份")

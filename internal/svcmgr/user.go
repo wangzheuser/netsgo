@@ -19,8 +19,25 @@ func UserExists(username string) (bool, error) {
 }
 
 var lookupSystemUser = user.Lookup
+var lookupSystemGroup = user.LookupGroup
 
 func isUnknownUser(err error) bool {
 	_, ok := err.(user.UnknownUserError)
 	return ok
+}
+
+func isUnknownGroup(err error) bool {
+	_, ok := err.(user.UnknownGroupError)
+	return ok
+}
+
+func GroupExists(name string) (bool, error) {
+	_, err := lookupSystemGroup(name)
+	if err == nil {
+		return true, nil
+	}
+	if isUnknownGroup(err) {
+		return false, nil
+	}
+	return false, err
 }
