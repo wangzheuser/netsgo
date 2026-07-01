@@ -66,10 +66,6 @@ func (s *Server) persistTunnelStates(clientID, name, desiredState, runtimeState,
 	return s.store.UpdateStates(clientID, name, desiredState, runtimeState, errMsg)
 }
 
-func (s *Server) upsertTunnelPlaceholder(client *ClientConn, req protocol.ProxyNewRequest, desiredState, runtimeState, errMsg string, createdAt time.Time) protocol.ProxyConfig {
-	return s.upsertTunnelPlaceholderWithRevision(client, req, 1, desiredState, runtimeState, errMsg, createdAt)
-}
-
 func (s *Server) upsertTunnelPlaceholderWithRevision(client *ClientConn, req protocol.ProxyNewRequest, revision int64, desiredState, runtimeState, errMsg string, createdAt time.Time) protocol.ProxyConfig {
 	if createdAt.IsZero() {
 		createdAt = time.Now().UTC()

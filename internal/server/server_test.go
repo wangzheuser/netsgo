@@ -2348,6 +2348,10 @@ func TestServer_RestorePostAckStoreFailureMarksError(t *testing.T) {
 		t.Fatalf("after restore failure: want %s, got %s", protocol.MsgTypeProxyClose, closeMsg.Type)
 	}
 
+	lastRuntimeState := "<missing>"
+	lastRuntimeError := ""
+	lastStoreState := "<missing>"
+	lastStoreError := ""
 	deadline := time.Now().Add(2 * time.Second)
 	for time.Now().Before(deadline) {
 		value, ok := s.clients.Load(authResp.ClientID)
@@ -2358,18 +2362,24 @@ func TestServer_RestorePostAckStoreFailureMarksError(t *testing.T) {
 		client.proxyMu.RLock()
 		tunnel := client.proxies["restore-fail-tunnel"]
 		client.proxyMu.RUnlock()
-		if tunnel != nil &&
-			tunnel.Config.DesiredState == protocol.ProxyDesiredStateRunning &&
-			tunnel.Config.RuntimeState == protocol.ProxyRuntimeStateError {
+		runtimeReady := false
+		if tunnel != nil {
+			lastRuntimeState = tunnel.Config.DesiredState + "/" + tunnel.Config.RuntimeState
+			lastRuntimeError = tunnel.Config.Error
+			runtimeReady = tunnel.Config.DesiredState == protocol.ProxyDesiredStateRunning &&
+				tunnel.Config.RuntimeState == protocol.ProxyRuntimeStateError
+		}
+		stored, exists := s.store.GetTunnel(authResp.ClientID, "restore-fail-tunnel")
+		storeReady := false
+		if exists {
+			lastStoreState = stored.DesiredState + "/" + stored.RuntimeState
+			lastStoreError = stored.Error
+			storeReady = stored.DesiredState == protocol.ProxyDesiredStateRunning &&
+				stored.RuntimeState == protocol.ProxyRuntimeStateError
+		}
+		if runtimeReady && storeReady {
 			if tunnel.Config.Error == "" {
 				t.Fatal("runtime error tunnel should carry the failure reason")
-			}
-			stored, exists := s.store.GetTunnel(authResp.ClientID, "restore-fail-tunnel")
-			if !exists {
-				t.Fatal("store should retain restore-fail-tunnel")
-			}
-			if stored.DesiredState != protocol.ProxyDesiredStateRunning || stored.RuntimeState != protocol.ProxyRuntimeStateError {
-				t.Fatalf("store state: want running/error, got %s/%s", stored.DesiredState, stored.RuntimeState)
 			}
 			if stored.Error == "" {
 				t.Fatal("store error tunnel should persist the failure reason")
@@ -2378,7 +2388,8 @@ func TestServer_RestorePostAckStoreFailureMarksError(t *testing.T) {
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
-	t.Fatal("timed out waiting for restore failure to degrade to error")
+	t.Fatalf("timed out waiting for restore failure to degrade to error: runtime=%s err=%q store=%s err=%q",
+		lastRuntimeState, lastRuntimeError, lastStoreState, lastStoreError)
 }
 
 func TestServer_RestoreActiveHTTPTunnel_DoesNotConflictWithSelf(t *testing.T) {
