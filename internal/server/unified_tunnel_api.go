@@ -1173,10 +1173,8 @@ func (s *Server) registeredClientInfo(clientID string) (RegisteredClient, bool) 
 }
 
 func clientSupportsTargetType(capabilities *protocol.ClientCapabilities, targetType string) bool {
-	if capabilities == nil {
-		return false
-	}
-	for _, supported := range capabilities.TargetTypes {
+	effective := effectiveClientCapabilities(capabilities)
+	for _, supported := range effective.TargetTypes {
 		if supported == targetType {
 			return true
 		}
@@ -1185,15 +1183,32 @@ func clientSupportsTargetType(capabilities *protocol.ClientCapabilities, targetT
 }
 
 func clientSupportsIngressType(capabilities *protocol.ClientCapabilities, ingressType string) bool {
-	if capabilities == nil {
-		return false
-	}
-	for _, supported := range capabilities.IngressTypes {
+	effective := effectiveClientCapabilities(capabilities)
+	for _, supported := range effective.IngressTypes {
 		if supported == ingressType {
 			return true
 		}
 	}
 	return false
+}
+
+func effectiveClientCapabilities(capabilities *protocol.ClientCapabilities) protocol.ClientCapabilities {
+	if capabilities != nil {
+		return *capabilities
+	}
+	return legacyUnifiedClientCapabilities()
+}
+
+func legacyUnifiedClientCapabilities() protocol.ClientCapabilities {
+	return protocol.ClientCapabilities{
+		ProtocolVersion:     1,
+		StreamHeaderVersion: 1,
+		TunnelSpecVersion:   protocol.TunnelSpecVersion,
+		IngressTypes:        []string{protocol.IngressTypeTCPListen, protocol.IngressTypeUDPListen},
+		TargetTypes:         []string{protocol.TargetTypeTCPService, protocol.TargetTypeUDPService},
+		TransportPolicies:   []string{protocol.TransportPolicyServerRelayOnly},
+		P2P:                 protocol.P2PCapabilities{Supported: false},
+	}
 }
 
 func clientHasDataSession(client *ClientConn) bool {
@@ -1502,17 +1517,6 @@ func unifiedTunnelViewKey(id, clientID, name string) string {
 
 func (s *Server) allUnifiedTunnelSpecs() ([]tunnelSpecAPI, error) {
 	byID := map[string]tunnelSpecAPI{}
-	appendConfig := func(config protocol.ProxyConfig, online bool) {
-		view := proxyConfigForClientView(config, online)
-		key := unifiedTunnelViewKey(view.ID, view.ClientID, view.Name)
-		if view.ID == "" {
-			view.ID = view.Name
-		}
-		if _, exists := byID[key]; exists {
-			return
-		}
-		byID[key] = unifiedSpecFromProxyConfig(view)
-	}
 
 	if s.store != nil {
 		stored, err := s.store.GetAllTunnels()
@@ -1529,14 +1533,6 @@ func (s *Server) allUnifiedTunnelSpecs() ([]tunnelSpecAPI, error) {
 		}
 	}
 
-	s.RangeClients(func(_ string, client *ClientConn) bool {
-		online := client.isLive()
-		for _, config := range client.ProxyConfigsSnapshot() {
-			appendConfig(config, online)
-		}
-		return true
-	})
-
 	tunnels := make([]tunnelSpecAPI, 0, len(byID))
 	for _, tunnel := range byID {
 		tunnels = append(tunnels, tunnel)
@@ -1552,17 +1548,6 @@ func (s *Server) allUnifiedTunnelSpecs() ([]tunnelSpecAPI, error) {
 
 func (s *Server) allUnifiedTunnelProxyConfigs() ([]protocol.ProxyConfig, error) {
 	byID := map[string]protocol.ProxyConfig{}
-	appendConfig := func(config protocol.ProxyConfig, online bool) {
-		view := proxyConfigForClientView(config, online)
-		key := unifiedTunnelViewKey(view.ID, view.ClientID, view.Name)
-		if view.ID == "" {
-			view.ID = view.Name
-		}
-		if _, exists := byID[key]; exists {
-			return
-		}
-		byID[key] = view
-	}
 
 	if s.store != nil {
 		stored, err := s.store.GetAllTunnels()
@@ -1578,14 +1563,6 @@ func (s *Server) allUnifiedTunnelProxyConfigs() ([]protocol.ProxyConfig, error) 
 			byID[key] = view
 		}
 	}
-
-	s.RangeClients(func(_ string, client *ClientConn) bool {
-		online := client.isLive()
-		for _, config := range client.ProxyConfigsSnapshot() {
-			appendConfig(config, online)
-		}
-		return true
-	})
 
 	tunnels := make([]protocol.ProxyConfig, 0, len(byID))
 	for _, tunnel := range byID {
@@ -1613,28 +1590,6 @@ func (s *Server) findUnifiedTunnelSpecByID(id string) (tunnelSpecAPI, bool, erro
 		if !errors.Is(err, ErrTunnelNotFound) {
 			return tunnelSpecAPI{}, false, err
 		}
-	}
-
-	var found tunnelSpecAPI
-	var ok bool
-	s.RangeClients(func(_ string, client *ClientConn) bool {
-		online := client.isLive()
-		for _, config := range client.ProxyConfigsSnapshot() {
-			view := proxyConfigForClientView(config, online)
-			if view.ID == "" {
-				view.ID = view.Name
-			}
-			if view.ID != id {
-				continue
-			}
-			found = unifiedSpecFromProxyConfig(view)
-			ok = true
-			return false
-		}
-		return true
-	})
-	if ok {
-		return found, true, nil
 	}
 	return tunnelSpecAPI{}, false, nil
 }

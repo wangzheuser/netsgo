@@ -242,6 +242,47 @@ func (s *Server) emitTunnelChanged(clientID string, tunnel protocol.ProxyConfig,
 	s.events.PublishJSON("tunnel_changed", payload)
 }
 
+func (s *Server) emitTunnelChangedIfStored(clientID string, tunnel protocol.ProxyConfig, action string) {
+	if !s.hasStoredTunnelForEvent(clientID, tunnel) {
+		log.Printf("🔎 suppressing runtime-only tunnel_changed action=%s client_id=%s tunnel_id=%s name=%s",
+			action, clientID, tunnel.ID, tunnel.Name)
+		return
+	}
+	s.emitTunnelChanged(clientID, tunnel, action)
+}
+
+func (s *Server) hasStoredTunnelForEvent(clientID string, tunnel protocol.ProxyConfig) bool {
+	if s.store == nil {
+		return false
+	}
+	ownerClientID := tunnel.OwnerClientID
+	if ownerClientID == "" {
+		ownerClientID = tunnel.ClientID
+	}
+	if ownerClientID == "" {
+		ownerClientID = clientID
+	}
+	if ownerClientID == "" {
+		return false
+	}
+	if tunnel.ID != "" {
+		if _, err := s.store.GetTunnelByIDE(ownerClientID, tunnel.ID); err == nil {
+			return true
+		} else if !errors.Is(err, ErrTunnelNotFound) {
+			log.Printf("⚠️ failed to check stored tunnel event by id: client_id=%s tunnel_id=%s err=%v", ownerClientID, tunnel.ID, err)
+		}
+	}
+	if tunnel.Name == "" {
+		return false
+	}
+	if _, err := s.store.GetTunnelE(ownerClientID, tunnel.Name); err == nil {
+		return true
+	} else if !errors.Is(err, ErrTunnelNotFound) {
+		log.Printf("⚠️ failed to check stored tunnel event by name: client_id=%s name=%s err=%v", ownerClientID, tunnel.Name, err)
+	}
+	return false
+}
+
 func encodeJSON(w http.ResponseWriter, status int, payload any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
@@ -413,7 +454,7 @@ func (s *Server) markTunnelsPortNotAllowed(affected []affectedTunnel) {
 			}
 		}
 
-		s.emitTunnelChanged(a.ClientID, eventConfig, "port_not_allowed")
+		s.emitTunnelChangedIfStored(a.ClientID, eventConfig, "port_not_allowed")
 
 		_ = s.persistTunnelStates(a.ClientID, a.TunnelName, protocol.ProxyDesiredStateRunning, protocol.ProxyRuntimeStateError, errMsg)
 

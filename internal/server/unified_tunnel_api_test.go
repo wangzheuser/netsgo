@@ -2258,59 +2258,64 @@ func TestAPI_UnifiedTunnelProjectionRequiresExposedClientRelayRuntime(t *testing
 	}
 }
 
-func TestAPI_UnifiedTunnelListKeepsSameNameLiveTunnelsWithoutIDs(t *testing.T) {
+func TestAPI_UnifiedTunnelProjectionIgnoresRuntimeOnlyProxyCreateTunnels(t *testing.T) {
 	s := New(0)
+	s.store = newTestTunnelStore(t)
 	now := time.Now().UTC()
+
+	stored := testStoredServerExposeTCPTunnel("stored-tunnel-id", "stored-web", "client-a", 8080, 18080, now)
+	mustAddStableTunnel(t, s.store, stored)
+
 	s.clients.Store("client-a", &ClientConn{
 		ID:    "client-a",
 		state: clientStateLive,
-		proxies: map[string]*ProxyTunnel{"web": {
-			Config: protocol.ProxyConfig{
-				Name:         "web",
-				Type:         protocol.ProxyTypeTCP,
-				LocalIP:      "127.0.0.1",
-				LocalPort:    8080,
-				RemotePort:   18080,
-				ClientID:     "client-a",
-				CreatedAt:    now,
-				DesiredState: protocol.ProxyDesiredStateRunning,
-				RuntimeState: protocol.ProxyRuntimeStateExposed,
-			},
-			done: make(chan struct{}),
-		}},
-	})
-	s.clients.Store("client-b", &ClientConn{
-		ID:    "client-b",
-		state: clientStateLive,
-		proxies: map[string]*ProxyTunnel{"web": {
-			Config: protocol.ProxyConfig{
-				Name:         "web",
-				Type:         protocol.ProxyTypeTCP,
-				LocalIP:      "127.0.0.1",
-				LocalPort:    8081,
-				RemotePort:   18081,
-				ClientID:     "client-b",
-				CreatedAt:    now.Add(time.Second),
-				DesiredState: protocol.ProxyDesiredStateRunning,
-				RuntimeState: protocol.ProxyRuntimeStateExposed,
-			},
-			done: make(chan struct{}),
-		}},
+		proxies: map[string]*ProxyTunnel{
+			"runtime-only": testRuntimeOnlyProxyTunnel("runtime-only-id", "runtime-only", "client-a", 8081, 18081, now.Add(time.Second)),
+		},
 	})
 
 	specs, err := s.allUnifiedTunnelSpecs()
 	if err != nil {
 		t.Fatalf("list unified tunnels: %v", err)
 	}
-	if len(specs) != 2 {
-		t.Fatalf("same-name live tunnels without ids should not be collapsed, got %d: %+v", len(specs), specs)
+	if len(specs) != 1 || specs[0].ID != stored.ID {
+		t.Fatalf("unified specs should only include stored tunnel, got %+v", specs)
 	}
-	seen := map[string]bool{}
-	for _, spec := range specs {
-		seen[spec.OwnerClientID] = true
+
+	configs, err := s.allUnifiedTunnelProxyConfigs()
+	if err != nil {
+		t.Fatalf("list unified proxy configs: %v", err)
 	}
-	if !seen["client-a"] || !seen["client-b"] {
-		t.Fatalf("same-name live tunnels should include both clients, got %+v", specs)
+	if len(configs) != 1 || configs[0].ID != stored.ID {
+		t.Fatalf("unified proxy configs should only include stored tunnel, got %+v", configs)
+	}
+
+	if _, ok, err := s.findUnifiedTunnelSpecByID("runtime-only-id"); err != nil || ok {
+		t.Fatalf("runtime-only tunnel should not be findable by unified id, ok=%v err=%v", ok, err)
+	}
+}
+
+func TestCollectClientViewsIgnoresRuntimeOnlyProxyCreateTunnels(t *testing.T) {
+	s := New(0)
+	s.store = newTestTunnelStore(t)
+	now := time.Now().UTC()
+
+	stored := testStoredServerExposeTCPTunnel("stored-client-view-id", "stored-client-view", "client-a", 8080, 18080, now)
+	mustAddStableTunnel(t, s.store, stored)
+	s.clients.Store("client-a", &ClientConn{
+		ID:    "client-a",
+		state: clientStateLive,
+		proxies: map[string]*ProxyTunnel{
+			"runtime-only": testRuntimeOnlyProxyTunnel("runtime-client-view-id", "runtime-only", "client-a", 8081, 18081, now.Add(time.Second)),
+		},
+	})
+
+	views := s.collectClientViews()
+	if len(views) != 1 {
+		t.Fatalf("collect client views: want 1, got %d: %+v", len(views), views)
+	}
+	if got := views[0].Proxies; len(got) != 1 || got[0].ID != stored.ID {
+		t.Fatalf("client view proxies should only include stored tunnel, got %+v", got)
 	}
 }
 
@@ -3135,6 +3140,55 @@ func TestUnifiedRestoreRoutesClientToClientThroughUnifiedReconcile(t *testing.T)
 	}
 	if reloaded.RuntimeState != protocol.ProxyRuntimeStateOffline {
 		t.Fatalf("C2C restore should reconcile to offline without ingress/target sessions, got %q", reloaded.RuntimeState)
+	}
+}
+
+func TestUnifiedClientSupportsNilCapabilitiesAsLegacyTCPUDP(t *testing.T) {
+	if !clientSupportsTargetType(nil, protocol.TargetTypeTCPService) {
+		t.Fatal("nil capabilities should allow legacy TCP target")
+	}
+	if !clientSupportsTargetType(nil, protocol.TargetTypeUDPService) {
+		t.Fatal("nil capabilities should allow legacy UDP target")
+	}
+	if clientSupportsTargetType(nil, protocol.TargetTypeSOCKS5ConnectHandler) {
+		t.Fatal("nil capabilities should not allow SOCKS5 target")
+	}
+	if !clientSupportsIngressType(nil, protocol.IngressTypeTCPListen) {
+		t.Fatal("nil capabilities should allow legacy TCP ingress")
+	}
+	if !clientSupportsIngressType(nil, protocol.IngressTypeUDPListen) {
+		t.Fatal("nil capabilities should allow legacy UDP ingress")
+	}
+	if clientSupportsIngressType(nil, protocol.IngressTypeSOCKS5Listen) {
+		t.Fatal("nil capabilities should not allow SOCKS5 ingress")
+	}
+
+	empty := protocol.ClientCapabilities{}
+	if clientSupportsTargetType(&empty, protocol.TargetTypeTCPService) {
+		t.Fatal("explicit empty capabilities should not allow TCP target")
+	}
+	if clientSupportsIngressType(&empty, protocol.IngressTypeTCPListen) {
+		t.Fatal("explicit empty capabilities should not allow TCP ingress")
+	}
+}
+
+func TestAPI_UnifiedTunnelCreateAllowsLegacyNilCapabilitiesForTCP(t *testing.T) {
+	s, handler, token, cleanup := setupTestServerWithStores(t, true)
+	defer cleanup()
+
+	record, err := s.auth.adminStore.GetOrCreateClient("install-legacy-nil-caps", protocol.ClientInfo{
+		Hostname: "legacy-nil-caps",
+		OS:       "linux",
+		Arch:     "amd64",
+		Version:  "0.1.0",
+	}, "127.0.0.1:12345")
+	if err != nil {
+		t.Fatalf("create client: %v", err)
+	}
+
+	resp := doMuxRequest(t, handler, http.MethodPost, "/api/tunnels", token, unifiedCreatePayload("legacy-nil-caps-tcp", record.ID, reserveTCPPort(t)))
+	if resp.Code != http.StatusCreated {
+		t.Fatalf("legacy nil capabilities TCP create: want 201, got %d body=%s", resp.Code, resp.Body.String())
 	}
 }
 

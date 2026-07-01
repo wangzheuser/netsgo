@@ -1062,18 +1062,18 @@ func TestTrafficAPI_RealtimeSecondQueryReturnsSixtyZeroFilledPoints(t *testing.T
 	end := time.Unix(1_800_000, 0).UTC()
 	from := end.Add(-59 * time.Second)
 	sampleTime := end.Add(-2 * time.Second)
-	ts.recordBytesAt(sampleTime, clientID, "web", protocol.ProxyTypeHTTP, 1024, 512)
-
-	s.clients.Store(clientID, &ClientConn{
-		ID:    clientID,
-		state: clientStateLive,
-		proxies: map[string]*ProxyTunnel{
-			"web": {
-				Config: protocol.ProxyConfig{Name: "web", Type: protocol.ProxyTypeHTTP},
-				done:   make(chan struct{}),
-			},
-		},
-	})
+	stored := testStoredServerExposeTCPTunnel("traffic-realtime-web-id", "web", clientID, 8080, 18080, from)
+	mustAddStableTunnel(t, s.store, stored)
+	ts.ApplyDeltas([]TrafficDelta{{
+		TunnelID:     stored.ID,
+		ClientID:     clientID,
+		TunnelName:   stored.Name,
+		TunnelType:   stored.Type,
+		SecondStart:  sampleTime.Unix(),
+		MinuteStart:  minuteFloorUTC(sampleTime).Unix(),
+		IngressBytes: 1024,
+		EgressBytes:  512,
+	}})
 
 	path := "/api/clients/" + clientID + "/traffic?from=" + itoa(from.Unix()) + "&to=" + itoa(end.Unix()) + "&resolution=second"
 	w := doMuxRequest(t, handler, http.MethodGet, path, token, nil)
@@ -1105,6 +1105,57 @@ func TestTrafficAPI_RealtimeSecondQueryReturnsSixtyZeroFilledPoints(t *testing.T
 	}
 	if web.Points[trafficRealtimePointCount-1].TotalBytes != 0 {
 		t.Fatalf("missing realtime seconds should be zero-filled, got %+v", web.Points[trafficRealtimePointCount-1])
+	}
+}
+
+func TestCollectRealtimeTrafficEventIgnoresRuntimeOnlyProxyCreateTunnels(t *testing.T) {
+	s := New(0)
+	s.store = newTestTunnelStore(t)
+	ts, trafficCleanup := newTestTrafficStore(t)
+	defer trafficCleanup()
+	s.trafficStore = ts
+
+	clientID := "test-client-runtime-traffic"
+	now := secondFloorUTC(time.Now().UTC()).Add(3 * time.Second)
+	sampleTime := secondFloorUTC(now).Add(-time.Second)
+	stored := testStoredServerExposeTCPTunnel("traffic-stored-id", "stored-web", clientID, 8080, 18080, sampleTime)
+	mustAddStableTunnel(t, s.store, stored)
+	s.clients.Store(clientID, &ClientConn{
+		ID:    clientID,
+		state: clientStateLive,
+		proxies: map[string]*ProxyTunnel{
+			"runtime-only": testRuntimeOnlyProxyTunnel("traffic-runtime-id", "runtime-only", clientID, 8081, 18081, sampleTime),
+		},
+	})
+	ts.ApplyDeltas([]TrafficDelta{
+		{
+			TunnelID:     stored.ID,
+			ClientID:     clientID,
+			TunnelName:   stored.Name,
+			TunnelType:   stored.Type,
+			SecondStart:  sampleTime.Unix(),
+			MinuteStart:  minuteFloorUTC(sampleTime).Unix(),
+			IngressBytes: 10,
+			EgressBytes:  5,
+		},
+		{
+			TunnelID:     "traffic-runtime-id",
+			ClientID:     clientID,
+			TunnelName:   "runtime-only",
+			TunnelType:   protocol.ProxyTypeTCP,
+			SecondStart:  sampleTime.Unix(),
+			MinuteStart:  minuteFloorUTC(sampleTime).Unix(),
+			IngressBytes: 99,
+			EgressBytes:  1,
+		},
+	})
+
+	event := s.collectRealtimeTrafficEvent(now)
+	if len(event.Clients) != 1 {
+		t.Fatalf("realtime event clients: want 1, got %d: %+v", len(event.Clients), event.Clients)
+	}
+	if got := event.Clients[0].Items; len(got) != 1 || got[0].TunnelID != stored.ID {
+		t.Fatalf("realtime event should only include stored tunnel, got %+v", got)
 	}
 }
 
