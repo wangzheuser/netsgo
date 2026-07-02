@@ -6,8 +6,6 @@ import (
 	"log"
 	"sort"
 	"time"
-
-	"netsgo/pkg/protocol"
 )
 
 type realtimeTrafficClient struct {
@@ -75,7 +73,7 @@ func (s *Server) collectRealtimeTrafficEvent(now time.Time) realtimeTrafficEvent
 			return true
 		}
 
-		knownTunnels := trafficSeriesKeysFromProxyConfigs(clientID, client.ProxyConfigsSnapshot(), "")
+		knownTunnels := s.knownTrafficTunnels(clientID, "")
 		if len(knownTunnels) == 0 {
 			return true
 		}
@@ -114,18 +112,10 @@ func (s *Server) knownTrafficTunnels(clientID, tunnelName string) []trafficSerie
 		if key.TunnelName == "" || key.TunnelType == "" {
 			return
 		}
-		if tunnelName != "" && key.TunnelName != tunnelName {
+		if tunnelName != "" && key.TunnelName != tunnelName && key.TunnelID != tunnelName {
 			return
 		}
 		known[key] = struct{}{}
-	}
-
-	if value, ok := s.clients.Load(clientID); ok {
-		if client, ok := value.(*ClientConn); ok && client.isLive() {
-			for _, key := range trafficSeriesKeysFromProxyConfigs(clientID, client.ProxyConfigsSnapshot(), tunnelName) {
-				add(key)
-			}
-		}
 	}
 
 	if s.store != nil {
@@ -147,23 +137,25 @@ func (s *Server) knownTrafficTunnels(clientID, tunnelName string) []trafficSerie
 	return keys
 }
 
-func trafficSeriesKeysFromProxyConfigs(clientID string, configs []protocol.ProxyConfig, tunnelName string) []trafficSeriesKey {
-	keys := make([]trafficSeriesKey, 0, len(configs))
-	for _, config := range configs {
-		if config.Name == "" || config.Type == "" {
+func filterTrafficResultByKnownTunnels(result TrafficQueryResult, knownTunnels []trafficSeriesKey) TrafficQueryResult {
+	allowedSeries := make(map[trafficSeriesKey]struct{}, len(knownTunnels))
+	for _, key := range knownTunnels {
+		if key.TunnelName == "" || key.TunnelType == "" {
 			continue
 		}
-		if tunnelName != "" && config.Name != tunnelName {
-			continue
-		}
-		tunnelID := config.ID
-		if tunnelID == "" {
-			tunnelID = fallbackTrafficTunnelID(clientID, config.Name, config.Type)
-		}
-		keys = append(keys, trafficSeriesKey{TunnelID: tunnelID, TunnelName: config.Name, TunnelType: config.Type})
+		allowedSeries[key] = struct{}{}
 	}
-	sortTrafficSeriesKeys(keys)
-	return keys
+
+	items := make([]TunnelTrafficSeries, 0, len(result.Items))
+	for _, item := range result.Items {
+		key := trafficSeriesKey{TunnelID: item.TunnelID, TunnelName: item.TunnelName, TunnelType: item.TunnelType}
+		if _, ok := allowedSeries[key]; !ok {
+			continue
+		}
+		items = append(items, item)
+	}
+	result.Items = items
+	return result
 }
 
 func fillRealtimeTrafficResult(result TrafficQueryResult, knownTunnels []trafficSeriesKey, from, to time.Time) (TrafficQueryResult, error) {
@@ -180,6 +172,7 @@ func fillRealtimeTrafficResult(result TrafficQueryResult, knownTunnels []traffic
 
 	fromUnix := from.Unix()
 	toUnix := to.Unix()
+	allowedSeries := make(map[trafficSeriesKey]struct{}, len(knownTunnels))
 	seriesSet := make(map[trafficSeriesKey]struct{})
 	pointsBySeries := make(map[trafficSeriesKey]map[int64]TrafficPoint)
 
@@ -187,12 +180,16 @@ func fillRealtimeTrafficResult(result TrafficQueryResult, knownTunnels []traffic
 		if key.TunnelName == "" || key.TunnelType == "" {
 			continue
 		}
+		allowedSeries[key] = struct{}{}
 		seriesSet[key] = struct{}{}
 	}
 
 	for _, item := range result.Items {
 		key := trafficSeriesKey{TunnelID: item.TunnelID, TunnelName: item.TunnelName, TunnelType: item.TunnelType}
 		if key.TunnelName == "" || key.TunnelType == "" {
+			continue
+		}
+		if _, ok := allowedSeries[key]; !ok {
 			continue
 		}
 		seriesSet[key] = struct{}{}

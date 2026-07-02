@@ -467,6 +467,32 @@ func TestAPI_UnifiedTunnelDefaultsMissingSourceCIDRsAndRejectsEmptyList(t *testi
 	}
 }
 
+func TestAPI_UnifiedTunnelRejectsNegativeBandwidthValues(t *testing.T) {
+	s, handler, token, cleanup := setupTestServerWithStores(t, true)
+	defer cleanup()
+
+	target := createUnifiedAPITestClient(t, s, "install-unified-negative-bandwidth", "unified-negative-bandwidth")
+	body := []byte(`{
+		"name":"neg-bandwidth",
+		"topology":"server_expose",
+		"ingress":{"location":"server","type":"tcp_listen","config":{"bind_ip":"0.0.0.0","port":` + strconv.Itoa(reserveTCPPort(t)) + `,"allowed_source_cidrs":["0.0.0.0/0","::/0"]}},
+		"target":{"location":"client","client_id":"` + target.ID + `","type":"tcp_service","config":{"ip":"127.0.0.1","port":22}},
+		"transport_policy":"server_relay_only",
+		"bandwidth_settings":{"ingress_bps":-1,"egress_bps":0}
+	}`)
+	resp := doMuxRequest(t, handler, http.MethodPost, "/api/tunnels", token, body)
+	if resp.Code != http.StatusBadRequest {
+		t.Fatalf("negative bandwidth create: want 400, got %d body=%s", resp.Code, resp.Body.String())
+	}
+	var errBody tunnelMutationErrorResponse
+	if err := mustDecodeJSON(t, resp.Body, &errBody); err != nil {
+		t.Fatalf("decode bandwidth error: %v", err)
+	}
+	if errBody.Field != "bandwidth_settings."+protocol.TunnelMutationFieldIngressBPS {
+		t.Fatalf("bandwidth error field mismatch: %+v", errBody)
+	}
+}
+
 func TestAPI_UnifiedTunnelPreservesSourceCIDRs(t *testing.T) {
 	s, handler, token, cleanup := setupTestServerWithStores(t, true)
 	defer cleanup()
@@ -1415,12 +1441,93 @@ func TestAPI_UnifiedTunnelUpdateRequiresExpectedRevisionAndHardDelete(t *testing
 		t.Fatalf("second update with stale revision: want 409, got %d body=%s", staleSecondResp.Code, staleSecondResp.Body.String())
 	}
 
+	ch := s.events.Subscribe()
+	defer s.events.Unsubscribe(ch)
+
 	deleteResp := doMuxRequest(t, handler, http.MethodDelete, "/api/tunnels/"+created.ID, token, nil)
 	if deleteResp.Code != http.StatusNoContent {
 		t.Fatalf("DELETE /api/tunnels/{id}: want 204, got %d body=%s", deleteResp.Code, deleteResp.Body.String())
 	}
 	if _, err := s.store.GetTunnelByIDE(record.ID, created.ID); !errors.Is(err, ErrTunnelNotFound) {
 		t.Fatalf("deleted tunnel should be hard-deleted, got err=%v", err)
+	}
+	tunnelPayload := waitForTunnelChangedEvent(t, ch, "deleted", "revise-me")
+	assertTunnelBandwidthFields(t, tunnelPayload, 128, 256)
+}
+
+func TestAPI_UnifiedTunnelResumeRequiresResumableState(t *testing.T) {
+	s, handler, token, cleanup := setupTestServerWithStores(t, true)
+	defer cleanup()
+
+	record := createUnifiedAPITestClient(t, s, "install-unified-resume", "unified-resume")
+
+	createResp := doMuxRequest(t, handler, http.MethodPost, "/api/tunnels", token, unifiedCreatePayload("resume-me", record.ID, reserveTCPPort(t)))
+	if createResp.Code != http.StatusCreated {
+		t.Fatalf("POST /api/tunnels: want 201, got %d body=%s", createResp.Code, createResp.Body.String())
+	}
+	var created tunnelSpecAPI
+	if err := mustDecodeJSON(t, createResp.Body, &created); err != nil {
+		t.Fatalf("failed to decode create response: %v", err)
+	}
+
+	blockedResumeResp := doMuxRequest(t, handler, http.MethodPut, "/api/tunnels/"+created.ID+"/resume", token, nil)
+	if blockedResumeResp.Code != http.StatusConflict {
+		t.Fatalf("resume running/offline tunnel: want 409, got %d body=%s", blockedResumeResp.Code, blockedResumeResp.Body.String())
+	}
+	var blockedBody tunnelMutationErrorResponse
+	if err := mustDecodeJSON(t, blockedResumeResp.Body, &blockedBody); err != nil {
+		t.Fatalf("failed to decode blocked resume error: %v", err)
+	}
+	if blockedBody.ErrorCode != protocol.TunnelMutationErrorCodeTunnelResumeNotAllowed && blockedBody.Code != protocol.TunnelMutationErrorCodeTunnelResumeNotAllowed {
+		t.Fatalf("blocked resume error mismatch: %+v", blockedBody)
+	}
+	stored, err := s.store.GetTunnelByIDE(record.ID, created.ID)
+	if err != nil {
+		t.Fatalf("created tunnel should remain persisted: %v", err)
+	}
+	if stored.DesiredState != protocol.ProxyDesiredStateRunning || stored.RuntimeState != protocol.ProxyRuntimeStateOffline {
+		t.Fatalf("blocked resume should not mutate state, got %s/%s", stored.DesiredState, stored.RuntimeState)
+	}
+
+	stopResp := doMuxRequest(t, handler, http.MethodPut, "/api/tunnels/"+created.ID+"/stop", token, nil)
+	if stopResp.Code != http.StatusOK {
+		t.Fatalf("stop tunnel: want 200, got %d body=%s", stopResp.Code, stopResp.Body.String())
+	}
+	var stopPayload struct {
+		Tunnel tunnelSpecAPI `json:"tunnel"`
+	}
+	if err := mustDecodeJSON(t, stopResp.Body, &stopPayload); err != nil {
+		t.Fatalf("failed to decode stop response: %v", err)
+	}
+	if stopPayload.Tunnel.DesiredState != protocol.ProxyDesiredStateStopped || stopPayload.Tunnel.RuntimeState != protocol.ProxyRuntimeStateIdle {
+		t.Fatalf("stop response state = %s/%s, want stopped/idle", stopPayload.Tunnel.DesiredState, stopPayload.Tunnel.RuntimeState)
+	}
+	if stopPayload.Tunnel.Capabilities == nil || !stopPayload.Tunnel.Capabilities.CanResume {
+		t.Fatalf("stopped tunnel should be resumable: %+v", stopPayload.Tunnel.Capabilities)
+	}
+
+	resumeResp := doMuxRequest(t, handler, http.MethodPut, "/api/tunnels/"+created.ID+"/resume", token, nil)
+	if resumeResp.Code != http.StatusOK {
+		t.Fatalf("resume stopped tunnel: want 200, got %d body=%s", resumeResp.Code, resumeResp.Body.String())
+	}
+	var resumePayload struct {
+		Tunnel tunnelSpecAPI `json:"tunnel"`
+	}
+	if err := mustDecodeJSON(t, resumeResp.Body, &resumePayload); err != nil {
+		t.Fatalf("failed to decode resume response: %v", err)
+	}
+	if resumePayload.Tunnel.DesiredState != protocol.ProxyDesiredStateRunning || resumePayload.Tunnel.RuntimeState != protocol.ProxyRuntimeStateOffline {
+		t.Fatalf("resume response state = %s/%s, want running/offline", resumePayload.Tunnel.DesiredState, resumePayload.Tunnel.RuntimeState)
+	}
+	if resumePayload.Tunnel.Capabilities == nil || resumePayload.Tunnel.Capabilities.CanResume {
+		t.Fatalf("running/offline tunnel should not remain resumable: %+v", resumePayload.Tunnel.Capabilities)
+	}
+	stored, err = s.store.GetTunnelByIDE(record.ID, created.ID)
+	if err != nil {
+		t.Fatalf("resumed tunnel should remain persisted: %v", err)
+	}
+	if stored.DesiredState != protocol.ProxyDesiredStateRunning || stored.RuntimeState != protocol.ProxyRuntimeStateOffline {
+		t.Fatalf("stored resume state = %s/%s, want running/offline", stored.DesiredState, stored.RuntimeState)
 	}
 }
 
@@ -2151,59 +2258,92 @@ func TestAPI_UnifiedTunnelProjectionRequiresExposedClientRelayRuntime(t *testing
 	}
 }
 
-func TestAPI_UnifiedTunnelListKeepsSameNameLiveTunnelsWithoutIDs(t *testing.T) {
+func TestAPI_UnifiedTunnelProjectionIgnoresRuntimeOnlyProxyCreateTunnels(t *testing.T) {
 	s := New(0)
+	s.store = newTestTunnelStore(t)
 	now := time.Now().UTC()
+
+	stored := testStoredServerExposeTCPTunnel("stored-tunnel-id", "stored-web", "client-a", 8080, 18080, now)
+	mustAddStableTunnel(t, s.store, stored)
+
 	s.clients.Store("client-a", &ClientConn{
 		ID:    "client-a",
 		state: clientStateLive,
-		proxies: map[string]*ProxyTunnel{"web": {
-			Config: protocol.ProxyConfig{
-				Name:         "web",
-				Type:         protocol.ProxyTypeTCP,
-				LocalIP:      "127.0.0.1",
-				LocalPort:    8080,
-				RemotePort:   18080,
-				ClientID:     "client-a",
-				CreatedAt:    now,
-				DesiredState: protocol.ProxyDesiredStateRunning,
-				RuntimeState: protocol.ProxyRuntimeStateExposed,
-			},
-			done: make(chan struct{}),
-		}},
-	})
-	s.clients.Store("client-b", &ClientConn{
-		ID:    "client-b",
-		state: clientStateLive,
-		proxies: map[string]*ProxyTunnel{"web": {
-			Config: protocol.ProxyConfig{
-				Name:         "web",
-				Type:         protocol.ProxyTypeTCP,
-				LocalIP:      "127.0.0.1",
-				LocalPort:    8081,
-				RemotePort:   18081,
-				ClientID:     "client-b",
-				CreatedAt:    now.Add(time.Second),
-				DesiredState: protocol.ProxyDesiredStateRunning,
-				RuntimeState: protocol.ProxyRuntimeStateExposed,
-			},
-			done: make(chan struct{}),
-		}},
+		proxies: map[string]*ProxyTunnel{
+			"runtime-only": testRuntimeOnlyProxyTunnel("runtime-only-id", "runtime-only", "client-a", 8081, 18081, now.Add(time.Second)),
+		},
 	})
 
 	specs, err := s.allUnifiedTunnelSpecs()
 	if err != nil {
 		t.Fatalf("list unified tunnels: %v", err)
 	}
-	if len(specs) != 2 {
-		t.Fatalf("same-name live tunnels without ids should not be collapsed, got %d: %+v", len(specs), specs)
+	if len(specs) != 1 || specs[0].ID != stored.ID {
+		t.Fatalf("unified specs should only include stored tunnel, got %+v", specs)
 	}
-	seen := map[string]bool{}
-	for _, spec := range specs {
-		seen[spec.OwnerClientID] = true
+
+	configs, err := s.allUnifiedTunnelProxyConfigs()
+	if err != nil {
+		t.Fatalf("list unified proxy configs: %v", err)
 	}
-	if !seen["client-a"] || !seen["client-b"] {
-		t.Fatalf("same-name live tunnels should include both clients, got %+v", specs)
+	if len(configs) != 1 || configs[0].ID != stored.ID {
+		t.Fatalf("unified proxy configs should only include stored tunnel, got %+v", configs)
+	}
+
+	if _, ok, err := s.findUnifiedTunnelSpecByID("runtime-only-id"); err != nil || ok {
+		t.Fatalf("runtime-only tunnel should not be findable by unified id, ok=%v err=%v", ok, err)
+	}
+}
+
+func TestCollectClientViewsIgnoresRuntimeOnlyProxyCreateTunnels(t *testing.T) {
+	s := New(0)
+	s.store = newTestTunnelStore(t)
+	now := time.Now().UTC()
+
+	stored := testStoredServerExposeTCPTunnel("stored-client-view-id", "stored-client-view", "client-a", 8080, 18080, now)
+	mustAddStableTunnel(t, s.store, stored)
+	s.clients.Store("client-a", &ClientConn{
+		ID:    "client-a",
+		state: clientStateLive,
+		proxies: map[string]*ProxyTunnel{
+			"runtime-only": testRuntimeOnlyProxyTunnel("runtime-client-view-id", "runtime-only", "client-a", 8081, 18081, now.Add(time.Second)),
+		},
+	})
+
+	views := s.collectClientViews()
+	if len(views) != 1 {
+		t.Fatalf("collect client views: want 1, got %d: %+v", len(views), views)
+	}
+	if got := views[0].Proxies; len(got) != 1 || got[0].ID != stored.ID {
+		t.Fatalf("client view proxies should only include stored tunnel, got %+v", got)
+	}
+}
+
+func TestAPI_ClientTunnelsIgnoresRuntimeOnlyProxyCreateTunnels(t *testing.T) {
+	s, handler, token, cleanup := setupTestServerWithStores(t, true)
+	defer cleanup()
+	now := time.Now().UTC()
+
+	stored := testStoredServerExposeTCPTunnel("stored-client-tunnels-id", "stored-client-tunnels", "client-a", 8080, 18080, now)
+	mustAddStableTunnel(t, s.store, stored)
+	s.clients.Store("client-a", &ClientConn{
+		ID:    "client-a",
+		state: clientStateLive,
+		proxies: map[string]*ProxyTunnel{
+			"runtime-only": testRuntimeOnlyProxyTunnel("runtime-client-tunnels-id", "runtime-only", "client-a", 8081, 18081, now.Add(time.Second)),
+		},
+	})
+
+	resp := doMuxRequest(t, handler, http.MethodGet, "/api/clients/client-a/tunnels?role=owner", token, nil)
+	if resp.Code != http.StatusOK {
+		t.Fatalf("GET client tunnels: want 200, got %d body=%s", resp.Code, resp.Body.String())
+	}
+	var tunnels []protocol.ProxyConfig
+	if err := mustDecodeJSON(t, resp.Body, &tunnels); err != nil {
+		t.Fatalf("failed to decode client tunnels: %v", err)
+	}
+	if len(tunnels) != 1 || tunnels[0].ID != stored.ID {
+		t.Fatalf("client tunnels should only include stored tunnel, got %+v", tunnels)
 	}
 }
 
@@ -3028,6 +3168,55 @@ func TestUnifiedRestoreRoutesClientToClientThroughUnifiedReconcile(t *testing.T)
 	}
 	if reloaded.RuntimeState != protocol.ProxyRuntimeStateOffline {
 		t.Fatalf("C2C restore should reconcile to offline without ingress/target sessions, got %q", reloaded.RuntimeState)
+	}
+}
+
+func TestUnifiedClientSupportsNilCapabilitiesAsLegacyTCPUDP(t *testing.T) {
+	if !clientSupportsTargetType(nil, protocol.TargetTypeTCPService) {
+		t.Fatal("nil capabilities should allow legacy TCP target")
+	}
+	if !clientSupportsTargetType(nil, protocol.TargetTypeUDPService) {
+		t.Fatal("nil capabilities should allow legacy UDP target")
+	}
+	if clientSupportsTargetType(nil, protocol.TargetTypeSOCKS5ConnectHandler) {
+		t.Fatal("nil capabilities should not allow SOCKS5 target")
+	}
+	if !clientSupportsIngressType(nil, protocol.IngressTypeTCPListen) {
+		t.Fatal("nil capabilities should allow legacy TCP ingress")
+	}
+	if !clientSupportsIngressType(nil, protocol.IngressTypeUDPListen) {
+		t.Fatal("nil capabilities should allow legacy UDP ingress")
+	}
+	if clientSupportsIngressType(nil, protocol.IngressTypeSOCKS5Listen) {
+		t.Fatal("nil capabilities should not allow SOCKS5 ingress")
+	}
+
+	empty := protocol.ClientCapabilities{}
+	if clientSupportsTargetType(&empty, protocol.TargetTypeTCPService) {
+		t.Fatal("explicit empty capabilities should not allow TCP target")
+	}
+	if clientSupportsIngressType(&empty, protocol.IngressTypeTCPListen) {
+		t.Fatal("explicit empty capabilities should not allow TCP ingress")
+	}
+}
+
+func TestAPI_UnifiedTunnelCreateAllowsLegacyNilCapabilitiesForTCP(t *testing.T) {
+	s, handler, token, cleanup := setupTestServerWithStores(t, true)
+	defer cleanup()
+
+	record, err := s.auth.adminStore.GetOrCreateClient("install-legacy-nil-caps", protocol.ClientInfo{
+		Hostname: "legacy-nil-caps",
+		OS:       "linux",
+		Arch:     "amd64",
+		Version:  "0.1.0",
+	}, "127.0.0.1:12345")
+	if err != nil {
+		t.Fatalf("create client: %v", err)
+	}
+
+	resp := doMuxRequest(t, handler, http.MethodPost, "/api/tunnels", token, unifiedCreatePayload("legacy-nil-caps-tcp", record.ID, reserveTCPPort(t)))
+	if resp.Code != http.StatusCreated {
+		t.Fatalf("legacy nil capabilities TCP create: want 201, got %d body=%s", resp.Code, resp.Body.String())
 	}
 }
 

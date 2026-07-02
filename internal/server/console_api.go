@@ -152,19 +152,10 @@ func (s *Server) collectClientViews() []clientView {
 		if !client.isLive() {
 			return true
 		}
-		proxies, seen, err := s.storedProxyViewsForClient(client.ID)
+		proxies, _, err := s.storedProxyViewsForClient(client.ID)
 		if err != nil {
 			log.Printf("⚠️ failed to load tunnels for live client %s: %v", client.ID, err)
 			proxies = []protocol.ProxyConfig{}
-			seen = map[string]struct{}{}
-		}
-		configs := client.ProxyConfigsSnapshot()
-		for _, config := range configs {
-			key := proxyConfigViewKey(config)
-			if _, exists := seen[key]; exists {
-				continue
-			}
-			proxies = append(proxies, proxyConfigForClientView(config, true))
 		}
 		sort.Slice(proxies, func(i, j int) bool {
 			if !proxies[i].CreatedAt.Equal(proxies[j].CreatedAt) {

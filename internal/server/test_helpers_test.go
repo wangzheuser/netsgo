@@ -5,6 +5,8 @@ import (
 	"io"
 	"testing"
 	"time"
+
+	"netsgo/pkg/protocol"
 )
 
 func mustClose(t testing.TB, closer io.Closer) {
@@ -70,6 +72,99 @@ func waitForTunnelChangedEvent(t testing.TB, ch <-chan SSEEvent, action, tunnelN
 
 	t.Fatalf("did not receive tunnel_changed event for action=%q tunnel=%q", action, tunnelName)
 	return nil
+}
+
+func assertNoTunnelChangedEvent(t testing.TB, ch <-chan SSEEvent, duration time.Duration, tunnelName string) {
+	t.Helper()
+
+	timer := time.NewTimer(duration)
+	defer timer.Stop()
+	for {
+		select {
+		case event, ok := <-ch:
+			if !ok {
+				return
+			}
+			if event.Type != "tunnel_changed" {
+				continue
+			}
+			var payload map[string]any
+			if err := json.Unmarshal([]byte(event.Data), &payload); err != nil {
+				t.Fatalf("failed to parse tunnel_changed event: %v", err)
+			}
+			if tunnelName != "" {
+				tunnelPayload, _ := payload["tunnel"].(map[string]any)
+				gotName, _ := tunnelPayload["name"].(string)
+				if gotName != tunnelName {
+					continue
+				}
+			}
+			t.Fatalf("unexpected tunnel_changed event: %s", event.Data)
+		case <-timer.C:
+			return
+		}
+	}
+}
+
+func testStoredServerExposeTCPTunnel(id, name, clientID string, localPort, remotePort int, createdAt time.Time) StoredTunnel {
+	if createdAt.IsZero() {
+		createdAt = time.Now().UTC()
+	}
+	return StoredTunnel{
+		ProxyNewRequest: protocol.ProxyNewRequest{
+			ID:         id,
+			Name:       name,
+			Type:       protocol.ProxyTypeTCP,
+			LocalIP:    "127.0.0.1",
+			LocalPort:  localPort,
+			RemotePort: remotePort,
+		},
+		ClientID:        clientID,
+		OwnerClientID:   clientID,
+		Revision:        1,
+		Topology:        TunnelTopologyServerExpose,
+		DesiredState:    protocol.ProxyDesiredStateRunning,
+		RuntimeState:    protocol.ProxyRuntimeStateExposed,
+		TransportPolicy: protocol.TransportPolicyServerRelayOnly,
+		ActualTransport: protocol.ActualTransportServerRelay,
+		Ingress: EndpointSpec{
+			Location: protocol.EndpointLocationServer,
+			Type:     protocol.IngressTypeTCPListen,
+			Config:   mustRawJSON(tcpListenConfigAPI{BindIP: "0.0.0.0", Port: remotePort, AllowedSourceCIDRs: allowAllSourceCIDRs()}),
+		},
+		Target: EndpointSpec{
+			Location: protocol.EndpointLocationClient,
+			ClientID: clientID,
+			Type:     protocol.TargetTypeTCPService,
+			Config:   mustRawJSON(serviceConfigAPI{IP: "127.0.0.1", Port: localPort}),
+		},
+		CreatedAt: createdAt,
+		UpdatedAt: createdAt,
+	}
+}
+
+func testRuntimeOnlyProxyTunnel(id, name, clientID string, localPort, remotePort int, createdAt time.Time) *ProxyTunnel {
+	if createdAt.IsZero() {
+		createdAt = time.Now().UTC()
+	}
+	return &ProxyTunnel{
+		Config: protocol.ProxyConfig{
+			ID:              id,
+			Name:            name,
+			Type:            protocol.ProxyTypeTCP,
+			LocalIP:         "127.0.0.1",
+			LocalPort:       localPort,
+			RemotePort:      remotePort,
+			ClientID:        clientID,
+			OwnerClientID:   clientID,
+			CreatedAt:       createdAt,
+			DesiredState:    protocol.ProxyDesiredStateRunning,
+			RuntimeState:    protocol.ProxyRuntimeStateExposed,
+			TransportPolicy: protocol.TransportPolicyServerRelayOnly,
+			ActualTransport: protocol.ActualTransportServerRelay,
+		},
+		done: make(chan struct{}),
+	}
 }
 
 func assertTunnelBandwidthFields(t testing.TB, tunnelPayload map[string]any, ingress, egress int64) {

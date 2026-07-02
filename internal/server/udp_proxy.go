@@ -272,7 +272,7 @@ func (s *Server) markUDPProxyRuntimeErrorIfCurrent(
 		log.Printf("⚠️ UDP proxy [%s] failed to persist error state: %v", tunnel.Config.Name, err)
 	}
 	s.recordServerExposeIngressIssue(tunnel.Config.ID, tunnel.Config.Type, message)
-	s.emitTunnelChanged(client.ID, config, "error")
+	s.emitTunnelChangedIfStored(client.ID, config, "error")
 	if err := s.notifyServerExposeTargetUnprovision(client, config, "runtime_error"); err != nil {
 		log.Printf("⚠️ UDP proxy [%s] failed to notify client of close: %v", tunnel.Config.Name, err)
 	}

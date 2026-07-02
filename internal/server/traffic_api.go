@@ -44,10 +44,14 @@ func (s *Server) handleGetClientTraffic(w http.ResponseWriter, r *http.Request) 
 	s.flushTrafficObservations()
 
 	var result TrafficQueryResult
+	knownTunnels := s.knownTrafficTunnels(clientID, tunnelName)
 	if resolution == TrafficResolutionSecond {
-		result, err = s.buildRealtimeTrafficResult(clientID, tunnelName, from, to, s.knownTrafficTunnels(clientID, tunnelName))
+		result, err = s.buildRealtimeTrafficResult(clientID, tunnelName, from, to, knownTunnels)
 	} else {
 		result, err = s.trafficStore.QueryWithResolution(clientID, tunnelName, from, to, resolution)
+		if err == nil && tunnelName == "" {
+			result = filterTrafficResultByKnownTunnels(result, knownTunnels)
+		}
 	}
 	if err != nil {
 		writeAPIError(w, http.StatusInternalServerError, "traffic_query_failed", "failed to query traffic")

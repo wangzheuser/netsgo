@@ -39,7 +39,7 @@ func newLiveConsoleRaceClient(t *testing.T, s *Server, clientID string) (*Client
 	return client, cleanup
 }
 
-func TestCollectClientViews_ProxyConfigsSnapshotAvoidsDirectMapRace(t *testing.T) {
+func TestCollectClientViews_ConcurrentProxyMapWritesAvoidDirectMapRace(t *testing.T) {
 	s := New(0)
 	client, cleanup := newLiveConsoleRaceClient(t, s, "console-map-race-client")
 	defer cleanup()
