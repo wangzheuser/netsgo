@@ -49,7 +49,7 @@ func (s *Server) handleGetClientTraffic(w http.ResponseWriter, r *http.Request) 
 		result, err = s.buildRealtimeTrafficResult(clientID, tunnelName, from, to, knownTunnels)
 	} else {
 		result, err = s.trafficStore.QueryWithResolution(clientID, tunnelName, from, to, resolution)
-		if err == nil {
+		if err == nil && tunnelName == "" {
 			result = filterTrafficResultByKnownTunnels(result, knownTunnels)
 		}
 	}

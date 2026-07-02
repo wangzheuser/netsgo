@@ -1133,8 +1133,77 @@ func TestTrafficAPI_HistoricalQueryIgnoresRuntimeOnlyProxyCreateTunnels(t *testi
 	if err := mustDecodeJSON(t, runtimeIDResp.Body, &runtimeIDResult); err != nil {
 		t.Fatalf("failed to decode runtime id response: %v", err)
 	}
-	if len(runtimeIDResult.Items) != 0 {
-		t.Fatalf("runtime-only tunnel id filter should be empty, got %+v", runtimeIDResult.Items)
+	if len(runtimeIDResult.Items) != 1 || runtimeIDResult.Items[0].TunnelID != runtimeID {
+		t.Fatalf("explicit historical tunnel filter should preserve store query semantics, got %+v", runtimeIDResult.Items)
+	}
+}
+
+func TestTrafficAPI_HistoricalQueryKeepsDeletedTunnelWhenSelected(t *testing.T) {
+	s, handler, token, cleanup := setupTestServerWithStores(t, true)
+	defer cleanup()
+
+	path := filepath.Join(t.TempDir(), serverDBFileName)
+	s.store = newTestTunnelStoreAt(t, path)
+	ts, err := NewTrafficStore(path)
+	if err != nil {
+		t.Fatalf("NewTrafficStore failed: %v", err)
+	}
+	defer func() { _ = ts.Close() }()
+	s.trafficStore = ts
+
+	clientID := "test-client-deleted-history"
+	now := minuteFloorUTC(time.Now().UTC())
+	stored := testStoredServerExposeTCPTunnel("traffic-deleted-id", "delete-history", clientID, 8080, 18080, now)
+	mustAddStableTunnel(t, s.store, stored)
+	ts.ApplyDeltas([]TrafficDelta{{
+		TunnelID:     stored.ID,
+		ClientID:     clientID,
+		TunnelName:   stored.Name,
+		TunnelType:   stored.Type,
+		MinuteStart:  now.Unix(),
+		IngressBytes: 10,
+		EgressBytes:  5,
+	}})
+	if err := ts.Flush(); err != nil {
+		t.Fatalf("Flush failed: %v", err)
+	}
+	if err := s.store.RemoveTunnel(clientID, stored.Name); err != nil {
+		t.Fatalf("RemoveTunnel failed: %v", err)
+	}
+
+	from := now.Add(-time.Minute).Unix()
+	to := now.Add(time.Minute).Unix()
+	listPath := "/api/clients/" + clientID + "/traffic?from=" + itoa(from) + "&to=" + itoa(to) + "&resolution=minute"
+	listResp := doMuxRequest(t, handler, http.MethodGet, listPath, token, nil)
+	if listResp.Code != http.StatusOK {
+		t.Fatalf("GET deleted history list: want 200, got %d body=%s", listResp.Code, listResp.Body.String())
+	}
+	var listResult TrafficQueryResult
+	if err := mustDecodeJSON(t, listResp.Body, &listResult); err != nil {
+		t.Fatalf("failed to decode deleted history list: %v", err)
+	}
+	if len(listResult.Items) != 0 {
+		t.Fatalf("unfiltered historical list should not surface deleted/runtime-only tunnels, got %+v", listResult.Items)
+	}
+
+	selectedPath := "/api/clients/" + clientID + "/traffic?from=" + itoa(from) + "&to=" + itoa(to) + "&resolution=minute&tunnel=" + stored.ID
+	selectedResp := doMuxRequest(t, handler, http.MethodGet, selectedPath, token, nil)
+	if selectedResp.Code != http.StatusOK {
+		t.Fatalf("GET selected deleted history: want 200, got %d body=%s", selectedResp.Code, selectedResp.Body.String())
+	}
+	var selectedResult TrafficQueryResult
+	if err := mustDecodeJSON(t, selectedResp.Body, &selectedResult); err != nil {
+		t.Fatalf("failed to decode selected deleted history: %v", err)
+	}
+	if len(selectedResult.Items) != 1 {
+		t.Fatalf("selected deleted tunnel history should remain queryable, got %+v", selectedResult.Items)
+	}
+	series := selectedResult.Items[0]
+	if series.TunnelID != stored.ID || !series.MetadataMissing {
+		t.Fatalf("selected deleted tunnel should carry id and metadata_missing=true, got %+v", series)
+	}
+	if len(series.Points) != 1 || series.Points[0].IngressBytes != 10 || series.Points[0].EgressBytes != 5 {
+		t.Fatalf("selected deleted tunnel points mismatch: %+v", series.Points)
 	}
 }
 
