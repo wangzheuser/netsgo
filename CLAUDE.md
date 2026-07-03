@@ -18,6 +18,7 @@
 - 服务端默认通过本地 SQLite 文件持久化管理数据和隧道配置；历史 JSON 状态只作为迁移或排查遗留状态时的背景。
 - 服务端 SQLite 迁移 SQL 在 `internal/server/migrations/`，通过 `internal/server/migrations_embed.go` 嵌入，加载和解析逻辑在 `internal/server/storage_schema.go`，通用执行器在 `internal/storage/sqlite.go` 的 `applyMigrations`。
 - 前端构建产物会通过 `go:embed` 嵌入 Go 二进制；这是单文件交付的一部分，不要轻易破坏。
+- Web 前端与 Server **同二进制、同版本发布**，不存在"新前端 + 旧 server"或"旧前端 + 新 server"的组合。因此不需要为 web↔server 接口做跨版本兼容：前端可以直接调用当前 server 的全部 API，无需保留旧 API 的 fallback 路径。跨版本兼容只发生在 **client ↔ server** 之间。
 
 ## 核心架构心智模型
 

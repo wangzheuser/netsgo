@@ -206,7 +206,7 @@ func (s *Server) resumeUnifiedTunnel(w http.ResponseWriter, current tunnelSpecAP
 		encodeJSON(w, status, payload)
 		return
 	}
-	if !canResumeTunnel(storedTunnelToProxyConfig(stored)) {
+	if !canResumeUnifiedTunnelSpec(current) {
 		writeAPIError(w, http.StatusConflict, protocol.TunnelMutationErrorCodeTunnelResumeNotAllowed, "only stopped or error tunnels can be resumed")
 		return
 	}
@@ -217,6 +217,7 @@ func (s *Server) resumeUnifiedTunnel(w http.ResponseWriter, current tunnelSpecAP
 	}
 	stored.DesiredState = protocol.ProxyDesiredStateRunning
 	stored.RuntimeState = protocol.ProxyRuntimeStateOffline
+	stored.Error = ""
 	if err := s.unprovisionStoredUnifiedTunnel(stored, "resume_reconcile", true); err != nil {
 		logUnifiedRuntimeCleanupFailure("resume", stored, err)
 	}
@@ -247,6 +248,12 @@ func (s *Server) stopUnifiedTunnel(w http.ResponseWriter, current tunnelSpecAPI)
 		logUnifiedRuntimeCleanupFailure("stop", stored, err)
 	}
 	encodeJSON(w, http.StatusOK, map[string]any{"success": true, "message": "tunnel stopped", "tunnel": specFromStoredTunnelConfig(config, s)})
+}
+
+func canResumeUnifiedTunnelSpec(spec tunnelSpecAPI) bool {
+	desiredState := canonicalDesiredState(spec.DesiredState)
+	return (desiredState == protocol.ProxyDesiredStateStopped && spec.RuntimeState == protocol.ProxyRuntimeStateIdle) ||
+		(desiredState == protocol.ProxyDesiredStateRunning && spec.RuntimeState == protocol.ProxyRuntimeStateError)
 }
 
 func (s *Server) handleListUnifiedTunnels(w http.ResponseWriter, _ *http.Request) {
@@ -854,6 +861,16 @@ func (s *Server) storedTunnelFromUnifiedRequest(req tunnelCreateRequestAPI, exis
 	}
 	if req.TransportPolicy != tunnelTransportPolicyServerRelayOnly {
 		return StoredTunnel{}, newProxyRequestValidationError(fmt.Errorf("transport policy %q requires direct transport support, which is not available in this build", req.TransportPolicy), "transport_policy", protocol.TunnelMutationErrorCodeDirectTransportUnavailable, http.StatusBadRequest)
+	}
+	if err := validateBandwidthSettings(req.BandwidthSettings); err != nil {
+		field := ""
+		switch {
+		case req.BandwidthSettings.IngressBPS < 0:
+			field = protocol.TunnelMutationFieldIngressBPS
+		case req.BandwidthSettings.EgressBPS < 0:
+			field = protocol.TunnelMutationFieldEgressBPS
+		}
+		return StoredTunnel{}, newProxyRequestValidationError(err, field, "", http.StatusBadRequest)
 	}
 	if err := validateUnifiedEndpointCombination(req.Topology, req.Ingress, req.Target); err != nil {
 		return StoredTunnel{}, err

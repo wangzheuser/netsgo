@@ -2581,6 +2581,51 @@ func TestAPI_UnifiedTunnelCapabilityLossProjectsError(t *testing.T) {
 	}
 }
 
+func TestAPI_UnifiedTunnelResumeUsesComputedRuntimeState(t *testing.T) {
+	s, handler, token, cleanup := setupTestServerWithStores(t, true)
+	defer cleanup()
+
+	target := createUnifiedAPITestClient(t, s, "install-resume-computed-target", "resume-computed-target")
+	resp := doMuxRequest(t, handler, http.MethodPost, "/api/tunnels", token, unifiedCreatePayload("resume-computed", target.ID, reserveTCPPort(t)))
+	if resp.Code != http.StatusCreated {
+		t.Fatalf("server_expose create: want 201, got %d body=%s", resp.Code, resp.Body.String())
+	}
+	var created tunnelSpecAPI
+	if err := mustDecodeJSON(t, resp.Body, &created); err != nil {
+		t.Fatalf("decode created tunnel: %v", err)
+	}
+
+	noCaps := protocol.ClientCapabilities{}
+	_, targetSession := newTestClientRelayDataSession(t)
+	s.clients.Store(target.ID, &ClientConn{
+		ID:          target.ID,
+		Info:        protocol.ClientInfo{Capabilities: &noCaps},
+		dataSession: targetSession,
+		generation:  1,
+		state:       clientStateLive,
+	})
+
+	getResp := doMuxRequest(t, handler, http.MethodGet, "/api/tunnels/"+created.ID, token, nil)
+	if getResp.Code != http.StatusOK {
+		t.Fatalf("GET tunnel: want 200, got %d body=%s", getResp.Code, getResp.Body.String())
+	}
+	var got tunnelSpecAPI
+	if err := mustDecodeJSON(t, getResp.Body, &got); err != nil {
+		t.Fatalf("decode tunnel: %v", err)
+	}
+	if got.RuntimeState != protocol.ProxyRuntimeStateError {
+		t.Fatalf("capability loss should compute runtime error, got %q", got.RuntimeState)
+	}
+	if got.Capabilities == nil || !got.Capabilities.CanResume {
+		t.Fatalf("computed runtime error should be resumable, capabilities=%+v", got.Capabilities)
+	}
+
+	resumeResp := doMuxRequest(t, handler, http.MethodPut, "/api/tunnels/"+created.ID+"/resume", token, nil)
+	if resumeResp.Code != http.StatusOK {
+		t.Fatalf("resume computed runtime error: want 200, got %d body=%s", resumeResp.Code, resumeResp.Body.String())
+	}
+}
+
 func TestAPI_UnifiedTunnelSuppressesRuntimeReportIssuesWhenClientOffline(t *testing.T) {
 	s, handler, token, cleanup := setupTestServerWithStores(t, true)
 	defer cleanup()
@@ -3217,6 +3262,53 @@ func TestAPI_UnifiedTunnelCreateAllowsLegacyNilCapabilitiesForTCP(t *testing.T) 
 	resp := doMuxRequest(t, handler, http.MethodPost, "/api/tunnels", token, unifiedCreatePayload("legacy-nil-caps-tcp", record.ID, reserveTCPPort(t)))
 	if resp.Code != http.StatusCreated {
 		t.Fatalf("legacy nil capabilities TCP create: want 201, got %d body=%s", resp.Code, resp.Body.String())
+	}
+}
+
+func TestAPI_UnifiedTunnelRejectsSOCKS5ForLegacyNilCapabilities(t *testing.T) {
+	s, handler, token, cleanup := setupTestServerWithStores(t, true)
+	defer cleanup()
+
+	record, err := s.auth.adminStore.GetOrCreateClient("install-legacy-nil-caps-socks5", protocol.ClientInfo{
+		Hostname: "legacy-nil-caps-socks5",
+		OS:       "linux",
+		Arch:     "amd64",
+		Version:  "0.1.0",
+	}, "127.0.0.1:12345")
+	if err != nil {
+		t.Fatalf("create client: %v", err)
+	}
+	loaded, ok := s.auth.adminStore.GetRegisteredClient(record.ID)
+	if !ok {
+		t.Fatalf("legacy nil capabilities client should be registered")
+	}
+	if loaded.Info.Capabilities != nil {
+		t.Fatalf("test setup expected nil capabilities after {} round-trip, got %+v", loaded.Info.Capabilities)
+	}
+
+	name := "legacy-nil-caps-socks5"
+	body := []byte(`{
+		"name":"` + name + `",
+		"topology":"server_expose",
+		"ingress":{"location":"server","type":"socks5_listen","config":` + unifiedCapabilityTestConfig(t, protocol.IngressTypeSOCKS5Listen) + `},
+		"target":{"location":"client","client_id":"` + record.ID + `","type":"socks5_connect_handler","config":` + unifiedCapabilityTestConfig(t, protocol.TargetTypeSOCKS5ConnectHandler) + `},
+		"transport_policy":"server_relay_only",
+		"confirm_no_auth_risk":true
+	}`)
+
+	resp := doMuxRequest(t, handler, http.MethodPost, "/api/tunnels", token, body)
+	if resp.Code != http.StatusBadRequest {
+		t.Fatalf("legacy nil capabilities SOCKS5 create: want 400, got %d body=%s", resp.Code, resp.Body.String())
+	}
+	var bodyResp tunnelMutationErrorResponse
+	if err := mustDecodeJSON(t, resp.Body, &bodyResp); err != nil {
+		t.Fatalf("decode SOCKS5 capability error: %v", err)
+	}
+	if bodyResp.ErrorCode != protocol.TunnelMutationErrorCodeCapabilityNotSupported || bodyResp.Field != "target.type" {
+		t.Fatalf("SOCKS5 nil-capability error mismatch: %+v", bodyResp)
+	}
+	if _, err := s.store.GetTunnelE(record.ID, name); !errors.Is(err, ErrTunnelNotFound) {
+		t.Fatalf("unsupported SOCKS5 nil-capability reject must not persist config, got err=%v", err)
 	}
 }
 
