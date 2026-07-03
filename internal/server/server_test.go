@@ -386,10 +386,26 @@ func TestAPI_ConsoleSummaryContractAlignsAcrossStatusAndSnapshot(t *testing.T) {
 		t.Fatalf("online client %s not found", authResp.ClientID)
 	}
 	client := val.(*ClientConn)
+	seedStoredTunnel(t, s, authResp.ClientID, protocol.ProxyNewRequest{Name: "active", Type: protocol.ProxyTypeHTTP, Domain: "active.example.com"}, protocol.ProxyStatusActive)
+	seedStoredTunnel(t, s, authResp.ClientID, protocol.ProxyNewRequest{Name: "pending", Type: protocol.ProxyTypeTCP, RemotePort: 20004}, protocol.ProxyStatusPending)
+	seedStoredTunnel(t, s, authResp.ClientID, protocol.ProxyNewRequest{Name: "error", Type: protocol.ProxyTypeTCP, RemotePort: 20005}, protocol.ProxyStatusActive)
+	activeStored, err := s.store.GetTunnelE(authResp.ClientID, "active")
+	if err != nil {
+		t.Fatalf("load active tunnel: %v", err)
+	}
+	pendingStored, err := s.store.GetTunnelE(authResp.ClientID, "pending")
+	if err != nil {
+		t.Fatalf("load pending tunnel: %v", err)
+	}
+	errorStored, err := s.store.GetTunnelE(authResp.ClientID, "error")
+	if err != nil {
+		t.Fatalf("load error tunnel: %v", err)
+	}
+	s.recordServerExposeIngressIssue(errorStored.ID, errorStored.Type, "boom")
 	client.proxyMu.Lock()
-	client.proxies["active"] = &ProxyTunnel{Config: protocol.ProxyConfig{Name: "active", DesiredState: protocol.ProxyDesiredStateRunning, RuntimeState: protocol.ProxyRuntimeStateExposed}, done: make(chan struct{})}
-	client.proxies["pending"] = &ProxyTunnel{Config: protocol.ProxyConfig{Name: "pending", DesiredState: protocol.ProxyDesiredStateRunning, RuntimeState: protocol.ProxyRuntimeStatePending}, done: make(chan struct{})}
-	client.proxies["error"] = &ProxyTunnel{Config: protocol.ProxyConfig{Name: "error", DesiredState: protocol.ProxyDesiredStateRunning, RuntimeState: protocol.ProxyRuntimeStateError, Error: "boom"}, done: make(chan struct{})}
+	client.proxies["active"] = &ProxyTunnel{Config: protocol.ProxyConfig{ID: activeStored.ID, Name: "active", Type: protocol.ProxyTypeHTTP, Domain: "active.example.com", ClientID: authResp.ClientID, DesiredState: protocol.ProxyDesiredStateRunning, RuntimeState: protocol.ProxyRuntimeStateExposed}, done: make(chan struct{})}
+	client.proxies["pending"] = &ProxyTunnel{Config: protocol.ProxyConfig{ID: pendingStored.ID, Name: "pending", Type: protocol.ProxyTypeTCP, ClientID: authResp.ClientID, DesiredState: protocol.ProxyDesiredStateRunning, RuntimeState: protocol.ProxyRuntimeStatePending}, done: make(chan struct{})}
+	client.proxies["error"] = &ProxyTunnel{Config: protocol.ProxyConfig{ID: errorStored.ID, Name: "error", Type: protocol.ProxyTypeTCP, ClientID: authResp.ClientID, DesiredState: protocol.ProxyDesiredStateRunning, RuntimeState: protocol.ProxyRuntimeStateError, Error: "boom"}, done: make(chan struct{})}
 	client.proxyMu.Unlock()
 
 	expected := map[string]float64{
@@ -760,9 +776,22 @@ func TestAPI_Clients_OfflineLegacyErrorTunnelProjectsOfflineFromLiveFacts(t *tes
 func TestAPI_Clients_LiveTunnelUsesDesiredAndRuntimeStates(t *testing.T) {
 	s, ts, cleanup := setupWSTestNoConn(t)
 	defer cleanup()
+	s.store = newTestTunnelStore(t)
 
 	wsConn, authResp := connectAndAuth(t, ts, "live-state-host")
 	defer mustClose(t, wsConn)
+
+	seedStoredTunnel(t, s, authResp.ClientID, protocol.ProxyNewRequest{
+		Name:      "live-http",
+		Type:      protocol.ProxyTypeHTTP,
+		LocalIP:   "127.0.0.1",
+		LocalPort: 3000,
+		Domain:    "live.example.com",
+	}, protocol.ProxyStatusActive)
+	stored, err := s.store.GetTunnelE(authResp.ClientID, "live-http")
+	if err != nil {
+		t.Fatalf("load live tunnel: %v", err)
+	}
 
 	value, ok := s.clients.Load(authResp.ClientID)
 	if !ok {
@@ -772,6 +801,7 @@ func TestAPI_Clients_LiveTunnelUsesDesiredAndRuntimeStates(t *testing.T) {
 	client.proxyMu.Lock()
 	client.proxies["live-http"] = &ProxyTunnel{
 		Config: protocol.ProxyConfig{
+			ID:           stored.ID,
 			Name:         "live-http",
 			Type:         protocol.ProxyTypeHTTP,
 			LocalIP:      "127.0.0.1",
@@ -1999,8 +2029,7 @@ func TestControlLoop_ProxyMessages(t *testing.T) {
 		t.Error("proxy tunnel still exists after sending ProxyClose")
 	}
 
-	tunnelPayload := waitForTunnelChangedEvent(t, eventsCh, "closed_by_client", "ws-tunnel-1")
-	assertTunnelBandwidthFields(t, tunnelPayload, 1234, 5678)
+	assertNoTunnelChangedEvent(t, eventsCh, 150*time.Millisecond, "ws-tunnel-1")
 }
 
 func TestControlLoop_ProxyCreateResponse(t *testing.T) {
@@ -2244,17 +2273,13 @@ func TestServer_StartHTTPOnly(t *testing.T) {
 	}
 }
 
-// ============================================================
-// Tunnel lifecycle API tests (Phase 2)
-// ============================================================
-
-func TestTunnelMutationErrorStatusMapsWrappedManagedTunnelNotFound(t *testing.T) {
-	status, body := tunnelMutationErrorStatusAndBody(fmt.Errorf("runtime update lost tunnel: %w", errManagedTunnelNotFound))
+func TestTunnelMutationErrorStatusMapsWrappedTunnelNotFound(t *testing.T) {
+	status, body := tunnelMutationErrorStatusAndBody(fmt.Errorf("runtime update lost tunnel: %w", errStoredTunnelNotFound))
 	if status != http.StatusNotFound {
-		t.Fatalf("wrapped managed tunnel not found: want 404, got %d", status)
+		t.Fatalf("wrapped tunnel not found: want 404, got %d", status)
 	}
 	if body.Error != "tunnel not found" {
-		t.Fatalf("wrapped managed tunnel not found error: want %q, got %q", "tunnel not found", body.Error)
+		t.Fatalf("wrapped tunnel not found error: want %q, got %q", "tunnel not found", body.Error)
 	}
 }
 
@@ -2352,6 +2377,10 @@ func TestServer_RestorePostAckStoreFailureMarksError(t *testing.T) {
 		t.Fatalf("after restore failure: want %s, got %s", protocol.MsgTypeProxyClose, closeMsg.Type)
 	}
 
+	lastRuntimeState := "<missing>"
+	lastRuntimeError := ""
+	lastStoreState := "<missing>"
+	lastStoreError := ""
 	deadline := time.Now().Add(2 * time.Second)
 	for time.Now().Before(deadline) {
 		value, ok := s.clients.Load(authResp.ClientID)
@@ -2362,18 +2391,24 @@ func TestServer_RestorePostAckStoreFailureMarksError(t *testing.T) {
 		client.proxyMu.RLock()
 		tunnel := client.proxies["restore-fail-tunnel"]
 		client.proxyMu.RUnlock()
-		if tunnel != nil &&
-			tunnel.Config.DesiredState == protocol.ProxyDesiredStateRunning &&
-			tunnel.Config.RuntimeState == protocol.ProxyRuntimeStateError {
+		runtimeReady := false
+		if tunnel != nil {
+			lastRuntimeState = tunnel.Config.DesiredState + "/" + tunnel.Config.RuntimeState
+			lastRuntimeError = tunnel.Config.Error
+			runtimeReady = tunnel.Config.DesiredState == protocol.ProxyDesiredStateRunning &&
+				tunnel.Config.RuntimeState == protocol.ProxyRuntimeStateError
+		}
+		stored, exists := s.store.GetTunnel(authResp.ClientID, "restore-fail-tunnel")
+		storeReady := false
+		if exists {
+			lastStoreState = stored.DesiredState + "/" + stored.RuntimeState
+			lastStoreError = stored.Error
+			storeReady = stored.DesiredState == protocol.ProxyDesiredStateRunning &&
+				stored.RuntimeState == protocol.ProxyRuntimeStateError
+		}
+		if runtimeReady && storeReady {
 			if tunnel.Config.Error == "" {
 				t.Fatal("runtime error tunnel should carry the failure reason")
-			}
-			stored, exists := s.store.GetTunnel(authResp.ClientID, "restore-fail-tunnel")
-			if !exists {
-				t.Fatal("store should retain restore-fail-tunnel")
-			}
-			if stored.DesiredState != protocol.ProxyDesiredStateRunning || stored.RuntimeState != protocol.ProxyRuntimeStateError {
-				t.Fatalf("store state: want running/error, got %s/%s", stored.DesiredState, stored.RuntimeState)
 			}
 			if stored.Error == "" {
 				t.Fatal("store error tunnel should persist the failure reason")
@@ -2382,7 +2417,8 @@ func TestServer_RestorePostAckStoreFailureMarksError(t *testing.T) {
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
-	t.Fatal("timed out waiting for restore failure to degrade to error")
+	t.Fatalf("timed out waiting for restore failure to degrade to error: runtime=%s err=%q store=%s err=%q",
+		lastRuntimeState, lastRuntimeError, lastStoreState, lastStoreError)
 }
 
 func TestServer_RestoreActiveHTTPTunnel_DoesNotConflictWithSelf(t *testing.T) {
@@ -2912,45 +2948,6 @@ func TestRestoreTunnels_PortNotAllowedPreservesBandwidthFields(t *testing.T) {
 	}
 
 	t.Fatal("timed out waiting for tunnel_changed event with bandwidth fields")
-}
-
-func TestDeleteManagedTunnel_EventPreservesBandwidthFields(t *testing.T) {
-	s := New(0)
-	initTestAdminStore(t, s)
-	s.store = newTestTunnelStore(t)
-
-	client := &ClientConn{
-		ID:         "client-delete-bandwidth",
-		Info:       protocol.ClientInfo{Hostname: "delete-host"},
-		proxies:    make(map[string]*ProxyTunnel),
-		generation: 1,
-		state:      clientStateLive,
-	}
-	s.clients.Store(client.ID, client)
-
-	req := protocol.ProxyNewRequest{
-		Name:       "delete-bandwidth",
-		Type:       protocol.ProxyTypeTCP,
-		RemotePort: reserveTCPPort(t),
-		BandwidthSettings: protocol.BandwidthSettings{
-			IngressBPS: 4321,
-			EgressBPS:  8765,
-		},
-	}
-	config := s.upsertTunnelPlaceholder(client, req, protocol.ProxyDesiredStateStopped, protocol.ProxyRuntimeStateIdle, "", time.Time{})
-	if err := s.store.AddTunnel(storedTunnelFromRuntime(client, client.proxies[req.Name])); err != nil {
-		t.Fatalf("failed to persist tunnel: %v", err)
-	}
-
-	ch := s.events.Subscribe()
-	defer s.events.Unsubscribe(ch)
-
-	if err := s.deleteManagedTunnel(client, req.Name); err != nil {
-		t.Fatalf("deleteManagedTunnel failed: %v", err)
-	}
-
-	tunnelPayload := waitForTunnelChangedEvent(t, ch, "deleted", req.Name)
-	assertTunnelBandwidthFields(t, tunnelPayload, config.IngressBPS, config.EgressBPS)
 }
 
 func TestFailRestoredTunnelAfterReadyPreservesCreatedAt(t *testing.T) {

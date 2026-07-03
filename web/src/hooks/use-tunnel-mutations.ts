@@ -31,7 +31,6 @@ export function useClientTunnelsByRole(clientId: string | undefined, role: Tunne
   });
 }
 
-
 function buildTunnelSpec(data: {
   topology?: TunnelTopology;
   ingress_client_id?: string;
@@ -86,47 +85,46 @@ export function useCreateTunnel() {
 export function useResumeTunnel() {
   const queryClient = useQueryClient();
 
-  return useMutation({
-    mutationFn: ({ tunnelId }: { clientId: string; tunnelId: string }) => tunnelApi.resume(tunnelId),
-    onSuccess: () => {
-      invalidateTunnelQueries(queryClient);
-    },
+	return useMutation({
+		mutationFn: ({ tunnelId }: { tunnelId: string }) => tunnelApi.resume(tunnelId),
+		onSuccess: () => {
+			invalidateTunnelQueries(queryClient);
+		},
   });
 }
 
 export function useStopTunnel() {
   const queryClient = useQueryClient();
 
-  return useMutation({
-    mutationFn: ({ tunnelId }: { clientId: string; tunnelId: string }) => tunnelApi.stop(tunnelId),
-    onSuccess: () => {
-      invalidateTunnelQueries(queryClient);
-    },
+	return useMutation({
+		mutationFn: ({ tunnelId }: { tunnelId: string }) => tunnelApi.stop(tunnelId),
+		onSuccess: () => {
+			invalidateTunnelQueries(queryClient);
+		},
   });
 }
 
 export function useDeleteTunnel() {
   const queryClient = useQueryClient();
 
-  return useMutation({
-    mutationFn: ({ tunnelId }: { clientId: string; tunnelId: string }) => tunnelApi.delete(tunnelId),
-    onSuccess: () => {
-      invalidateTunnelQueries(queryClient);
-    },
+	return useMutation({
+		mutationFn: ({ tunnelId }: { tunnelId: string }) => tunnelApi.delete(tunnelId),
+		onSuccess: () => {
+			invalidateTunnelQueries(queryClient);
+		},
   });
 }
 
 export function useUpdateTunnel() {
   const queryClient = useQueryClient();
 
-  return useMutation({
-    mutationFn: (data: UpdateTunnelInput) =>
-      tunnelApi.update(data.tunnelId, {
-        expected_revision: data.expected_revision,
-        spec: buildTunnelSpec(data),
-      }),
-    onSuccess: () => {
-      invalidateTunnelQueries(queryClient);
-    },
+	return useMutation({
+		mutationFn: (data: UpdateTunnelInput) => tunnelApi.update(data.tunnelId, {
+			expected_revision: data.expected_revision,
+			spec: buildTunnelSpec(data),
+		}),
+		onSuccess: () => {
+			invalidateTunnelQueries(queryClient);
+		},
   });
 }

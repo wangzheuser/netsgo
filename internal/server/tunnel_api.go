@@ -165,10 +165,10 @@ func tunnelMutationErrorStatusAndBody(err error) (int, tunnelMutationErrorRespon
 	var validationErr *proxyRequestValidationError
 	var rejected *tunnelProvisionRejectedError
 	switch {
-	case errors.Is(err, errManagedTunnelClientNotFound):
+	case errors.Is(err, errStoredTunnelClientNotFound):
 		status = http.StatusNotFound
 		payload.Error = "client not found"
-	case errors.Is(err, errManagedTunnelNotFound):
+	case errors.Is(err, errStoredTunnelNotFound):
 		status = http.StatusNotFound
 		payload.Error = "tunnel not found"
 	case errors.Is(err, errTunnelProvisionAckTimeout):

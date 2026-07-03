@@ -180,8 +180,6 @@ func (s *Server) handleProxyCreateMessage(client *ClientConn, msg protocol.Messa
 			TransportPolicy: config.TransportPolicy,
 			ActualTransport: config.ActualTransport,
 		})
-
-		s.emitTunnelChanged(client.ID, config, "created_by_client")
 	}
 
 	if err := client.writeJSON(resp); err != nil {
@@ -308,21 +306,8 @@ func (s *Server) handleProxyCloseMessage(client *ClientConn, msg protocol.Messag
 		return
 	}
 
-	config := protocol.ProxyConfig{
-		Name:     req.Name,
-		ClientID: client.ID,
-	}
-	client.proxyMu.RLock()
-	if tunnel, exists := client.proxies[req.Name]; exists {
-		config = tunnel.Config
-	}
-	client.proxyMu.RUnlock()
-
 	if err := s.StopProxy(client, req.Name); err != nil {
 		log.Printf("⚠️ Failed to close proxy [%s]: %v", client.ID, err)
 		return
 	}
-
-	setProxyConfigStates(&config, protocol.ProxyDesiredStateStopped, protocol.ProxyRuntimeStateIdle, "")
-	s.emitTunnelChanged(client.ID, config, "closed_by_client")
 }

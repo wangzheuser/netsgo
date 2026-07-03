@@ -572,6 +572,19 @@ func TestStopAllProxies(t *testing.T) {
 	_ = sConn.Close()
 }
 
+func TestCloseTunnelRuntimeResourcesAllowsUnboundPlaceholder(t *testing.T) {
+	tunnel := &ProxyTunnel{
+		Config: protocol.ProxyConfig{
+			Name:         "placeholder",
+			DesiredState: protocol.ProxyDesiredStateRunning,
+			RuntimeState: protocol.ProxyRuntimeStateOffline,
+		},
+	}
+
+	closeTunnelRuntimeResources(tunnel)
+	closeTunnelRuntimeResources(tunnel)
+}
+
 // ============================================================
 // Complete Proxy accept loop and forwarding behavior tests
 // ============================================================
@@ -786,6 +799,22 @@ func (l *scriptedListener) Close() error {
 
 func (l *scriptedListener) Addr() net.Addr { return l.addr }
 
+func storedTunnelFromRuntimeForTest(client *ClientConn, tunnel *ProxyTunnel) StoredTunnel {
+	stored := StoredTunnel{
+		ProxyNewRequest: tunnel.Config.ToProxyNewRequest(),
+		ClientID:        client.ID,
+		Hostname:        client.GetInfo().Hostname,
+		Binding:         TunnelBindingClientID,
+		Revision:        tunnel.Config.Revision,
+		CreatedAt:       tunnel.Config.CreatedAt,
+	}
+	stored.DesiredState = tunnel.Config.DesiredState
+	stored.RuntimeState = tunnel.Config.RuntimeState
+	stored.Error = tunnel.Config.Error
+	_ = stored.normalize()
+	return stored
+}
+
 func TestProxyAcceptLoop_UnexpectedAcceptFailureMarksTunnelError(t *testing.T) {
 	s := New(0)
 	s.store = newTestTunnelStore(t)
@@ -821,7 +850,7 @@ func TestProxyAcceptLoop_UnexpectedAcceptFailureMarksTunnelError(t *testing.T) {
 	}
 	client.proxies[tunnel.Config.Name] = tunnel
 
-	mustAddStableTunnel(t, s.store, storedTunnelFromRuntime(client, tunnel))
+	mustAddStableTunnel(t, s.store, storedTunnelFromRuntimeForTest(client, tunnel))
 
 	listener.acceptCh <- errors.New("boom")
 	s.proxyAcceptLoop(client, tunnel, listener, tunnel.done)
@@ -880,7 +909,7 @@ func TestProxyAcceptLoop_ClosedDoneDoesNotMarkTunnelError(t *testing.T) {
 	}
 	client.proxies[tunnel.Config.Name] = tunnel
 
-	mustAddStableTunnel(t, s.store, storedTunnelFromRuntime(client, tunnel))
+	mustAddStableTunnel(t, s.store, storedTunnelFromRuntimeForTest(client, tunnel))
 
 	close(tunnel.done)
 	listener.acceptCh <- net.ErrClosed
@@ -931,7 +960,7 @@ func TestMarkTCPProxyRuntimeErrorIfCurrent_StaleListenerDoesNotDemote(t *testing
 	}
 	client.proxies[tunnel.Config.Name] = tunnel
 
-	mustAddStableTunnel(t, s.store, storedTunnelFromRuntime(client, tunnel))
+	mustAddStableTunnel(t, s.store, storedTunnelFromRuntimeForTest(client, tunnel))
 
 	s.markTCPProxyRuntimeErrorIfCurrent(client, tunnel, oldListener, "stale accept failure")
 
@@ -983,7 +1012,7 @@ func TestHandleProxyConn_OpenStreamFailureMarksTunnelError(t *testing.T) {
 	}
 	client.proxies[tunnel.Config.Name] = tunnel
 
-	mustAddStableTunnel(t, s.store, storedTunnelFromRuntime(client, tunnel))
+	mustAddStableTunnel(t, s.store, storedTunnelFromRuntimeForTest(client, tunnel))
 
 	peerConn, extConn := net.Pipe()
 	defer mustClose(t, peerConn)

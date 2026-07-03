@@ -200,21 +200,14 @@ func (s *Server) handleUnifiedTunnelAction(w http.ResponseWriter, r *http.Reques
 }
 
 func (s *Server) resumeUnifiedTunnel(w http.ResponseWriter, current tunnelSpecAPI) {
-	stored, err := s.loadOfflineManagedTunnelBySelector(current.OwnerClientID, current.ID)
+	stored, err := s.loadOfflineTunnelBySelector(current.OwnerClientID, current.ID)
 	if err != nil {
 		status, payload := tunnelMutationErrorStatusAndBody(err)
 		encodeJSON(w, status, payload)
 		return
 	}
-	if !canResumeTunnel(storedTunnelToProxyConfig(stored)) {
-		message := "only stopped or error tunnels can be resumed"
-		encodeJSON(w, http.StatusBadRequest, tunnelMutationErrorResponse{
-			Success:   false,
-			Error:     message,
-			Message:   message,
-			ErrorCode: protocol.TunnelMutationErrorCodeResumeNotAllowed,
-			Code:      protocol.TunnelMutationErrorCodeResumeNotAllowed,
-		})
+	if !canResumeUnifiedTunnelSpec(current) {
+		writeAPIError(w, http.StatusConflict, protocol.TunnelMutationErrorCodeTunnelResumeNotAllowed, "only stopped or error tunnels can be resumed")
 		return
 	}
 	if err := s.store.UpdateStates(current.OwnerClientID, stored.Name, protocol.ProxyDesiredStateRunning, protocol.ProxyRuntimeStateOffline, ""); err != nil {
@@ -224,6 +217,7 @@ func (s *Server) resumeUnifiedTunnel(w http.ResponseWriter, current tunnelSpecAP
 	}
 	stored.DesiredState = protocol.ProxyDesiredStateRunning
 	stored.RuntimeState = protocol.ProxyRuntimeStateOffline
+	stored.Error = ""
 	if err := s.unprovisionStoredUnifiedTunnel(stored, "resume_reconcile", true); err != nil {
 		logUnifiedRuntimeCleanupFailure("resume", stored, err)
 	}
@@ -238,13 +232,13 @@ func (s *Server) resumeUnifiedTunnel(w http.ResponseWriter, current tunnelSpecAP
 }
 
 func (s *Server) stopUnifiedTunnel(w http.ResponseWriter, current tunnelSpecAPI) {
-	stored, err := s.loadOfflineManagedTunnelBySelector(current.OwnerClientID, current.ID)
+	stored, err := s.loadOfflineTunnelBySelector(current.OwnerClientID, current.ID)
 	if err != nil {
 		status, payload := tunnelMutationErrorStatusAndBody(err)
 		encodeJSON(w, status, payload)
 		return
 	}
-	config, err := s.stopOfflineManagedTunnel(current.OwnerClientID, current.ID)
+	config, err := s.stopOfflineTunnel(current.OwnerClientID, current.ID)
 	if err != nil {
 		status, payload := tunnelMutationErrorStatusAndBody(err)
 		encodeJSON(w, status, payload)
@@ -254,6 +248,12 @@ func (s *Server) stopUnifiedTunnel(w http.ResponseWriter, current tunnelSpecAPI)
 		logUnifiedRuntimeCleanupFailure("stop", stored, err)
 	}
 	encodeJSON(w, http.StatusOK, map[string]any{"success": true, "message": "tunnel stopped", "tunnel": specFromStoredTunnelConfig(config, s)})
+}
+
+func canResumeUnifiedTunnelSpec(spec tunnelSpecAPI) bool {
+	desiredState := canonicalDesiredState(spec.DesiredState)
+	return (desiredState == protocol.ProxyDesiredStateStopped && spec.RuntimeState == protocol.ProxyRuntimeStateIdle) ||
+		(desiredState == protocol.ProxyDesiredStateRunning && spec.RuntimeState == protocol.ProxyRuntimeStateError)
 }
 
 func (s *Server) handleListUnifiedTunnels(w http.ResponseWriter, _ *http.Request) {
@@ -419,7 +419,7 @@ func (s *Server) handleDeleteUnifiedTunnel(w http.ResponseWriter, r *http.Reques
 		return
 	}
 
-	stored, err := s.loadOfflineManagedTunnelBySelector(current.OwnerClientID, current.ID)
+	stored, err := s.loadOfflineTunnelBySelector(current.OwnerClientID, current.ID)
 	if err != nil {
 		status, payload := tunnelMutationErrorStatusAndBody(err)
 		encodeJSON(w, status, payload)
@@ -846,6 +846,16 @@ func (s *Server) storedTunnelFromUnifiedRequest(req tunnelCreateRequestAPI, exis
 	if strings.TrimSpace(req.Name) == "" {
 		return StoredTunnel{}, newProxyRequestValidationError(fmt.Errorf("tunnel name is required"), protocol.TunnelMutationFieldName, "", http.StatusBadRequest)
 	}
+	if err := validateBandwidthSettings(req.BandwidthSettings); err != nil {
+		switch {
+		case req.BandwidthSettings.IngressBPS < 0:
+			return StoredTunnel{}, newProxyRequestValidationError(err, "bandwidth_settings."+protocol.TunnelMutationFieldIngressBPS, "", http.StatusBadRequest)
+		case req.BandwidthSettings.EgressBPS < 0:
+			return StoredTunnel{}, newProxyRequestValidationError(err, "bandwidth_settings."+protocol.TunnelMutationFieldEgressBPS, "", http.StatusBadRequest)
+		default:
+			return StoredTunnel{}, newProxyRequestValidationError(err, "bandwidth_settings", "", http.StatusBadRequest)
+		}
+	}
 	if req.TransportPolicy == "" {
 		req.TransportPolicy = tunnelTransportPolicyServerRelayOnly
 	}
@@ -1179,16 +1189,9 @@ func (s *Server) registeredClientInfo(clientID string) (RegisteredClient, bool) 
 	return s.auth.adminStore.GetRegisteredClient(clientID)
 }
 
-// clientSupportsTargetType checks whether a registered client advertised support
-// for the given target endpoint type. Clients registered before the capabilities
-// feature (last_capabilities == "{}") have nil capabilities; treat them as
-// supporting the default production endpoint types for backward compatibility.
 func clientSupportsTargetType(capabilities *protocol.ClientCapabilities, targetType string) bool {
-	if capabilities == nil {
-		defaults := protocol.DefaultClientCapabilities()
-		capabilities = &defaults
-	}
-	for _, supported := range capabilities.TargetTypes {
+	effective := effectiveClientCapabilities(capabilities)
+	for _, supported := range effective.TargetTypes {
 		if supported == targetType {
 			return true
 		}
@@ -1197,16 +1200,31 @@ func clientSupportsTargetType(capabilities *protocol.ClientCapabilities, targetT
 }
 
 func clientSupportsIngressType(capabilities *protocol.ClientCapabilities, ingressType string) bool {
-	if capabilities == nil {
-		defaults := protocol.DefaultClientCapabilities()
-		capabilities = &defaults
-	}
-	for _, supported := range capabilities.IngressTypes {
+	effective := effectiveClientCapabilities(capabilities)
+	for _, supported := range effective.IngressTypes {
 		if supported == ingressType {
 			return true
 		}
 	}
 	return false
+}
+
+func effectiveClientCapabilities(capabilities *protocol.ClientCapabilities) protocol.ClientCapabilities {
+	if capabilities != nil {
+		return *capabilities
+	}
+	return legacyUnifiedClientCapabilities()
+}
+
+func legacyUnifiedClientCapabilities() protocol.ClientCapabilities {
+	return protocol.ClientCapabilities{
+		ProtocolVersion:     1,
+		StreamHeaderVersion: 1,
+		TunnelSpecVersion:   protocol.TunnelSpecVersion,
+		IngressTypes:        []string{protocol.IngressTypeTCPListen, protocol.IngressTypeUDPListen},
+		TargetTypes:         []string{protocol.TargetTypeTCPService, protocol.TargetTypeUDPService},
+		P2P:                 protocol.P2PCapabilities{Supported: false},
+	}
 }
 
 func clientHasDataSession(client *ClientConn) bool {
@@ -1515,17 +1533,6 @@ func unifiedTunnelViewKey(id, clientID, name string) string {
 
 func (s *Server) allUnifiedTunnelSpecs() ([]tunnelSpecAPI, error) {
 	byID := map[string]tunnelSpecAPI{}
-	appendConfig := func(config protocol.ProxyConfig, online bool) {
-		view := proxyConfigForClientView(config, online)
-		key := unifiedTunnelViewKey(view.ID, view.ClientID, view.Name)
-		if view.ID == "" {
-			view.ID = view.Name
-		}
-		if _, exists := byID[key]; exists {
-			return
-		}
-		byID[key] = unifiedSpecFromProxyConfig(view)
-	}
 
 	if s.store != nil {
 		stored, err := s.store.GetAllTunnels()
@@ -1542,14 +1549,6 @@ func (s *Server) allUnifiedTunnelSpecs() ([]tunnelSpecAPI, error) {
 		}
 	}
 
-	s.RangeClients(func(_ string, client *ClientConn) bool {
-		online := client.isLive()
-		for _, config := range client.ProxyConfigsSnapshot() {
-			appendConfig(config, online)
-		}
-		return true
-	})
-
 	tunnels := make([]tunnelSpecAPI, 0, len(byID))
 	for _, tunnel := range byID {
 		tunnels = append(tunnels, tunnel)
@@ -1565,17 +1564,6 @@ func (s *Server) allUnifiedTunnelSpecs() ([]tunnelSpecAPI, error) {
 
 func (s *Server) allUnifiedTunnelProxyConfigs() ([]protocol.ProxyConfig, error) {
 	byID := map[string]protocol.ProxyConfig{}
-	appendConfig := func(config protocol.ProxyConfig, online bool) {
-		view := proxyConfigForClientView(config, online)
-		key := unifiedTunnelViewKey(view.ID, view.ClientID, view.Name)
-		if view.ID == "" {
-			view.ID = view.Name
-		}
-		if _, exists := byID[key]; exists {
-			return
-		}
-		byID[key] = view
-	}
 
 	if s.store != nil {
 		stored, err := s.store.GetAllTunnels()
@@ -1591,14 +1579,6 @@ func (s *Server) allUnifiedTunnelProxyConfigs() ([]protocol.ProxyConfig, error) 
 			byID[key] = view
 		}
 	}
-
-	s.RangeClients(func(_ string, client *ClientConn) bool {
-		online := client.isLive()
-		for _, config := range client.ProxyConfigsSnapshot() {
-			appendConfig(config, online)
-		}
-		return true
-	})
 
 	tunnels := make([]protocol.ProxyConfig, 0, len(byID))
 	for _, tunnel := range byID {
@@ -1626,28 +1606,6 @@ func (s *Server) findUnifiedTunnelSpecByID(id string) (tunnelSpecAPI, bool, erro
 		if !errors.Is(err, ErrTunnelNotFound) {
 			return tunnelSpecAPI{}, false, err
 		}
-	}
-
-	var found tunnelSpecAPI
-	var ok bool
-	s.RangeClients(func(_ string, client *ClientConn) bool {
-		online := client.isLive()
-		for _, config := range client.ProxyConfigsSnapshot() {
-			view := proxyConfigForClientView(config, online)
-			if view.ID == "" {
-				view.ID = view.Name
-			}
-			if view.ID != id {
-				continue
-			}
-			found = unifiedSpecFromProxyConfig(view)
-			ok = true
-			return false
-		}
-		return true
-	})
-	if ok {
-		return found, true, nil
 	}
 	return tunnelSpecAPI{}, false, nil
 }

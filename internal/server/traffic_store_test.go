@@ -1017,7 +1017,17 @@ func TestTrafficAPI_Query(t *testing.T) {
 
 	clientID := "test-client-001"
 	now := time.Now().UTC()
-	ts.ApplyDeltas([]TrafficDelta{{ClientID: clientID, TunnelName: "web", TunnelType: "http", MinuteStart: minuteFloorUTC(now).Unix(), IngressBytes: 1024, EgressBytes: 512}})
+	stored := testStoredServerExposeTCPTunnel("traffic-query-web-id", "web", clientID, 8080, 18080, now)
+	mustAddStableTunnel(t, s.store, stored)
+	ts.ApplyDeltas([]TrafficDelta{{
+		TunnelID:     stored.ID,
+		ClientID:     clientID,
+		TunnelName:   stored.Name,
+		TunnelType:   stored.Type,
+		MinuteStart:  minuteFloorUTC(now).Unix(),
+		IngressBytes: 1024,
+		EgressBytes:  512,
+	}})
 
 	from := now.Add(-time.Minute).Unix()
 	to := now.Add(time.Minute).Unix()
@@ -1050,6 +1060,153 @@ func TestTrafficAPI_Query(t *testing.T) {
 	}
 }
 
+func TestTrafficAPI_HistoricalQueryIgnoresRuntimeOnlyProxyCreateTunnels(t *testing.T) {
+	s, handler, token, cleanup := setupTestServerWithStores(t, true)
+	defer cleanup()
+
+	ts, trafficCleanup := newTestTrafficStore(t)
+	defer trafficCleanup()
+	s.trafficStore = ts
+
+	clientID := "test-client-historical-runtime"
+	now := time.Now().UTC()
+	stored := testStoredServerExposeTCPTunnel("traffic-history-stored-id", "stored-history", clientID, 8080, 18080, now)
+	mustAddStableTunnel(t, s.store, stored)
+	runtimeID := "traffic-history-runtime-id"
+	ts.ApplyDeltas([]TrafficDelta{
+		{
+			TunnelID:     stored.ID,
+			ClientID:     clientID,
+			TunnelName:   stored.Name,
+			TunnelType:   stored.Type,
+			MinuteStart:  minuteFloorUTC(now).Unix(),
+			IngressBytes: 10,
+			EgressBytes:  5,
+		},
+		{
+			TunnelID:     runtimeID,
+			ClientID:     clientID,
+			TunnelName:   "runtime-history",
+			TunnelType:   protocol.ProxyTypeTCP,
+			MinuteStart:  minuteFloorUTC(now).Unix(),
+			IngressBytes: 99,
+			EgressBytes:  1,
+		},
+	})
+
+	from := now.Add(-time.Hour).Unix()
+	to := now.Add(time.Hour).Unix()
+	for _, resolution := range []TrafficResolution{TrafficResolutionMinute, TrafficResolutionHour} {
+		path := "/api/clients/" + clientID + "/traffic?from=" + itoa(from) + "&to=" + itoa(to) + "&resolution=" + string(resolution)
+		w := doMuxRequest(t, handler, http.MethodGet, path, token, nil)
+		if w.Code != http.StatusOK {
+			t.Fatalf("GET %s traffic: want 200, got %d body=%s", resolution, w.Code, w.Body.String())
+		}
+		var resp TrafficQueryResult
+		if err := mustDecodeJSON(t, w.Body, &resp); err != nil {
+			t.Fatalf("failed to decode %s response: %v", resolution, err)
+		}
+		if len(resp.Items) != 1 || resp.Items[0].TunnelID != stored.ID {
+			t.Fatalf("%s historical traffic should only include stored tunnel, got %+v", resolution, resp.Items)
+		}
+	}
+
+	storedIDPath := "/api/clients/" + clientID + "/traffic?from=" + itoa(from) + "&to=" + itoa(to) + "&resolution=minute&tunnel=" + stored.ID
+	storedIDResp := doMuxRequest(t, handler, http.MethodGet, storedIDPath, token, nil)
+	if storedIDResp.Code != http.StatusOK {
+		t.Fatalf("GET stored id traffic: want 200, got %d body=%s", storedIDResp.Code, storedIDResp.Body.String())
+	}
+	var storedIDResult TrafficQueryResult
+	if err := mustDecodeJSON(t, storedIDResp.Body, &storedIDResult); err != nil {
+		t.Fatalf("failed to decode stored id response: %v", err)
+	}
+	if len(storedIDResult.Items) != 1 || storedIDResult.Items[0].TunnelID != stored.ID {
+		t.Fatalf("stored tunnel id filter should include stored traffic, got %+v", storedIDResult.Items)
+	}
+
+	runtimeIDPath := "/api/clients/" + clientID + "/traffic?from=" + itoa(from) + "&to=" + itoa(to) + "&resolution=minute&tunnel=" + runtimeID
+	runtimeIDResp := doMuxRequest(t, handler, http.MethodGet, runtimeIDPath, token, nil)
+	if runtimeIDResp.Code != http.StatusOK {
+		t.Fatalf("GET runtime id traffic: want 200, got %d body=%s", runtimeIDResp.Code, runtimeIDResp.Body.String())
+	}
+	var runtimeIDResult TrafficQueryResult
+	if err := mustDecodeJSON(t, runtimeIDResp.Body, &runtimeIDResult); err != nil {
+		t.Fatalf("failed to decode runtime id response: %v", err)
+	}
+	if len(runtimeIDResult.Items) != 1 || runtimeIDResult.Items[0].TunnelID != runtimeID {
+		t.Fatalf("explicit historical tunnel filter should preserve store query semantics, got %+v", runtimeIDResult.Items)
+	}
+}
+
+func TestTrafficAPI_HistoricalQueryKeepsDeletedTunnelWhenSelected(t *testing.T) {
+	s, handler, token, cleanup := setupTestServerWithStores(t, true)
+	defer cleanup()
+
+	path := filepath.Join(t.TempDir(), serverDBFileName)
+	s.store = newTestTunnelStoreAt(t, path)
+	ts, err := NewTrafficStore(path)
+	if err != nil {
+		t.Fatalf("NewTrafficStore failed: %v", err)
+	}
+	defer func() { _ = ts.Close() }()
+	s.trafficStore = ts
+
+	clientID := "test-client-deleted-history"
+	now := minuteFloorUTC(time.Now().UTC())
+	stored := testStoredServerExposeTCPTunnel("traffic-deleted-id", "delete-history", clientID, 8080, 18080, now)
+	mustAddStableTunnel(t, s.store, stored)
+	ts.ApplyDeltas([]TrafficDelta{{
+		TunnelID:     stored.ID,
+		ClientID:     clientID,
+		TunnelName:   stored.Name,
+		TunnelType:   stored.Type,
+		MinuteStart:  now.Unix(),
+		IngressBytes: 10,
+		EgressBytes:  5,
+	}})
+	if err := ts.Flush(); err != nil {
+		t.Fatalf("Flush failed: %v", err)
+	}
+	if err := s.store.RemoveTunnel(clientID, stored.Name); err != nil {
+		t.Fatalf("RemoveTunnel failed: %v", err)
+	}
+
+	from := now.Add(-time.Minute).Unix()
+	to := now.Add(time.Minute).Unix()
+	listPath := "/api/clients/" + clientID + "/traffic?from=" + itoa(from) + "&to=" + itoa(to) + "&resolution=minute"
+	listResp := doMuxRequest(t, handler, http.MethodGet, listPath, token, nil)
+	if listResp.Code != http.StatusOK {
+		t.Fatalf("GET deleted history list: want 200, got %d body=%s", listResp.Code, listResp.Body.String())
+	}
+	var listResult TrafficQueryResult
+	if err := mustDecodeJSON(t, listResp.Body, &listResult); err != nil {
+		t.Fatalf("failed to decode deleted history list: %v", err)
+	}
+	if len(listResult.Items) != 0 {
+		t.Fatalf("unfiltered historical list should not surface deleted/runtime-only tunnels, got %+v", listResult.Items)
+	}
+
+	selectedPath := "/api/clients/" + clientID + "/traffic?from=" + itoa(from) + "&to=" + itoa(to) + "&resolution=minute&tunnel=" + stored.ID
+	selectedResp := doMuxRequest(t, handler, http.MethodGet, selectedPath, token, nil)
+	if selectedResp.Code != http.StatusOK {
+		t.Fatalf("GET selected deleted history: want 200, got %d body=%s", selectedResp.Code, selectedResp.Body.String())
+	}
+	var selectedResult TrafficQueryResult
+	if err := mustDecodeJSON(t, selectedResp.Body, &selectedResult); err != nil {
+		t.Fatalf("failed to decode selected deleted history: %v", err)
+	}
+	if len(selectedResult.Items) != 1 {
+		t.Fatalf("selected deleted tunnel history should remain queryable, got %+v", selectedResult.Items)
+	}
+	series := selectedResult.Items[0]
+	if series.TunnelID != stored.ID || !series.MetadataMissing {
+		t.Fatalf("selected deleted tunnel should carry id and metadata_missing=true, got %+v", series)
+	}
+	if len(series.Points) != 1 || series.Points[0].IngressBytes != 10 || series.Points[0].EgressBytes != 5 {
+		t.Fatalf("selected deleted tunnel points mismatch: %+v", series.Points)
+	}
+}
+
 func TestTrafficAPI_RealtimeSecondQueryReturnsSixtyZeroFilledPoints(t *testing.T) {
 	s, handler, token, cleanup := setupTestServerWithStores(t, true)
 	defer cleanup()
@@ -1062,18 +1219,18 @@ func TestTrafficAPI_RealtimeSecondQueryReturnsSixtyZeroFilledPoints(t *testing.T
 	end := time.Unix(1_800_000, 0).UTC()
 	from := end.Add(-59 * time.Second)
 	sampleTime := end.Add(-2 * time.Second)
-	ts.recordBytesAt(sampleTime, clientID, "web", protocol.ProxyTypeHTTP, 1024, 512)
-
-	s.clients.Store(clientID, &ClientConn{
-		ID:    clientID,
-		state: clientStateLive,
-		proxies: map[string]*ProxyTunnel{
-			"web": {
-				Config: protocol.ProxyConfig{Name: "web", Type: protocol.ProxyTypeHTTP},
-				done:   make(chan struct{}),
-			},
-		},
-	})
+	stored := testStoredServerExposeTCPTunnel("traffic-realtime-web-id", "web", clientID, 8080, 18080, from)
+	mustAddStableTunnel(t, s.store, stored)
+	ts.ApplyDeltas([]TrafficDelta{{
+		TunnelID:     stored.ID,
+		ClientID:     clientID,
+		TunnelName:   stored.Name,
+		TunnelType:   stored.Type,
+		SecondStart:  sampleTime.Unix(),
+		MinuteStart:  minuteFloorUTC(sampleTime).Unix(),
+		IngressBytes: 1024,
+		EgressBytes:  512,
+	}})
 
 	path := "/api/clients/" + clientID + "/traffic?from=" + itoa(from.Unix()) + "&to=" + itoa(end.Unix()) + "&resolution=second"
 	w := doMuxRequest(t, handler, http.MethodGet, path, token, nil)
@@ -1105,6 +1262,57 @@ func TestTrafficAPI_RealtimeSecondQueryReturnsSixtyZeroFilledPoints(t *testing.T
 	}
 	if web.Points[trafficRealtimePointCount-1].TotalBytes != 0 {
 		t.Fatalf("missing realtime seconds should be zero-filled, got %+v", web.Points[trafficRealtimePointCount-1])
+	}
+}
+
+func TestCollectRealtimeTrafficEventIgnoresRuntimeOnlyProxyCreateTunnels(t *testing.T) {
+	s := New(0)
+	s.store = newTestTunnelStore(t)
+	ts, trafficCleanup := newTestTrafficStore(t)
+	defer trafficCleanup()
+	s.trafficStore = ts
+
+	clientID := "test-client-runtime-traffic"
+	now := secondFloorUTC(time.Now().UTC()).Add(3 * time.Second)
+	sampleTime := secondFloorUTC(now).Add(-time.Second)
+	stored := testStoredServerExposeTCPTunnel("traffic-stored-id", "stored-web", clientID, 8080, 18080, sampleTime)
+	mustAddStableTunnel(t, s.store, stored)
+	s.clients.Store(clientID, &ClientConn{
+		ID:    clientID,
+		state: clientStateLive,
+		proxies: map[string]*ProxyTunnel{
+			"runtime-only": testRuntimeOnlyProxyTunnel("traffic-runtime-id", "runtime-only", clientID, 8081, 18081, sampleTime),
+		},
+	})
+	ts.ApplyDeltas([]TrafficDelta{
+		{
+			TunnelID:     stored.ID,
+			ClientID:     clientID,
+			TunnelName:   stored.Name,
+			TunnelType:   stored.Type,
+			SecondStart:  sampleTime.Unix(),
+			MinuteStart:  minuteFloorUTC(sampleTime).Unix(),
+			IngressBytes: 10,
+			EgressBytes:  5,
+		},
+		{
+			TunnelID:     "traffic-runtime-id",
+			ClientID:     clientID,
+			TunnelName:   "runtime-only",
+			TunnelType:   protocol.ProxyTypeTCP,
+			SecondStart:  sampleTime.Unix(),
+			MinuteStart:  minuteFloorUTC(sampleTime).Unix(),
+			IngressBytes: 99,
+			EgressBytes:  1,
+		},
+	})
+
+	event := s.collectRealtimeTrafficEvent(now)
+	if len(event.Clients) != 1 {
+		t.Fatalf("realtime event clients: want 1, got %d: %+v", len(event.Clients), event.Clients)
+	}
+	if got := event.Clients[0].Items; len(got) != 1 || got[0].TunnelID != stored.ID {
+		t.Fatalf("realtime event should only include stored tunnel, got %+v", got)
 	}
 }
 
