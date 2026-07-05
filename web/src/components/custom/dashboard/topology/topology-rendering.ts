@@ -10,11 +10,44 @@ import {
 export type StatusKey = TunnelStatusPresentation['key'];
 
 export const EDGE_STROKE: Record<StatusKey, string> = {
-  exposed: 'stroke-cyan-500/75',
-  pending: 'stroke-violet-500/70',
-  offline: 'stroke-amber-500/60',
-  stopped: 'stroke-muted-foreground/35',
-  error: 'stroke-destructive/70',
+  exposed: 'stroke-cyan-400/90',
+  pending: 'stroke-violet-400/85',
+  offline: 'stroke-amber-400/80',
+  stopped: 'stroke-slate-400/55',
+  error: 'stroke-rose-500/90',
+};
+
+export const EDGE_FLOW_COLORS: Record<StatusKey, { start: string; middle: string; end: string; spark: string }> = {
+  exposed: {
+    start: '#00e5ff',
+    middle: '#2dff9d',
+    end: '#4f7cff',
+    spark: '#f8fafc',
+  },
+  pending: {
+    start: '#a855f7',
+    middle: '#22d3ee',
+    end: '#6366f1',
+    spark: '#f0abfc',
+  },
+  offline: {
+    start: '#f59e0b',
+    middle: '#fde047',
+    end: '#fb7185',
+    spark: '#fffbeb',
+  },
+  stopped: {
+    start: '#64748b',
+    middle: '#cbd5e1',
+    end: '#38bdf8',
+    spark: '#f8fafc',
+  },
+  error: {
+    start: '#ff2d55',
+    middle: '#f97316',
+    end: '#a855f7',
+    spark: '#ffe4e6',
+  },
 };
 
 export const STATUS_DOT: Record<StatusKey, string> = {
@@ -68,9 +101,8 @@ export function flowDuration(rate: TopologyTrafficRate | undefined) {
   return `${(1.55 - trafficIntensity(rate) * 0.85).toFixed(2)}s`;
 }
 
-/** 渐变流光扫过整条边所需时长；流量越大扫得越快。 */
-export function flowSweepDuration(rate: TopologyTrafficRate | undefined) {
-  return `${(2.6 - trafficIntensity(rate) * 1.4).toFixed(2)}s`;
+export function tunnelStreamDuration(rate: TopologyTrafficRate | undefined) {
+  return `${(1.05 - trafficIntensity(rate) * 0.45).toFixed(2)}s`;
 }
 
 export function trafficStrokeWidth(rate: TopologyTrafficRate | undefined, base: number, emphasis: TopologyLinkEmphasis) {

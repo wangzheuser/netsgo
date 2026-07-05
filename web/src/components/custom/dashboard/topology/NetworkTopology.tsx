@@ -48,8 +48,8 @@ export function TopologyHeaderActions({
   }
 
   return (
-    <Button type="button" variant="secondary" size="sm" className="h-8 gap-1.5 px-2.5" onClick={onAddClient}>
-      <LayersPlus className="h-4 w-4" />
+    <Button type="button" variant="secondary" size="sm" onClick={onAddClient}>
+      <LayersPlus className="h-4 w-4 mr-1.5" />
       {t('dashboard.addClient')}
     </Button>
   );
@@ -121,6 +121,7 @@ export function NetworkTopology() {
       trafficSnapshot={trafficSnapshot}
       focusId={activeTopologyFocusId}
       hoveredTunnelId={hoveredTunnelId}
+      onHoverTunnel={setHoveredTunnelId}
       onFocusChange={setFocusId}
       isFullscreen={isFullscreen}
       onToggleFullscreen={() => setIsFullscreen((v) => !v)}
@@ -133,7 +134,6 @@ export function NetworkTopology() {
       trafficSnapshot={trafficSnapshot}
       focusId={topologyFocusNode.id}
       hoveredTunnelId={hoveredTunnelId}
-      onHoverTunnel={setHoveredTunnelId}
     />
   );
   const renderHeaderTitle = () => {

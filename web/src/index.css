@@ -146,6 +146,12 @@ body {
   }
 }
 
+@keyframes topology-stream {
+  to {
+    stroke-dashoffset: -28;
+  }
+}
+
 @keyframes topology-pulse {
   0% {
     r: 25;

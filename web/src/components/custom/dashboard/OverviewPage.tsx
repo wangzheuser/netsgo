@@ -9,6 +9,7 @@ import { ServerInfoCard } from './ServerInfoCard';
 import { DashboardClientTable } from './DashboardClientTable';
 import { DashboardTunnelTable } from './DashboardTunnelTable';
 import { NetworkTopology } from './NetworkTopology';
+import { buildDashboardTabMetrics, formatDashboardTabCount } from './dashboard-tab-metrics';
 
 const stagger = {
   hidden: {},
@@ -36,10 +37,14 @@ function isDashboardTab(value: string): value is DashboardTab {
   return value === 'topology' || value === 'clients' || value === 'tunnels';
 }
 
-function TabCountBadge({ count }: { count: number }) {
+function TabCountBadge({ label }: { label: string | null }) {
+  if (!label) {
+    return null;
+  }
+
   return (
     <span className="rounded-full bg-muted px-1.5 py-0.5 font-mono text-[10px] leading-none text-muted-foreground group-data-active/trigger:bg-background/80">
-      {count}
+      {label}
     </span>
   );
 }
@@ -53,16 +58,11 @@ export function OverviewPage() {
     canInitiallyShowTopologyTab() ? 'topology' : 'clients'
   ));
   const currentTab = showTopologyTab || activeTab !== 'topology' ? activeTab : 'clients';
+  const shouldRenderDashboardTabs = clients === undefined || clients.length > 0;
 
-  const tunnelCount = useMemo(() => {
-    const ids = new Set<string>();
-    for (const client of clients ?? []) {
-      for (const proxy of client.proxies ?? []) {
-        ids.add(proxy.id);
-      }
-    }
-    return ids.size;
-  }, [clients]);
+  const tabMetrics = useMemo(() => buildDashboardTabMetrics(clients), [clients]);
+  const clientTabCount = formatDashboardTabCount(tabMetrics.clients);
+  const tunnelTabCount = formatDashboardTabCount(tabMetrics.tunnels);
 
   useEffect(() => {
     const element = containerRef.current;
@@ -91,41 +91,45 @@ export function OverviewPage() {
     >
       <motion.div variants={fadeUp}><ServerInfoCard /></motion.div>
       <motion.div variants={fadeUp}>
-        <Tabs
-          value={currentTab}
-          onValueChange={(value) => {
-            if (isDashboardTab(value)) {
-              setActiveTab(value);
-            }
-          }}
-          className="gap-4"
-        >
-          <TabsList className="h-9">
-            {showTopologyTab && (
-              <TabsTrigger value="topology" className="group/trigger gap-1.5 px-3">
-                <Waypoints className="h-4 w-4" />
-                {t('dashboard.tabTopology')}
+        {shouldRenderDashboardTabs ? (
+          <Tabs
+            value={currentTab}
+            onValueChange={(value) => {
+              if (isDashboardTab(value)) {
+                setActiveTab(value);
+              }
+            }}
+            className="gap-4"
+          >
+            <TabsList className="h-9">
+              {showTopologyTab && (
+                <TabsTrigger value="topology" className="group/trigger gap-1.5 px-3">
+                  <Waypoints className="h-4 w-4" />
+                  {t('dashboard.tabTopology')}
+                </TabsTrigger>
+              )}
+              <TabsTrigger value="clients" className="group/trigger gap-1.5 px-3">
+                <Laptop className="h-4 w-4" />
+                {t('dashboard.tabClients')}
+                <TabCountBadge label={clientTabCount} />
               </TabsTrigger>
+              <TabsTrigger value="tunnels" className="group/trigger gap-1.5 px-3">
+                <ArrowRightLeft className="h-4 w-4" />
+                {t('dashboard.tabTunnels')}
+                <TabCountBadge label={tunnelTabCount} />
+              </TabsTrigger>
+            </TabsList>
+            {showTopologyTab && (
+              <TabsContent value="topology" forceMount className="data-[state=inactive]:hidden">
+                <NetworkTopology />
+              </TabsContent>
             )}
-            <TabsTrigger value="clients" className="group/trigger gap-1.5 px-3">
-              <Laptop className="h-4 w-4" />
-              {t('dashboard.tabClients')}
-              <TabCountBadge count={clients?.length ?? 0} />
-            </TabsTrigger>
-            <TabsTrigger value="tunnels" className="group/trigger gap-1.5 px-3">
-              <ArrowRightLeft className="h-4 w-4" />
-              {t('dashboard.tabTunnels')}
-              <TabCountBadge count={tunnelCount} />
-            </TabsTrigger>
-          </TabsList>
-          {showTopologyTab && (
-            <TabsContent value="topology" forceMount className="data-[state=inactive]:hidden">
-              <NetworkTopology />
-            </TabsContent>
-          )}
-          <TabsContent value="clients"><DashboardClientTable /></TabsContent>
-          <TabsContent value="tunnels"><DashboardTunnelTable /></TabsContent>
-        </Tabs>
+            <TabsContent value="clients"><DashboardClientTable /></TabsContent>
+            <TabsContent value="tunnels"><DashboardTunnelTable /></TabsContent>
+          </Tabs>
+        ) : (
+          <DashboardClientTable />
+        )}
       </motion.div>
     </motion.div>
   );

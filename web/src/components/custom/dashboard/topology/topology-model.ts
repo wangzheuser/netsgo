@@ -17,6 +17,8 @@ export interface TopologyEdge {
   id: string;
   sourceId: string;
   targetId: string;
+  flowSourceId: string;
+  flowTargetId: string;
   tunnel: ProxyConfig;
   status: TunnelStatusPresentation;
 }
@@ -67,6 +69,26 @@ export function resolveTunnelTargetNodeId(tunnel: ProxyConfig): string {
     || tunnel.client_id;
 }
 
+export function resolveTunnelOwnerNodeId(tunnel: ProxyConfig): string {
+  return tunnel.owner_client_id
+    || tunnel.target?.client_id
+    || tunnel.participants?.target?.client_id
+    || tunnel.client_id;
+}
+
+function resolveTunnelFlowNodeIds(
+  tunnel: ProxyConfig,
+  sourceId: string,
+  targetId: string,
+): Pick<TopologyEdge, 'flowSourceId' | 'flowTargetId'> {
+  const ownerId = resolveTunnelOwnerNodeId(tunnel);
+  const flowSourceId = ownerId === sourceId || ownerId === targetId ? ownerId : targetId;
+  return {
+    flowSourceId,
+    flowTargetId: flowSourceId === sourceId ? targetId : sourceId,
+  };
+}
+
 export function topologyEdgeTouches(edge: Pick<TopologyEdge, 'sourceId' | 'targetId'>, nodeId: string) {
   return edge.sourceId === nodeId || edge.targetId === nodeId;
 }
@@ -82,15 +104,12 @@ export function isTopologyOverview(focusId: string | null) {
 export function getTunnelEdgeEmphasis(edge: TopologyEdge, state: TopologyViewState): TopologyLinkEmphasis {
   const focusId = normalizeTopologyFocusId(state.focusId);
   if (focusId === null) {
-    if (state.hoveredTunnelId) {
-      return edge.id === state.hoveredTunnelId ? 'muted' : 'hidden';
-    }
     if (
       state.hoverNodeId
       && state.hoverNodeId !== SERVER_NODE_ID
       && topologyEdgeTouches(edge, state.hoverNodeId)
     ) {
-      return 'muted';
+      return 'strong';
     }
     return 'hidden';
   }
@@ -103,18 +122,16 @@ export function shouldRenderControlLink(clientId: string, state: TopologyViewSta
   if (focusId === null) {
     return true;
   }
-  return clientId === focusId;
+  return Boolean(clientId);
 }
 
 export function getControlLinkEmphasis(clientId: string, state: TopologyViewState): TopologyLinkEmphasis {
   if (!shouldRenderControlLink(clientId, state)) {
     return 'hidden';
   }
-  if (!isTopologyOverview(state.focusId)) {
-    return 'muted';
-  }
-  if (state.hoveredTunnelId) {
-    return 'muted';
+  const focusId = normalizeTopologyFocusId(state.focusId);
+  if (focusId !== null) {
+    return clientId === focusId ? 'strong' : 'muted';
   }
   if (state.hoverNodeId && state.hoverNodeId !== SERVER_NODE_ID && state.hoverNodeId !== clientId) {
     return 'muted';
@@ -167,10 +184,12 @@ export function buildTopologyGraph(clients: Client[] | undefined): TopologyGraph
 
       const sourceOnline = sourceId === SERVER_NODE_ID ? true : onlineById.get(sourceId) ?? false;
       const targetOnline = targetId === SERVER_NODE_ID ? true : onlineById.get(targetId) ?? false;
+      const flow = resolveTunnelFlowNodeIds(tunnel, sourceId, targetId);
       edges.push({
         id: tunnel.id,
         sourceId,
         targetId,
+        ...flow,
         tunnel,
         status: resolveTunnelStatus(tunnel, sourceOnline && targetOnline),
       });

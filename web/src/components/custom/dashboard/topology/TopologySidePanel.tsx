@@ -25,13 +25,11 @@ export function TopologySidePanel({
   trafficSnapshot,
   focusId,
   hoveredTunnelId,
-  onHoverTunnel,
 }: {
   graph: TopologyGraph;
   trafficSnapshot: TopologyTrafficSnapshot;
   focusId: string;
   hoveredTunnelId: string | null;
-  onHoverTunnel: (id: string | null) => void;
 }) {
   const { t } = useTranslation();
   const navigate = useNavigate();
@@ -73,7 +71,6 @@ export function TopologySidePanel({
                 graph={graph}
                 trafficRate={trafficSnapshot.tunnelRates.get(edge.id)}
                 hovered={hoveredTunnelId === edge.id}
-                onHover={onHoverTunnel}
               />
             ))}
           </div>
@@ -88,13 +85,11 @@ function TunnelListItem({
   graph,
   trafficRate,
   hovered,
-  onHover,
 }: {
   edge: TopologyEdge;
   graph: TopologyGraph;
   trafficRate: TopologyTrafficRate | undefined;
   hovered: boolean;
-  onHover: (id: string | null) => void;
 }) {
   const { t } = useTranslation();
   const view = buildTunnelViewModel(edge.tunnel, true);
@@ -109,18 +104,10 @@ function TunnelListItem({
     <div
       className={cn(
         'group relative flex w-full flex-col gap-2 px-4 py-2.5 text-left transition-colors',
-        hovered ? 'bg-muted/50' : 'hover:bg-muted/40',
+        hovered && 'bg-muted/50',
       )}
-      onMouseEnter={() => onHover(edge.id)}
-      onMouseLeave={() => onHover(null)}
       title={`${view.routeLabel} · ${statusLabel(t, edge.status)}`}
     >
-      <span
-        className={cn(
-          'absolute inset-y-2 left-0 w-0.5 rounded-full bg-primary/70 transition-opacity',
-          hovered ? 'opacity-100' : 'opacity-0',
-        )}
-      />
       <span className="flex min-w-0 items-center gap-1.5">
         <span className={cn('size-1.5 shrink-0 rounded-full', STATUS_DOT[edge.status.key])} />
         <span className="min-w-0 truncate text-xs font-medium text-foreground">{edge.tunnel.name}</span>

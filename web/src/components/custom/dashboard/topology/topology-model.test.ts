@@ -97,6 +97,8 @@ describe('buildTopologyGraph', () => {
     expect(graph.edges).toHaveLength(1);
     expect(graph.edges[0].sourceId).toBe(SERVER_NODE_ID);
     expect(graph.edges[0].targetId).toBe('client-a');
+    expect(graph.edges[0].flowSourceId).toBe('client-a');
+    expect(graph.edges[0].flowTargetId).toBe(SERVER_NODE_ID);
     expect(graph.edges[0].status.key).toBe('exposed');
   });
 
@@ -104,6 +106,7 @@ describe('buildTopologyGraph', () => {
     const c2cTunnel = createTunnel({
       id: 'tunnel-c2c',
       topology: 'client_to_client',
+      owner_client_id: 'client-a',
       ingress: {
         location: 'client',
         client_id: 'client-b',
@@ -129,6 +132,8 @@ describe('buildTopologyGraph', () => {
     expect(graph.edges).toHaveLength(1);
     expect(graph.edges[0].sourceId).toBe('client-b');
     expect(graph.edges[0].targetId).toBe('client-a');
+    expect(graph.edges[0].flowSourceId).toBe('client-a');
+    expect(graph.edges[0].flowTargetId).toBe('client-b');
   });
 
   test('marks running tunnels as offline when a participant client is offline', () => {
@@ -251,7 +256,7 @@ describe('topology link emphasis', () => {
     expect(getTunnelEdgeEmphasis(graph.edges[0], state)).toBe('hidden');
   });
 
-  test('overview weakly reveals tunnels related to the hovered client', () => {
+  test('overview strongly reveals tunnels related to the hovered client', () => {
     const graph = buildTopologyGraph([
       createClient({ proxies: [createTunnel()] }),
     ]);
@@ -260,10 +265,10 @@ describe('topology link emphasis', () => {
       focusId: null,
       hoverNodeId: 'client-a',
       hoveredTunnelId: null,
-    })).toBe('muted');
+    })).toBe('strong');
   });
 
-  test('overview weakly reveals the hovered tunnel from the side panel', () => {
+  test('overview ignores hovered tunnel state', () => {
     const graph = buildTopologyGraph([
       createClient({ proxies: [createTunnel()] }),
     ]);
@@ -272,10 +277,10 @@ describe('topology link emphasis', () => {
       focusId: null,
       hoverNodeId: null,
       hoveredTunnelId: 'tunnel-1',
-    })).toBe('muted');
+    })).toBe('hidden');
   });
 
-  test('client focus shows related tunnel edges and only the focused client control link', () => {
+  test('client focus shows related tunnel edges and emphasizes the focused client control link', () => {
     const graph = buildTopologyGraph([
       createClient({ proxies: [createTunnel()] }),
       createClient({
@@ -288,8 +293,9 @@ describe('topology link emphasis', () => {
 
     expect(getTunnelEdgeEmphasis(graph.edges[0], state)).toBe('strong');
     expect(shouldRenderControlLink('client-a', state)).toBe(true);
-    expect(getControlLinkEmphasis('client-a', state)).toBe('muted');
-    expect(shouldRenderControlLink('client-b', state)).toBe(false);
+    expect(getControlLinkEmphasis('client-a', state)).toBe('strong');
+    expect(shouldRenderControlLink('client-b', state)).toBe(true);
+    expect(getControlLinkEmphasis('client-b', state)).toBe('muted');
   });
 });
 
