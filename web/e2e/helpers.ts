@@ -70,7 +70,7 @@ export function e2eURL(path: string) {
 async function expectDashboardShell(page: Page) {
   await expect(page).toHaveURL(/#\/dashboard(?:$|[/?])/);
   await expect(page.getByRole('tablist')).toBeVisible();
-  await expect(page.getByRole('tab', { name: /Endpoints/i })).toBeVisible();
+  await expect(page.getByRole('tab', { name: /Clients/i })).toBeVisible();
   await expect(page.getByRole('tab', { name: /Tunnels/i })).toBeVisible();
 }
 
