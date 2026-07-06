@@ -794,40 +794,104 @@ function TunnelDialogForm({
           </div>
 
           {!isSocks5 && (
-            <div className="grid grid-cols-2 gap-3">
-              <div className="space-y-1.5">
-                <label className="text-sm font-medium">{isClientToClient ? t('tunnels.targetAddress') : t('tunnels.localIp')}</label>
-                <Input
-                  aria-label={isClientToClient ? t('tunnels.targetAddress') : t('tunnels.localIp')}
-                  placeholder="127.0.0.1"
-                  value={localIp}
-                  onChange={(e) => {
-                    clearMutationFeedback();
-                    setLocalIp(e.target.value);
-                  }}
-                />
-                <FieldErrorText error={fieldError} fields={['target.config.ip', 'target.config.host', 'target.config', 'local_ip']} />
-              </div>
-              <div className="space-y-1.5">
-                <label className="text-sm font-medium">{isClientToClient ? t('tunnels.targetPort') : t('tunnels.localPort')}</label>
-                <Input
-                  aria-label={isClientToClient ? t('tunnels.targetPort') : t('tunnels.localPort')}
-                  type="number"
-                  placeholder="e.g. 22"
-                  value={localPort}
-                  onChange={(e) => {
-                    clearMutationFeedback();
-                    setLocalPort(e.target.value);
-                  }}
-                  min={1}
-                  max={65535}
-                />
-                <FieldErrorText error={fieldError} fields={['target.config.port', 'local_port']} />
-                {localPort && !parsedLocalPort && (
-                  <p className="text-[11px] font-medium text-destructive">{portErrorMessage}</p>
+            <div className="space-y-2">
+              <div className="grid grid-cols-2 gap-3">
+                <div className="space-y-1.5">
+                  <label className="block text-sm font-medium">{isClientToClient ? t('tunnels.targetAddress') : t('tunnels.localIp')}</label>
+                  <Input
+                    aria-label={isClientToClient ? t('tunnels.targetAddress') : t('tunnels.localIp')}
+                    placeholder="127.0.0.1"
+                    value={localIp}
+                    onChange={(e) => {
+                      clearMutationFeedback();
+                      setLocalIp(e.target.value);
+                    }}
+                  />
+                  <FieldErrorText error={fieldError} fields={['target.config.ip', 'target.config.host', 'target.config', 'local_ip']} />
+                </div>
+                <div className="space-y-1.5">
+                  <label className="block text-sm font-medium">{isClientToClient ? t('tunnels.targetPort') : t('tunnels.localPort')}</label>
+                  <Input
+                    aria-label={isClientToClient ? t('tunnels.targetPort') : t('tunnels.localPort')}
+                    type="text"
+                    inputMode="numeric"
+                    pattern="[0-9]*"
+                    placeholder="e.g. 22"
+                    value={localPort}
+                    onChange={(e) => {
+                      clearMutationFeedback();
+                      setLocalPort(e.target.value);
+                    }}
+                  />
+                  <FieldErrorText error={fieldError} fields={['target.config.port', 'local_port']} />
+                  {localPort && !parsedLocalPort && (
+                    <p className="text-[11px] font-medium text-destructive">{portErrorMessage}</p>
+                  )}
+                </div>
+                {!isHttp && isClientToClient && (
+                  <div className="space-y-1.5">
+                    <label className="block text-sm font-medium">{t('tunnels.bindAddress')}</label>
+                    <Input
+                      aria-label={t('tunnels.bindAddress')}
+                      placeholder="0.0.0.0"
+                      value={bindIp}
+                      onChange={(e) => {
+                        clearMutationFeedback();
+                        setBindIp(e.target.value);
+                      }}
+                      autoCapitalize="none"
+                      autoCorrect="off"
+                      spellCheck={false}
+                    />
+                    <FieldErrorText error={fieldError} fields={['ingress.config.bind_ip', 'bind_ip']} />
+                  </div>
+                )}
+                {!isHttp && (
+                  <div className={cn('space-y-1.5', !isClientToClient && 'max-w-[220px]')}>
+                    <label className="block text-sm font-medium">{isClientToClient ? t('tunnels.bindPort') : t('tunnels.publicPort')}</label>
+                    <Input
+                      aria-label={isClientToClient ? t('tunnels.bindPort') : t('tunnels.publicPort')}
+                      type="text"
+                      inputMode="numeric"
+                      pattern="[0-9]*"
+                      placeholder="18080"
+                      value={remotePort}
+                      onChange={(e) => {
+                        clearMutationFeedback();
+                        setRemotePort(e.target.value);
+                      }}
+                      onBlur={validateRemotePortRange}
+                    />
+                    <FieldErrorText error={fieldError} fields={['remote_port', 'ingress.config.port']} />
+                    {remotePort && !parsedRemotePort && (
+                      <p className="text-[11px] font-medium text-destructive">{portErrorMessage}</p>
+                    )}
+                    {suggestedRemotePort && (
+                      <button
+                        type="button"
+                        className="text-[11px] font-medium text-primary hover:underline"
+                        onClick={() => {
+                          clearMutationFeedback();
+                          setRemotePort(suggestedRemotePort);
+                        }}
+                      >
+                        {t('tunnels.suggestionPrefix')}：{suggestedRemotePort}
+                      </button>
+                    )}
+                    {!isClientToClient && (
+                      <div className="mt-1.5 flex items-center gap-1.5 text-[11px] text-muted-foreground">
+                        <span>{t('tunnels.portRangeAllowed')}</span>
+                        <Badge variant="secondary" className="font-mono">
+                          {status?.allowed_ports === undefined
+                            ? t('common.loading')
+                            : formatPortRanges(status.allowed_ports)}
+                        </Badge>
+                      </div>
+                    )}
+                  </div>
                 )}
               </div>
-              <p className="col-span-2 text-[11px] text-muted-foreground">
+              <p className="text-[11px] text-muted-foreground">
                 {isClientToClient ? t('tunnels.targetHintClientToClient') : t('tunnels.targetHintServerExpose')}
               </p>
             </div>
@@ -853,11 +917,11 @@ function TunnelDialogForm({
                 {t('tunnels.httpDomainHelp')}
               </p>
             </div>
-          ) : (
+          ) : isSocks5 ? (
             <div className={cn('grid gap-3', isClientToClient ? 'grid-cols-2' : 'grid-cols-1')}>
               {isClientToClient && (
                 <div className="space-y-1.5">
-                  <label className="text-sm font-medium">{t('tunnels.bindAddress')}</label>
+                  <label className="block text-sm font-medium">{t('tunnels.bindAddress')}</label>
                   <Input
                     aria-label={t('tunnels.bindAddress')}
                     placeholder="0.0.0.0"
@@ -875,24 +939,20 @@ function TunnelDialogForm({
               )}
               <div className="space-y-1.5">
                 <label className="block text-sm font-medium">{isClientToClient ? t('tunnels.bindPort') : t('tunnels.publicPort')}</label>
-                <InputGroup className={isClientToClient ? '' : 'max-w-[220px]'}>
-                  <InputGroupAddon align="inline-start">
-                    <InputGroupText className="font-mono">:</InputGroupText>
-                  </InputGroupAddon>
-                  <InputGroupInput
-                    aria-label={isClientToClient ? t('tunnels.bindPort') : t('tunnels.publicPort')}
-                    type="number"
-                    placeholder="18080"
-                    value={remotePort}
-                    onChange={(e) => {
-                      clearMutationFeedback();
-                      setRemotePort(e.target.value);
-                    }}
-                    onBlur={validateRemotePortRange}
-                    min={1}
-                    max={65535}
-                  />
-                </InputGroup>
+                <Input
+                  className={isClientToClient ? undefined : 'max-w-[220px]'}
+                  aria-label={isClientToClient ? t('tunnels.bindPort') : t('tunnels.publicPort')}
+                  type="text"
+                  inputMode="numeric"
+                  pattern="[0-9]*"
+                  placeholder="18080"
+                  value={remotePort}
+                  onChange={(e) => {
+                    clearMutationFeedback();
+                    setRemotePort(e.target.value);
+                  }}
+                  onBlur={validateRemotePortRange}
+                />
                 <FieldErrorText error={fieldError} fields={['remote_port', 'ingress.config.port']} />
                 {remotePort && !parsedRemotePort && (
                   <p className="text-[11px] font-medium text-destructive">{portErrorMessage}</p>
@@ -921,7 +981,7 @@ function TunnelDialogForm({
                 )}
               </div>
             </div>
-          )}
+          ) : null}
         </div>
 
         <div className="rounded-lg border border-border bg-muted/20">
