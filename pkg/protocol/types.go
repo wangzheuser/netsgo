@@ -278,10 +278,11 @@ type SystemStats struct {
 
 // TunnelCapabilities 描述一条隧道当前允许执行的操作，由服务端计算并注入，仅用于前端展示
 type TunnelCapabilities struct {
-	CanResume bool `json:"can_resume"` // 是否可以启动
-	CanStop   bool `json:"can_stop"`   // 是否可以停止
-	CanEdit   bool `json:"can_edit"`   // 是否可以编辑
-	CanDelete bool `json:"can_delete"` // 是否可以删除
+	CanResume  bool `json:"can_resume"`  // 是否可以启动
+	CanStop    bool `json:"can_stop"`    // 是否可以停止
+	CanEdit    bool `json:"can_edit"`    // 是否可以编辑
+	CanDelete  bool `json:"can_delete"`  // 是否可以删除
+	CanMigrate bool `json:"can_migrate"` // 是否可以迁移目标 Client
 }
 
 // ProxyConfig 代理隧道的完整配置
@@ -356,6 +357,9 @@ const (
 	TunnelMutationErrorCodeUnknownClient              = "unknown_client"
 	TunnelMutationErrorCodeCapabilityNotSupported     = "capability_not_supported"
 	TunnelMutationErrorCodeSameIngressAndTargetClient = "same_ingress_and_target_client"
+	TunnelMutationErrorCodeSameTargetClient           = "same_target_client"
+	TunnelMutationErrorCodeTunnelPending              = "tunnel_pending"
+	TunnelMutationErrorCodeTunnelNameConflict         = "tunnel_name_conflict"
 	TunnelMutationErrorCodeInvalidBindIP              = "invalid_bind_ip"
 	TunnelMutationErrorCodeIngressResourceConflict    = "ingress_resource_conflict"
 	TunnelMutationErrorCodeIngressPreflightTimeout    = "ingress_preflight_timeout"

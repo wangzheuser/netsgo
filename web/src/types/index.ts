@@ -261,6 +261,7 @@ export interface TunnelCapabilities {
   can_stop: boolean;
   can_edit: boolean;
   can_delete: boolean;
+  can_migrate: boolean;
 }
 
 /** 对齐 protocol.ProxyConfig */
@@ -423,6 +424,15 @@ export interface TunnelCreateRequest {
 export interface TunnelUpdateRequest {
   expected_revision?: number;
   spec: TunnelCreateRequest;
+}
+
+export interface TunnelMigrateRequest {
+  expected_revision: number;
+  target_client_id: string;
+}
+
+export interface MigrateTunnelInput extends TunnelMigrateRequest {
+  tunnelId: string;
 }
 
 export interface TunnelMutationResponse {

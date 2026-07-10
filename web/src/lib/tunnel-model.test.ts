@@ -33,6 +33,7 @@ function createTunnel(overrides: Partial<ProxyConfig> = {}): ProxyConfig {
       can_stop: true,
       can_edit: false,
       can_delete: false,
+      can_migrate: false,
     },
     ...overrides,
   };
@@ -96,6 +97,7 @@ describe('tunnel-model', () => {
           can_stop: false,
           can_edit: true,
           can_delete: true,
+          can_migrate: true,
         },
       }),
     );
@@ -104,6 +106,27 @@ describe('tunnel-model', () => {
     expect(permissions.canStop).toBe(false);
     expect(permissions.canEdit).toBe(true);
     expect(permissions.canDelete).toBe(true);
+    expect(permissions.canMigrate).toBe(true);
+  });
+
+  test('动作能力要求 can_migrate 且不从编辑删除能力推导', () => {
+    const permissions = getTunnelActionAvailability(
+      createTunnel({
+        desired_state: 'running',
+        runtime_state: 'offline',
+        capabilities: {
+          can_resume: false,
+          can_stop: true,
+          can_edit: true,
+          can_delete: true,
+          can_migrate: false,
+        },
+      }),
+    );
+
+    expect(permissions.canEdit).toBe(true);
+    expect(permissions.canDelete).toBe(true);
+    expect(permissions.canMigrate).toBe(false);
   });
 
   test('缺失 capability projection 时立即失败，不再回退旧矩阵', () => {
@@ -113,10 +136,22 @@ describe('tunnel-model', () => {
     })).toThrow('Tunnel capabilities are required');
   });
 
+  test('requires can_migrate capability projection when normalizing actions', () => {
+    expect(() => getTunnelActionAvailability({
+      ...createTunnel(),
+      capabilities: {
+        can_resume: false,
+        can_stop: true,
+        can_edit: true,
+        can_delete: true,
+      },
+    })).toThrow('Tunnel capability "can_migrate" is required');
+  });
+
   test('capability projection 缺字段时立即失败', () => {
     expect(() => getTunnelActionAvailability({
       ...createTunnel(),
-      capabilities: {} as never,
+      capabilities: {},
     })).toThrow('Tunnel capability "can_resume" is required');
   });
 

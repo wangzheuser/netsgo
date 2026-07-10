@@ -5,7 +5,13 @@ import type { Client, ProxyConfig } from '@/types';
 
 import { applyEventForDiagnostics, createEventStreamSnapshotState } from './use-event-stream';
 
-function createDeferred<T>() {
+interface Deferred<T> {
+  promise: Promise<T>;
+  resolve: (value: T) => void;
+  reject: (reason?: unknown) => void;
+}
+
+function createDeferred<T>(): Deferred<T> {
   let resolve!: (value: T) => void;
   let reject!: (reason?: unknown) => void;
   const promise = new Promise<T>((res, rej) => {
@@ -15,7 +21,10 @@ function createDeferred<T>() {
   return { promise, resolve, reject };
 }
 
-function createTunnel(runtimeState: ProxyConfig['runtime_state']): ProxyConfig {
+function createTunnel(
+  runtimeState: ProxyConfig['runtime_state'],
+  overrides: Partial<ProxyConfig> = {},
+): ProxyConfig {
   return {
     id: 'tunnel-1',
     name: 'demo',
@@ -35,34 +44,44 @@ function createTunnel(runtimeState: ProxyConfig['runtime_state']): ProxyConfig {
       can_stop: runtimeState === 'exposed',
       can_edit: false,
       can_delete: runtimeState !== 'pending',
+      can_migrate: runtimeState !== 'pending',
     },
+    ...overrides,
   };
 }
 
-function createClient(runtimeState: ProxyConfig['runtime_state']): Client {
+function createClientWithTunnels(id: string, proxies: ProxyConfig[]): Client {
   return {
-    id: 'client-1',
+    id,
     ingress_bps: 0,
     egress_bps: 0,
     info: {
-      hostname: 'client-1',
+      hostname: id,
       os: 'linux',
       arch: 'amd64',
       ip: '127.0.0.1',
       version: 'v0.1.0',
     },
     stats: null,
-    proxies: [createTunnel(runtimeState)],
+    proxies,
     online: true,
   };
 }
 
-function tunnelChangedEvent(runtimeState: ProxyConfig['runtime_state'], action: string) {
+function createClient(runtimeState: ProxyConfig['runtime_state']): Client {
+  return createClientWithTunnels('client-1', [createTunnel(runtimeState)]);
+}
+
+function tunnelChangedPayload(clientId: string, action: string, tunnel: ProxyConfig) {
   return JSON.stringify({
-    client_id: 'client-1',
+    client_id: clientId,
     action,
-    tunnel: createTunnel(runtimeState),
+    tunnel,
   });
+}
+
+function tunnelChangedEvent(runtimeState: ProxyConfig['runtime_state'], action: string) {
+  return tunnelChangedPayload('client-1', action, createTunnel(runtimeState));
 }
 
 function snapshotPayload(runtimeState: ProxyConfig['runtime_state'], generatedAt?: string) {
@@ -74,6 +93,16 @@ function snapshotPayload(runtimeState: ProxyConfig['runtime_state'], generatedAt
 
 function snapshotResponse(runtimeState: ProxyConfig['runtime_state']) {
   return new Response(snapshotPayload(runtimeState), {
+    status: 200,
+    headers: { 'Content-Type': 'application/json' },
+  });
+}
+
+function clientsSnapshotResponse(
+  clients: Client[],
+  overrides: Record<string, unknown> = {},
+) {
+  return new Response(JSON.stringify({ clients, ...overrides }), {
     status: 200,
     headers: { 'Content-Type': 'application/json' },
   });
@@ -98,7 +127,7 @@ describe('use-event-stream diagnostics', () => {
     queryClient.setQueryData<Client[]>(['clients'], [createClient('pending')]);
 
     const originalFetch = globalThis.fetch;
-    const requests: ReturnType<typeof createDeferred<Response>>[] = [];
+    const requests: Deferred<Response>[] = [];
     globalThis.fetch = (() => {
       const deferred = createDeferred<Response>();
       requests.push(deferred);
@@ -155,6 +184,285 @@ describe('use-event-stream diagnostics', () => {
 
       expect(queryClient.getQueryData<Client[]>(['clients'])?.[0]?.proxies?.[0]?.runtime_state).toBe('exposed');
     } finally {
+      queryClient.clear();
+    }
+  });
+
+  test('moves a server-expose tunnel from the old owner to the new owner', async () => {
+    const queryClient = new QueryClient();
+    const oldOwnerId = 'old-owner';
+    const newOwnerId = 'new-owner';
+    const oldTunnel = createTunnel('exposed', {
+      revision: 7,
+      topology: 'server_expose',
+      client_id: oldOwnerId,
+      owner_client_id: oldOwnerId,
+      ingress: {
+        location: 'server',
+        type: 'tcp_listen',
+        config: { bind_ip: '0.0.0.0', port: 18080 },
+      },
+      target: {
+        location: 'client',
+        client_id: oldOwnerId,
+        type: 'tcp_service',
+        config: { host: '127.0.0.1', port: 3000 },
+      },
+    });
+    const migratedTunnel: ProxyConfig = {
+      ...oldTunnel,
+      revision: 8,
+      client_id: newOwnerId,
+      owner_client_id: newOwnerId,
+      runtime_state: 'pending',
+      target: {
+        location: 'client',
+        client_id: newOwnerId,
+        type: 'tcp_service',
+        config: { host: '127.0.0.1', port: 3000 },
+      },
+      capabilities: {
+        ...oldTunnel.capabilities,
+        can_stop: false,
+        can_migrate: false,
+      },
+    };
+    const finalClients = [
+      createClientWithTunnels(oldOwnerId, []),
+      createClientWithTunnels(newOwnerId, [migratedTunnel]),
+    ];
+    queryClient.setQueryData<Client[]>(['clients'], [
+      createClientWithTunnels(oldOwnerId, [oldTunnel]),
+      createClientWithTunnels(newOwnerId, []),
+    ]);
+
+    const originalFetch = globalThis.fetch;
+    const requests: Deferred<Response>[] = [];
+    globalThis.fetch = (() => {
+      const deferred = createDeferred<Response>();
+      requests.push(deferred);
+      return deferred.promise;
+    }) as typeof fetch;
+
+    try {
+      const snapshotState = createEventStreamSnapshotState();
+      applyEventForDiagnostics(
+        queryClient,
+        () => undefined,
+        snapshotState,
+        'tunnel_changed',
+        tunnelChangedPayload(oldOwnerId, 'migrated_out', oldTunnel),
+      );
+
+      let clients = queryClient.getQueryData<Client[]>(['clients']);
+      expect(clients?.find((client) => client.id === oldOwnerId)?.proxies).toEqual([]);
+      expect(clients?.find((client) => client.id === newOwnerId)?.proxies).toEqual([]);
+
+      applyEventForDiagnostics(
+        queryClient,
+        () => undefined,
+        snapshotState,
+        'tunnel_changed',
+        tunnelChangedPayload(newOwnerId, 'migrated_in', migratedTunnel),
+      );
+
+      clients = queryClient.getQueryData<Client[]>(['clients']);
+      expect(clients?.find((client) => client.id === oldOwnerId)?.proxies).toEqual([]);
+      expect(clients?.find((client) => client.id === newOwnerId)?.proxies).toEqual([migratedTunnel]);
+
+      await waitForRequests(requests, 2);
+      requests[0].resolve(clientsSnapshotResponse(finalClients));
+      requests[1].resolve(clientsSnapshotResponse(finalClients));
+      await flushAsyncWork();
+    } finally {
+      globalThis.fetch = originalFetch;
+      queryClient.clear();
+    }
+  });
+
+  test('keeps the c2c ingress copy on migrated_out and updates it on migrated_in', async () => {
+    const queryClient = new QueryClient();
+    const ingressId = 'ingress-client';
+    const oldOwnerId = 'old-target';
+    const newOwnerId = 'new-target';
+    const oldTunnel = createTunnel('active', {
+      revision: 11,
+      topology: 'client_to_client',
+      client_id: oldOwnerId,
+      owner_client_id: oldOwnerId,
+      ingress: {
+        location: 'client',
+        client_id: ingressId,
+        type: 'tcp_listen',
+        config: { bind_ip: '0.0.0.0', port: 18080 },
+      },
+      target: {
+        location: 'client',
+        client_id: oldOwnerId,
+        type: 'tcp_service',
+        config: { host: '127.0.0.1', port: 3000 },
+      },
+    });
+    const migratedTunnel: ProxyConfig = {
+      ...oldTunnel,
+      revision: 12,
+      client_id: newOwnerId,
+      owner_client_id: newOwnerId,
+      runtime_state: 'pending',
+      target: {
+        location: 'client',
+        client_id: newOwnerId,
+        type: 'tcp_service',
+        config: { host: '127.0.0.1', port: 3000 },
+      },
+      capabilities: {
+        ...oldTunnel.capabilities,
+        can_stop: false,
+        can_migrate: false,
+      },
+    };
+    const finalClients = [
+      createClientWithTunnels(ingressId, [migratedTunnel]),
+      createClientWithTunnels(oldOwnerId, []),
+      createClientWithTunnels(newOwnerId, [migratedTunnel]),
+    ];
+    queryClient.setQueryData<Client[]>(['clients'], [
+      createClientWithTunnels(ingressId, [oldTunnel]),
+      createClientWithTunnels(oldOwnerId, [oldTunnel]),
+      createClientWithTunnels(newOwnerId, []),
+    ]);
+    queryClient.setQueryData(['client-tunnels', oldOwnerId, 'owner'], [oldTunnel]);
+    queryClient.setQueryData(['client-tunnels', newOwnerId, 'owner'], []);
+    queryClient.setQueryData(['client-tunnels', ingressId, 'ingress'], [oldTunnel]);
+    queryClient.setQueryData(['client-traffic', oldOwnerId, '60s', ''], { resolution: 'second', items: [] });
+    queryClient.setQueryData(['client-traffic', newOwnerId, '60s', 'demo'], { resolution: 'second', items: [] });
+    queryClient.setQueryData(['console-summary'], { marker: 'stale-summary' });
+    queryClient.setQueryData(['server-status'], { marker: 'stale-status' });
+
+    const originalFetch = globalThis.fetch;
+    const requests: Deferred<Response>[] = [];
+    globalThis.fetch = (() => {
+      const deferred = createDeferred<Response>();
+      requests.push(deferred);
+      return deferred.promise;
+    }) as typeof fetch;
+
+    try {
+      const snapshotState = createEventStreamSnapshotState();
+      applyEventForDiagnostics(
+        queryClient,
+        () => undefined,
+        snapshotState,
+        'tunnel_changed',
+        tunnelChangedPayload(oldOwnerId, 'migrated_out', oldTunnel),
+      );
+
+      let clients = queryClient.getQueryData<Client[]>(['clients']);
+      expect(clients?.find((client) => client.id === oldOwnerId)?.proxies).toEqual([]);
+      expect(clients?.find((client) => client.id === ingressId)?.proxies).toEqual([oldTunnel]);
+
+      applyEventForDiagnostics(
+        queryClient,
+        () => undefined,
+        snapshotState,
+        'tunnel_changed',
+        tunnelChangedPayload(newOwnerId, 'migrated_in', migratedTunnel),
+      );
+
+      clients = queryClient.getQueryData<Client[]>(['clients']);
+      expect(clients?.find((client) => client.id === oldOwnerId)?.proxies).toEqual([]);
+      expect(clients?.find((client) => client.id === ingressId)?.proxies).toEqual([migratedTunnel]);
+      expect(clients?.find((client) => client.id === newOwnerId)?.proxies).toEqual([migratedTunnel]);
+      expect(queryClient.getQueryState(['client-tunnels', oldOwnerId, 'owner'])?.isInvalidated).toBe(true);
+      expect(queryClient.getQueryState(['client-tunnels', newOwnerId, 'owner'])?.isInvalidated).toBe(true);
+      expect(queryClient.getQueryState(['client-tunnels', ingressId, 'ingress'])?.isInvalidated).toBe(true);
+      expect(queryClient.getQueryState(['client-traffic', oldOwnerId, '60s', ''])?.isInvalidated).toBe(true);
+      expect(queryClient.getQueryState(['client-traffic', newOwnerId, '60s', 'demo'])?.isInvalidated).toBe(true);
+      expect(queryClient.getQueryData(['console-summary'])).toEqual({ marker: 'stale-summary' });
+      expect(queryClient.getQueryData(['server-status'])).toEqual({ marker: 'stale-status' });
+      expect(queryClient.getQueryState(['console-summary'])?.isInvalidated).toBe(false);
+      expect(queryClient.getQueryState(['server-status'])?.isInvalidated).toBe(false);
+
+      await waitForRequests(requests, 2);
+      requests[0].resolve(clientsSnapshotResponse(finalClients));
+      requests[1].resolve(clientsSnapshotResponse(finalClients));
+      await flushAsyncWork();
+    } finally {
+      globalThis.fetch = originalFetch;
+      queryClient.clear();
+    }
+  });
+
+  test('ignores a stale migrated_out resync failure after migrated_in resync succeeds', async () => {
+    const queryClient = new QueryClient();
+    const oldOwnerId = 'old-owner';
+    const newOwnerId = 'new-owner';
+    const oldTunnel = createTunnel('exposed', {
+      client_id: oldOwnerId,
+      owner_client_id: oldOwnerId,
+    });
+    const migratedTunnel = createTunnel('pending', {
+      ...oldTunnel,
+      client_id: newOwnerId,
+      owner_client_id: newOwnerId,
+    });
+    const finalClients = [
+      createClientWithTunnels(oldOwnerId, []),
+      createClientWithTunnels(newOwnerId, [migratedTunnel]),
+    ];
+    queryClient.setQueryData<Client[]>(['clients'], [
+      createClientWithTunnels(oldOwnerId, [oldTunnel]),
+      createClientWithTunnels(newOwnerId, []),
+    ]);
+    queryClient.setQueryData(['console-summary'], { marker: 'fresh-summary' });
+    queryClient.setQueryData(['server-status'], { marker: 'fresh-status' });
+
+    const originalFetch = globalThis.fetch;
+    const requests: Deferred<Response>[] = [];
+    globalThis.fetch = (() => {
+      const deferred = createDeferred<Response>();
+      requests.push(deferred);
+      return deferred.promise;
+    }) as typeof fetch;
+
+    try {
+      const statuses: string[] = [];
+      const snapshotState = createEventStreamSnapshotState();
+      applyEventForDiagnostics(
+        queryClient,
+        (status) => statuses.push(status),
+        snapshotState,
+        'tunnel_changed',
+        tunnelChangedPayload(oldOwnerId, 'migrated_out', oldTunnel),
+      );
+      applyEventForDiagnostics(
+        queryClient,
+        (status) => statuses.push(status),
+        snapshotState,
+        'tunnel_changed',
+        tunnelChangedPayload(newOwnerId, 'migrated_in', migratedTunnel),
+      );
+
+      requests[1].resolve(clientsSnapshotResponse(finalClients, {
+        summary: { marker: 'fresh-summary' },
+        server_status: { marker: 'fresh-status' },
+      }));
+      await flushAsyncWork();
+      requests[0].reject(new Error('stale migrated_out resync failed'));
+      await flushAsyncWork();
+
+      expect(queryClient.getQueryData<Client[]>(['clients'])).toEqual(finalClients);
+      expect(queryClient.getQueryData(['console-summary'])).toEqual({ marker: 'fresh-summary' });
+      expect(queryClient.getQueryData(['server-status'])).toEqual({
+        marker: 'fresh-status',
+        summary: { marker: 'fresh-summary' },
+      });
+      expect(queryClient.getQueryState(['clients'])?.isInvalidated).toBe(false);
+      expect(queryClient.getQueryState(['console-summary'])?.isInvalidated).toBe(false);
+      expect(queryClient.getQueryState(['server-status'])?.isInvalidated).toBe(false);
+      expect(statuses).toEqual(['connected']);
+    } finally {
+      globalThis.fetch = originalFetch;
       queryClient.clear();
     }
   });

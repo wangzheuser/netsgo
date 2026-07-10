@@ -21,6 +21,7 @@ const capabilities: TunnelCapabilities = {
   can_stop: true,
   can_edit: true,
   can_delete: true,
+  can_migrate: true,
 };
 
 function createTunnel(overrides: Partial<ProxyConfig> = {}): ProxyConfig {

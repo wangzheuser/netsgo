@@ -24,6 +24,7 @@ function createTunnel(overrides: Partial<ProxyConfig> = {}): ProxyConfig {
       can_stop: true,
       can_edit: false,
       can_delete: false,
+      can_migrate: true,
     },
     ...overrides,
   };

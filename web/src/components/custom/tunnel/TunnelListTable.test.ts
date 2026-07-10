@@ -3,7 +3,12 @@ import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { createElement } from 'react';
 import { renderToStaticMarkup } from 'react-dom/server';
 
-import type { ProxyConfig } from '@/types';
+import type { Client, ProxyConfig } from '@/types';
+import {
+  buildTunnelMigrationInput,
+  getLatestTunnelMigrationTarget,
+  getTunnelMigrationCandidates,
+} from '@/lib/tunnel-migration';
 
 import { TunnelListTable, type TunnelEntry } from './TunnelListTable';
 
@@ -27,6 +32,7 @@ function createTunnel(overrides: Partial<ProxyConfig> = {}): TunnelEntry {
       can_stop: true,
       can_edit: false,
       can_delete: false,
+      can_migrate: true,
     },
     clientId: 'client-1',
     clientOnline: true,
@@ -34,7 +40,19 @@ function createTunnel(overrides: Partial<ProxyConfig> = {}): TunnelEntry {
   };
 }
 
-function renderTable(tunnels: TunnelEntry[]) {
+function createClient(id: string): Client {
+  return {
+    id,
+    ingress_bps: 0,
+    egress_bps: 0,
+    info: { hostname: id, os: 'linux', arch: 'amd64', ip: '127.0.0.1', version: 'dev' },
+    stats: null,
+    proxies: [],
+    online: true,
+  };
+}
+
+function renderTable(tunnels: TunnelEntry[], clients?: Client[]) {
   const client = new QueryClient();
   return renderToStaticMarkup(
     createElement(
@@ -42,6 +60,7 @@ function renderTable(tunnels: TunnelEntry[]) {
       { client },
       createElement(TunnelListTable, {
         tunnels,
+        clients,
         title: 'Child tunnels',
         showActions: true,
         showSearch: false,
@@ -59,6 +78,7 @@ describe('TunnelListTable', () => {
           can_stop: false,
           can_edit: true,
           can_delete: true,
+          can_migrate: true,
         },
       }),
     ]);
@@ -78,6 +98,71 @@ describe('TunnelListTable', () => {
     expect(markup).not.toContain('lucide-square');
     expect(markup).not.toContain('group-hover:opacity-100');
     expect(markup).not.toContain('opacity-0');
+  });
+
+  test('仅在 can_migrate 且存在候选客户端时显示迁移动作', () => {
+    const clients = [createClient('client-1'), createClient('client-2')];
+    const enabledMarkup = renderTable([createTunnel()], clients);
+    const disabledMarkup = renderTable([createTunnel({
+      capabilities: {
+        can_resume: false,
+        can_stop: true,
+        can_edit: false,
+        can_delete: false,
+        can_migrate: false,
+      },
+    })], clients);
+    const noCandidateMarkup = renderTable([createTunnel()], [createClient('client-1')]);
+
+    expect(enabledMarkup).toContain('title="Migrate tunnel"');
+    expect(disabledMarkup).not.toContain('title="Migrate tunnel"');
+    expect(noCandidateMarkup).not.toContain('title="Migrate tunnel"');
+  });
+
+  test('迁移窗口按稳定 ID 使用刷新后的 revision 与目标节点', () => {
+    const initialTunnel = createTunnel({
+      revision: 4,
+      owner_client_id: 'target-old',
+      target: {
+        location: 'client',
+        client_id: 'target-old',
+        type: 'tcp_service',
+        config: { ip: '127.0.0.1', port: 3000 },
+      },
+    });
+    const refreshedTunnel = createTunnel({
+      revision: 9,
+      owner_client_id: 'target-new',
+      target: {
+        location: 'client',
+        client_id: 'target-new',
+        type: 'tcp_service',
+        config: { ip: '127.0.0.1', port: 4000 },
+      },
+    });
+    const clients = [
+      createClient('target-old'),
+      createClient('target-new'),
+      createClient('target-next'),
+    ];
+
+    const migrateTarget = getLatestTunnelMigrationTarget([refreshedTunnel], initialTunnel.id);
+
+    expect(migrateTarget).toBe(refreshedTunnel);
+    expect(migrateTarget?.revision).toBe(9);
+    expect(migrateTarget?.target).toEqual(refreshedTunnel.target);
+    expect(getTunnelMigrationCandidates(migrateTarget, clients).map((client) => client.id))
+      .toEqual(['target-old', 'target-next']);
+    expect(buildTunnelMigrationInput(migrateTarget, 'target-new', clients)).toBeNull();
+    expect(buildTunnelMigrationInput(migrateTarget, 'target-next', clients)).toEqual({
+      tunnelId: refreshedTunnel.id,
+      expected_revision: 9,
+      target_client_id: 'target-next',
+    });
+  });
+
+  test('迁移中的隧道从刷新列表消失时派生为空', () => {
+    expect(getLatestTunnelMigrationTarget([], 'tunnel-1')).toBeNull();
   });
 
   test('缺失 capability projection 时渲染直接失败', () => {
@@ -321,6 +406,7 @@ describe('TunnelListTable', () => {
               can_stop: false,
               can_edit: true,
               can_delete: true,
+              can_migrate: true,
             },
           })],
           title: 'Child tunnels',

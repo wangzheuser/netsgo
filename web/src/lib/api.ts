@@ -12,6 +12,7 @@ import type {
   ProxyConfig,
   TunnelClientRole,
   TunnelCreateRequest,
+  TunnelMigrateRequest,
   TunnelMutationResponse,
   TunnelUpdateRequest,
 } from '@/types';
@@ -173,6 +174,10 @@ export const tunnelApi = {
 
   update(tunnelId: string, body: TunnelUpdateRequest) {
     return api.put<TunnelMutationResponse>(`/api/tunnels/${encodePath(tunnelId)}`, body);
+  },
+
+  migrate(tunnelId: string, body: TunnelMigrateRequest) {
+    return api.post<TunnelMutationResponse>(`/api/tunnels/${encodePath(tunnelId)}/migrate`, body);
   },
 
   resume(tunnelId: string) {

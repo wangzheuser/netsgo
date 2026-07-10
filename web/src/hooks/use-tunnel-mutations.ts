@@ -1,14 +1,15 @@
-import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
+import { useMutation, useQuery, useQueryClient, type QueryClient } from '@tanstack/react-query';
 import { tunnelApi } from '@/lib/api';
 import {
   buildClientToClientTunnelSpecCreateRequest,
   buildTunnelSpecCreateRequest,
 } from '@/lib/tunnel-model';
-import type { CreateTunnelInput, TunnelClientRole, TunnelTopology, UpdateTunnelInput } from '@/types';
+import type { CreateTunnelInput, MigrateTunnelInput, TunnelClientRole, TunnelTopology, UpdateTunnelInput } from '@/types';
 
-function invalidateTunnelQueries(queryClient: ReturnType<typeof useQueryClient>) {
+export function invalidateTunnelQueries(queryClient: QueryClient) {
   queryClient.invalidateQueries({ queryKey: ['clients'] });
   queryClient.invalidateQueries({ queryKey: ['client-tunnels'] });
+	queryClient.invalidateQueries({ queryKey: ['client-traffic'] });
   queryClient.invalidateQueries({ queryKey: ['console-summary'] });
   queryClient.invalidateQueries({ queryKey: ['server-status'] });
 }
@@ -127,4 +128,18 @@ export function useUpdateTunnel() {
 			invalidateTunnelQueries(queryClient);
 		},
   });
+}
+
+export function useMigrateTunnel() {
+  const queryClient = useQueryClient();
+
+	return useMutation({
+		mutationFn: ({ tunnelId, expected_revision, target_client_id }: MigrateTunnelInput) => tunnelApi.migrate(tunnelId, {
+			expected_revision,
+			target_client_id,
+		}),
+		onSuccess: () => {
+			invalidateTunnelQueries(queryClient);
+		},
+	});
 }

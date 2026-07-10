@@ -7,6 +7,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -29,6 +30,7 @@ const (
 
 type TrafficDelta struct {
 	TunnelID        string
+	Revision        int64
 	ClientID        string
 	OwnerClientID   string
 	IngressClientID string
@@ -94,9 +96,11 @@ type TrafficStore struct {
 	closeOnce sync.Once
 	closeErr  error
 
-	realtimeSecond *realtimeSecondIndex
-	pendingMinute  map[string]TrafficBucket
-	pendingErr     error
+	realtimeSecond          *realtimeSecondIndex
+	pendingMinute           map[string]TrafficBucket
+	pendingErr              error
+	minimumRevisionByTunnel map[string]int64
+	accumulator             atomic.Pointer[trafficAccumulator]
 
 	failSaveErr   error
 	failSaveCount int
@@ -114,12 +118,20 @@ func NewTrafficStore(path string) (*TrafficStore, error) {
 // When closeDB is false the caller retains DB ownership.
 func newTrafficStoreWithDB(path string, db *sql.DB, closeDB bool) *TrafficStore {
 	return &TrafficStore{
-		path:           path,
-		db:             db,
-		closeDB:        closeDB,
-		realtimeSecond: newRealtimeSecondIndex(),
-		pendingMinute:  make(map[string]TrafficBucket),
+		path:                    path,
+		db:                      db,
+		closeDB:                 closeDB,
+		realtimeSecond:          newRealtimeSecondIndex(),
+		pendingMinute:           make(map[string]TrafficBucket),
+		minimumRevisionByTunnel: make(map[string]int64),
 	}
+}
+
+func (s *TrafficStore) attachAccumulator(accumulator *trafficAccumulator) {
+	if s == nil || accumulator == nil {
+		return
+	}
+	s.accumulator.CompareAndSwap(nil, accumulator)
 }
 
 func (s *TrafficStore) Close() error {
@@ -157,6 +169,9 @@ func (s *TrafficStore) ApplyDeltas(deltas []TrafficDelta) {
 
 	var newestSecond int64
 	for _, delta := range deltas {
+		if minimumRevision := s.minimumRevisionByTunnel[delta.TunnelID]; minimumRevision > 0 && delta.Revision < minimumRevision {
+			continue
+		}
 		if delta.ClientID == "" || delta.TunnelName == "" || delta.TunnelType == "" {
 			continue
 		}
@@ -222,6 +237,47 @@ func (s *TrafficStore) ApplyDeltas(deltas []TrafficDelta) {
 	}
 	if newestSecond != 0 {
 		s.pruneRealtimeLocked(time.Unix(newestSecond, 0).UTC())
+	}
+}
+
+// resetTunnelAfterMigrationLocked clears in-memory observations for a migrated
+// tunnel and rejects traffic produced by an older tunnel specification. The
+// caller must hold s.mu while the tunnel migration transaction commits so a
+// concurrent flush cannot persist stale observations after the SQL delete.
+func (s *TrafficStore) resetTunnelAfterMigrationLocked(tunnelID string, minimumRevision int64) {
+	if s == nil || tunnelID == "" || minimumRevision <= 0 {
+		return
+	}
+	if current := s.minimumRevisionByTunnel[tunnelID]; current >= minimumRevision {
+		return
+	}
+
+	if s.minimumRevisionByTunnel == nil {
+		s.minimumRevisionByTunnel = make(map[string]int64)
+	}
+	if accumulator := s.accumulator.Load(); accumulator != nil {
+		accumulator.ResetTunnel(tunnelID, minimumRevision)
+	}
+	s.minimumRevisionByTunnel[tunnelID] = minimumRevision
+	for key, bucket := range s.pendingMinute {
+		if bucket.TunnelID == tunnelID {
+			delete(s.pendingMinute, key)
+		}
+	}
+	if s.realtimeSecond != nil {
+		for clientID, seriesByClient := range s.realtimeSecond.byClient {
+			for key := range seriesByClient {
+				if key.TunnelID == tunnelID {
+					delete(seriesByClient, key)
+				}
+			}
+			if len(seriesByClient) == 0 {
+				delete(s.realtimeSecond.byClient, clientID)
+			}
+		}
+	}
+	if len(s.pendingMinute) == 0 {
+		s.pendingErr = nil
 	}
 }
 

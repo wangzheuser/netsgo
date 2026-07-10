@@ -1,6 +1,7 @@
 package server
 
 import (
+	"bytes"
 	"encoding/binary"
 	"fmt"
 	"io"
@@ -15,17 +16,105 @@ import (
 	"netsgo/internal/socks5wire"
 )
 
-func TestUnifiedServerExposeSOCKS5EndToEndWithRealClient(t *testing.T) {
+func newUnifiedE2ETestServer(t *testing.T) *Server {
+	t.Helper()
+
 	s := New(0)
 	initTestAdminStore(t, s)
-	s.store = newTestTunnelStore(t)
+
+	var err error
+	s.store, err = newTunnelStoreWithDB(s.auth.adminStore.path, s.auth.adminStore.db, false)
+	if err != nil {
+		t.Fatalf("failed to create shared TunnelStore: %v", err)
+	}
+	return s
+}
+
+func TestUnifiedServerExposeTCPEndToEndWithRealClient(t *testing.T) {
+	s := newUnifiedE2ETestServer(t)
+	ts := newIPv4HTTPTestServer(t, s.newHTTPMux())
+	defer ts.Close()
+	token := loginAdminTokenLocal(t, s.StartHTTPOnly(), "admin", "password123")
+
+	targetAddr, targetPort := startTestTCPEchoService(t)
+	targetClient := startUnifiedE2EClient(t, s, ts.URL, "install-e2e-server-tcp-target")
+	newTargetClient := startUnifiedE2EClient(t, s, ts.URL, "install-e2e-server-tcp-target-new")
+	targetID := waitForUnifiedE2EClientReady(t, s, targetClient)
+	newTargetID := waitForUnifiedE2EClientReady(t, s, newTargetClient)
+	ingressPort := reserveTCPPort(t)
+
+	create := []byte(fmt.Sprintf(`{
+		"name":"e2e-server-tcp",
+		"topology":"server_expose",
+		"ingress":{"location":"server","type":"tcp_listen","config":{"bind_ip":"127.0.0.1","port":%d,"allowed_source_cidrs":["127.0.0.0/8"]}},
+		"target":{"location":"client","client_id":"%s","type":"tcp_service","config":{"ip":"%s","port":%d}},
+		"transport_policy":"server_relay_only"
+	}`, ingressPort, targetID, targetAddr, targetPort))
+	resp := doMuxRequest(t, s.StartHTTPOnly(), http.MethodPost, "/api/tunnels", token, create)
+	if resp.Code != http.StatusCreated {
+		t.Fatalf("server_expose TCP create: want 201, got %d body=%s", resp.Code, resp.Body.String())
+	}
+	var created tunnelSpecAPI
+	if err := mustDecodeJSON(t, resp.Body, &created); err != nil {
+		t.Fatalf("decode created tunnel: %v", err)
+	}
+	waitForUnifiedTunnelRuntimeState(t, s, token, created.ID, tunnelRuntimeStateActive)
+
+	assertUnifiedTCPEcho(t, ingressPort, []byte("server-expose tcp payload"))
+	migrated := migrateUnifiedE2ETunnel(t, s, token, created.ID, created.Revision, newTargetID)
+	waitForUnifiedTunnelRuntimeState(t, s, token, created.ID, tunnelRuntimeStateActive)
+	assertUnifiedE2EMigrationIdentity(t, created, migrated, newTargetID)
+	assertUnifiedTCPEcho(t, ingressPort, []byte("server-expose migrated tcp payload"))
+}
+
+func TestUnifiedServerExposeUDPEndToEndWithRealClient(t *testing.T) {
+	s := newUnifiedE2ETestServer(t)
+	ts := newIPv4HTTPTestServer(t, s.newHTTPMux())
+	defer ts.Close()
+	token := loginAdminTokenLocal(t, s.StartHTTPOnly(), "admin", "password123")
+
+	targetAddr, targetPort := startTestUDPEchoService(t)
+	targetClient := startUnifiedE2EClient(t, s, ts.URL, "install-e2e-server-udp-target")
+	newTargetClient := startUnifiedE2EClient(t, s, ts.URL, "install-e2e-server-udp-target-new")
+	targetID := waitForUnifiedE2EClientReady(t, s, targetClient)
+	newTargetID := waitForUnifiedE2EClientReady(t, s, newTargetClient)
+	ingressPort := reserveUDPPort(t)
+
+	create := []byte(fmt.Sprintf(`{
+		"name":"e2e-server-udp",
+		"topology":"server_expose",
+		"ingress":{"location":"server","type":"udp_listen","config":{"bind_ip":"127.0.0.1","port":%d,"allowed_source_cidrs":["127.0.0.0/8"]}},
+		"target":{"location":"client","client_id":"%s","type":"udp_service","config":{"ip":"%s","port":%d}},
+		"transport_policy":"server_relay_only"
+	}`, ingressPort, targetID, targetAddr, targetPort))
+	resp := doMuxRequest(t, s.StartHTTPOnly(), http.MethodPost, "/api/tunnels", token, create)
+	if resp.Code != http.StatusCreated {
+		t.Fatalf("server_expose UDP create: want 201, got %d body=%s", resp.Code, resp.Body.String())
+	}
+	var created tunnelSpecAPI
+	if err := mustDecodeJSON(t, resp.Body, &created); err != nil {
+		t.Fatalf("decode created tunnel: %v", err)
+	}
+	waitForUnifiedTunnelRuntimeState(t, s, token, created.ID, tunnelRuntimeStateActive)
+
+	assertUnifiedUDPEcho(t, ingressPort, []byte("server-expose udp payload"))
+	migrated := migrateUnifiedE2ETunnel(t, s, token, created.ID, created.Revision, newTargetID)
+	waitForUnifiedTunnelRuntimeState(t, s, token, created.ID, tunnelRuntimeStateActive)
+	assertUnifiedE2EMigrationIdentity(t, created, migrated, newTargetID)
+	assertUnifiedUDPEcho(t, ingressPort, []byte("server-expose migrated udp payload"))
+}
+
+func TestUnifiedServerExposeSOCKS5EndToEndWithRealClient(t *testing.T) {
+	s := newUnifiedE2ETestServer(t)
 	ts := newIPv4HTTPTestServer(t, s.newHTTPMux())
 	defer ts.Close()
 	token := loginAdminTokenLocal(t, s.StartHTTPOnly(), "admin", "password123")
 
 	targetAddr, targetPort := startTestTCPEchoService(t)
 	targetClient := startUnifiedE2EClient(t, s, ts.URL, "install-e2e-server-socks5-target")
+	newTargetClient := startUnifiedE2EClient(t, s, ts.URL, "install-e2e-server-socks5-target-new")
 	targetID := waitForUnifiedE2EClientReady(t, s, targetClient)
+	newTargetID := waitForUnifiedE2EClientReady(t, s, newTargetClient)
 	ingressPort := reserveTCPPort(t)
 
 	create := []byte(fmt.Sprintf(`{
@@ -59,20 +148,28 @@ func TestUnifiedServerExposeSOCKS5EndToEndWithRealClient(t *testing.T) {
 	conn := dialSOCKS5ConnectNoAuth(t, net.JoinHostPort("127.0.0.1", strconv.Itoa(ingressPort)), targetAddr, targetPort)
 	defer func() { _ = conn.Close() }()
 	assertSOCKS5Echo(t, conn, []byte("server-expose socks5 payload"))
+	_ = conn.Close()
+
+	migrated := migrateUnifiedE2ETunnel(t, s, token, created.ID, created.Revision, newTargetID)
+	waitForUnifiedTunnelRuntimeState(t, s, token, created.ID, tunnelRuntimeStateActive)
+	assertUnifiedE2EMigrationIdentity(t, created, migrated, newTargetID)
+	migratedConn := dialSOCKS5ConnectNoAuth(t, net.JoinHostPort("127.0.0.1", strconv.Itoa(ingressPort)), targetAddr, targetPort)
+	defer func() { _ = migratedConn.Close() }()
+	assertSOCKS5Echo(t, migratedConn, []byte("server-expose socks5 migrated payload"))
 }
 
 func TestUnifiedClientToClientTCPEndToEndWithRealClients(t *testing.T) {
-	s := New(0)
-	initTestAdminStore(t, s)
-	s.store = newTestTunnelStore(t)
+	s := newUnifiedE2ETestServer(t)
 	ts := newIPv4HTTPTestServer(t, s.newHTTPMux())
 	defer ts.Close()
 	token := loginAdminTokenLocal(t, s.StartHTTPOnly(), "admin", "password123")
 
 	targetAddr, targetPort := startTestTCPEchoService(t)
 	targetClient := startUnifiedE2EClient(t, s, ts.URL, "install-e2e-c2c-target")
+	newTargetClient := startUnifiedE2EClient(t, s, ts.URL, "install-e2e-c2c-target-new")
 	ingressClient := startUnifiedE2EClient(t, s, ts.URL, "install-e2e-c2c-ingress")
 	targetID := waitForUnifiedE2EClientReady(t, s, targetClient)
+	newTargetID := waitForUnifiedE2EClientReady(t, s, newTargetClient)
 	ingressID := waitForUnifiedE2EClientReady(t, s, ingressClient)
 	ingressPort := reserveTCPPort(t)
 
@@ -113,20 +210,44 @@ func TestUnifiedClientToClientTCPEndToEndWithRealClients(t *testing.T) {
 	if string(got) != string(payload) {
 		t.Fatalf("echoed payload mismatch: got %q want %q", got, payload)
 	}
+	_ = conn.Close()
+
+	migrated := migrateUnifiedE2ETunnel(t, s, token, created.ID, created.Revision, newTargetID)
+	assertUnifiedE2EMigrationIdentity(t, created, migrated, newTargetID)
+	waitForUnifiedTunnelRuntimeState(t, s, token, created.ID, tunnelRuntimeStateActive)
+	migratedConn, err := net.DialTimeout("tcp", net.JoinHostPort("127.0.0.1", strconv.Itoa(ingressPort)), 2*time.Second)
+	if err != nil {
+		t.Fatalf("dial migrated client ingress listener: %v", err)
+	}
+	defer func() { _ = migratedConn.Close() }()
+	if err := migratedConn.SetDeadline(time.Now().Add(2 * time.Second)); err != nil {
+		t.Fatalf("set migrated client ingress deadline: %v", err)
+	}
+	migratedPayload := []byte("client-to-client migrated tcp payload")
+	if _, err := migratedConn.Write(migratedPayload); err != nil {
+		t.Fatalf("write migrated ingress payload: %v", err)
+	}
+	migratedGot := make([]byte, len(migratedPayload))
+	if _, err := io.ReadFull(migratedConn, migratedGot); err != nil {
+		t.Fatalf("read migrated echoed payload: %v", err)
+	}
+	if string(migratedGot) != string(migratedPayload) {
+		t.Fatalf("migrated echoed payload mismatch: got %q want %q", migratedGot, migratedPayload)
+	}
 }
 
 func TestUnifiedClientToClientSOCKS5EndToEndWithRealClients(t *testing.T) {
-	s := New(0)
-	initTestAdminStore(t, s)
-	s.store = newTestTunnelStore(t)
+	s := newUnifiedE2ETestServer(t)
 	ts := newIPv4HTTPTestServer(t, s.newHTTPMux())
 	defer ts.Close()
 	token := loginAdminTokenLocal(t, s.StartHTTPOnly(), "admin", "password123")
 
 	targetAddr, targetPort := startTestTCPEchoService(t)
 	targetClient := startUnifiedE2EClient(t, s, ts.URL, "install-e2e-c2c-socks5-target")
+	newTargetClient := startUnifiedE2EClient(t, s, ts.URL, "install-e2e-c2c-socks5-target-new")
 	ingressClient := startUnifiedE2EClient(t, s, ts.URL, "install-e2e-c2c-socks5-ingress")
 	targetID := waitForUnifiedE2EClientReady(t, s, targetClient)
+	newTargetID := waitForUnifiedE2EClientReady(t, s, newTargetClient)
 	ingressID := waitForUnifiedE2EClientReady(t, s, ingressClient)
 	ingressPort := reserveTCPPort(t)
 
@@ -160,20 +281,28 @@ func TestUnifiedClientToClientSOCKS5EndToEndWithRealClients(t *testing.T) {
 	conn := dialSOCKS5ConnectNoAuth(t, net.JoinHostPort("127.0.0.1", strconv.Itoa(ingressPort)), targetAddr, targetPort)
 	defer func() { _ = conn.Close() }()
 	assertSOCKS5Echo(t, conn, []byte("client-to-client socks5 payload"))
+	_ = conn.Close()
+
+	migrated := migrateUnifiedE2ETunnel(t, s, token, created.ID, created.Revision, newTargetID)
+	assertUnifiedE2EMigrationIdentity(t, created, migrated, newTargetID)
+	waitForUnifiedTunnelRuntimeState(t, s, token, created.ID, tunnelRuntimeStateActive)
+	migratedConn := dialSOCKS5ConnectNoAuth(t, net.JoinHostPort("127.0.0.1", strconv.Itoa(ingressPort)), targetAddr, targetPort)
+	defer func() { _ = migratedConn.Close() }()
+	assertSOCKS5Echo(t, migratedConn, []byte("client-to-client socks5 migrated payload"))
 }
 
 func TestUnifiedClientToClientUDPEndToEndWithRealClients(t *testing.T) {
-	s := New(0)
-	initTestAdminStore(t, s)
-	s.store = newTestTunnelStore(t)
+	s := newUnifiedE2ETestServer(t)
 	ts := newIPv4HTTPTestServer(t, s.newHTTPMux())
 	defer ts.Close()
 	token := loginAdminTokenLocal(t, s.StartHTTPOnly(), "admin", "password123")
 
 	targetAddr, targetPort := startTestUDPEchoService(t)
 	targetClient := startUnifiedE2EClient(t, s, ts.URL, "install-e2e-c2c-udp-target")
+	newTargetClient := startUnifiedE2EClient(t, s, ts.URL, "install-e2e-c2c-udp-target-new")
 	ingressClient := startUnifiedE2EClient(t, s, ts.URL, "install-e2e-c2c-udp-ingress")
 	targetID := waitForUnifiedE2EClientReady(t, s, targetClient)
+	newTargetID := waitForUnifiedE2EClientReady(t, s, newTargetClient)
 	ingressID := waitForUnifiedE2EClientReady(t, s, ingressClient)
 	ingressPort := reserveUDPPort(t)
 
@@ -214,6 +343,107 @@ func TestUnifiedClientToClientUDPEndToEndWithRealClients(t *testing.T) {
 	}
 	if string(got[:n]) != string(payload) {
 		t.Fatalf("echoed UDP payload mismatch: got %q want %q", got[:n], payload)
+	}
+	_ = conn.Close()
+
+	migrated := migrateUnifiedE2ETunnel(t, s, token, created.ID, created.Revision, newTargetID)
+	assertUnifiedE2EMigrationIdentity(t, created, migrated, newTargetID)
+	waitForUnifiedTunnelRuntimeState(t, s, token, created.ID, tunnelRuntimeStateActive)
+	migratedConn, err := net.DialTimeout("udp", net.JoinHostPort("127.0.0.1", strconv.Itoa(ingressPort)), 2*time.Second)
+	if err != nil {
+		t.Fatalf("dial migrated client UDP ingress listener: %v", err)
+	}
+	defer func() { _ = migratedConn.Close() }()
+	if err := migratedConn.SetDeadline(time.Now().Add(2 * time.Second)); err != nil {
+		t.Fatalf("set migrated UDP ingress deadline: %v", err)
+	}
+	migratedPayload := []byte("client-to-client migrated udp payload")
+	if _, err := migratedConn.Write(migratedPayload); err != nil {
+		t.Fatalf("write migrated UDP ingress payload: %v", err)
+	}
+	migratedN, err := migratedConn.Read(got)
+	if err != nil {
+		t.Fatalf("read migrated UDP echoed payload: %v", err)
+	}
+	if string(got[:migratedN]) != string(migratedPayload) {
+		t.Fatalf("migrated UDP echoed payload mismatch: got %q want %q", got[:migratedN], migratedPayload)
+	}
+}
+
+func migrateUnifiedE2ETunnel(t *testing.T, s *Server, token, tunnelID string, revision int64, targetClientID string) tunnelSpecAPI {
+	t.Helper()
+	body := []byte(fmt.Sprintf(`{"expected_revision":%d,"target_client_id":"%s"}`, revision, targetClientID))
+	resp := doMuxRequest(t, s.StartHTTPOnly(), http.MethodPost, "/api/tunnels/"+tunnelID+"/migrate", token, body)
+	if resp.Code != http.StatusOK {
+		t.Fatalf("migrate tunnel: want 200, got %d body=%s", resp.Code, resp.Body.String())
+	}
+	var payload struct {
+		Tunnel tunnelSpecAPI `json:"tunnel"`
+	}
+	if err := mustDecodeJSON(t, resp.Body, &payload); err != nil {
+		t.Fatalf("decode migrated tunnel: %v", err)
+	}
+	return payload.Tunnel
+}
+
+func assertUnifiedE2EMigrationIdentity(t *testing.T, before, after tunnelSpecAPI, targetClientID string) {
+	t.Helper()
+	if after.ID != before.ID || after.Revision != before.Revision+1 {
+		t.Fatalf("migrated tunnel identity mismatch: before=%+v after=%+v", before, after)
+	}
+	if after.OwnerClientID != targetClientID || after.Target.ClientID != targetClientID {
+		t.Fatalf("migrated tunnel owner/target mismatch: %+v", after)
+	}
+	if after.Ingress.Location != before.Ingress.Location ||
+		after.Ingress.ClientID != before.Ingress.ClientID ||
+		after.Ingress.Type != before.Ingress.Type ||
+		!bytes.Equal(after.Ingress.Config, before.Ingress.Config) {
+		t.Fatalf("migration changed ingress: before=%+v after=%+v", before.Ingress, after.Ingress)
+	}
+}
+
+func assertUnifiedTCPEcho(t *testing.T, ingressPort int, payload []byte) {
+	t.Helper()
+	conn, err := net.DialTimeout("tcp", net.JoinHostPort("127.0.0.1", strconv.Itoa(ingressPort)), 2*time.Second)
+	if err != nil {
+		t.Fatalf("dial TCP ingress: %v", err)
+	}
+	defer func() { _ = conn.Close() }()
+	if err := conn.SetDeadline(time.Now().Add(2 * time.Second)); err != nil {
+		t.Fatalf("set TCP ingress deadline: %v", err)
+	}
+	if _, err := conn.Write(payload); err != nil {
+		t.Fatalf("write TCP ingress payload: %v", err)
+	}
+	got := make([]byte, len(payload))
+	if _, err := io.ReadFull(conn, got); err != nil {
+		t.Fatalf("read TCP ingress payload: %v", err)
+	}
+	if string(got) != string(payload) {
+		t.Fatalf("TCP echoed payload mismatch: got %q want %q", got, payload)
+	}
+}
+
+func assertUnifiedUDPEcho(t *testing.T, ingressPort int, payload []byte) {
+	t.Helper()
+	conn, err := net.DialTimeout("udp", net.JoinHostPort("127.0.0.1", strconv.Itoa(ingressPort)), 2*time.Second)
+	if err != nil {
+		t.Fatalf("dial UDP ingress: %v", err)
+	}
+	defer func() { _ = conn.Close() }()
+	if err := conn.SetDeadline(time.Now().Add(2 * time.Second)); err != nil {
+		t.Fatalf("set UDP ingress deadline: %v", err)
+	}
+	if _, err := conn.Write(payload); err != nil {
+		t.Fatalf("write UDP ingress payload: %v", err)
+	}
+	got := make([]byte, len(payload))
+	n, err := conn.Read(got)
+	if err != nil {
+		t.Fatalf("read UDP ingress payload: %v", err)
+	}
+	if string(got[:n]) != string(payload) {
+		t.Fatalf("UDP echoed payload mismatch: got %q want %q", got[:n], payload)
 	}
 }
 

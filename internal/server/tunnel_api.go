@@ -116,6 +116,8 @@ func (s *Server) handleDeleteClient(w http.ResponseWriter, r *http.Request) {
 		writeAPIError(w, http.StatusInternalServerError, "admin_store_unavailable", "admin store unavailable")
 		return
 	}
+	s.clientTunnelMutationMu.Lock()
+	defer s.clientTunnelMutationMu.Unlock()
 	if value, ok := s.clients.Load(clientID); ok {
 		client := value.(*ClientConn)
 		if client.getState() != clientStateClosing {

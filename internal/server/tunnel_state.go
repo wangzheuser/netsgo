@@ -101,11 +101,13 @@ func computeTunnelCapabilities(config protocol.ProxyConfig) *protocol.TunnelCapa
 	canStop := isTunnelExposed(config) || isTunnelOffline(config)
 	canEdit := canEditOrDeleteLiveTunnel(config) || isTunnelOffline(config)
 	canDelete := config.RuntimeState != protocol.ProxyRuntimeStatePending
+	canMigrate := config.RuntimeState != protocol.ProxyRuntimeStatePending && config.ID != "" && config.Revision > 0
 	return &protocol.TunnelCapabilities{
-		CanResume: canResume,
-		CanStop:   canStop,
-		CanEdit:   canEdit,
-		CanDelete: canDelete,
+		CanResume:  canResume,
+		CanStop:    canStop,
+		CanEdit:    canEdit,
+		CanDelete:  canDelete,
+		CanMigrate: canMigrate,
 	}
 }
 

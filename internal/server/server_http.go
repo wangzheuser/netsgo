@@ -38,6 +38,7 @@ func (s *Server) registerManagementRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /api/tunnels/{tunnel_id}", s.RequireAuth(s.handleUnifiedTunnelItem))
 	mux.HandleFunc("PUT /api/tunnels/{tunnel_id}", s.RequireAuth(s.handleUnifiedTunnelItem))
 	mux.HandleFunc("DELETE /api/tunnels/{tunnel_id}", s.RequireAuth(s.handleUnifiedTunnelItem))
+	mux.HandleFunc("POST /api/tunnels/{tunnel_id}/migrate", s.RequireAuth(s.handleUnifiedTunnelMigrate))
 	mux.HandleFunc("PUT /api/tunnels/{tunnel_id}/{action}", s.RequireAuth(s.handleUnifiedTunnelAction))
 	mux.HandleFunc("GET /api/clients/{id}/traffic", s.RequireAuth(s.handleGetClientTraffic))
 

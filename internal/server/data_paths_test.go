@@ -62,4 +62,10 @@ func TestServerInitStore_SharesSingleDBHandle(t *testing.T) {
 	if s.store.db != s.trafficStore.db {
 		t.Fatal("tunnel and traffic stores should share one server DB handle")
 	}
+	if s.store.trafficStore != s.trafficStore {
+		t.Fatal("tunnel store should coordinate migrations with the server traffic store")
+	}
+	if got := s.trafficStore.accumulator.Load(); got != s.trafficAccumulator {
+		t.Fatalf("traffic store accumulator = %p, want server accumulator %p", got, s.trafficAccumulator)
+	}
 }

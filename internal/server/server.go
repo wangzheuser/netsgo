@@ -30,6 +30,7 @@ type Server struct {
 	serverDB                    *sql.DB             // owned shared SQLite handle for borrowed server stores; close only via closeServerDB
 	serverDBCloseOnce           sync.Once
 	serverDBCloseErr            error
+	clientTunnelMutationMu      sync.Mutex        // serializes registered-client deletion with tunnel target migration
 	startTime                   time.Time         // server start time
 	auth                        *AuthService      // auth and access control (adminStore, rate limiting)
 	webFS                       fs.FS             // embedded frontend static assets (nil in dev mode)

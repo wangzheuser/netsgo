@@ -191,6 +191,36 @@ func mustAddStableTunnel(t *testing.T, store *TunnelStore, tunnel StoredTunnel) 
 	}
 }
 
+func tunnelTargetMigrationReplacement(t *testing.T, store *TunnelStore, stored StoredTunnel, targetClientID string) StoredTunnel {
+	t.Helper()
+	mustRegisterTunnelMigrationTarget(t, store, targetClientID)
+	replacement := stored
+	replacement.ClientID = targetClientID
+	replacement.OwnerClientID = targetClientID
+	replacement.Target.ClientID = targetClientID
+	replacement.Revision = stored.Revision + 1
+	replacement.UpdatedAt = time.Time{}
+	return replacement
+}
+
+func mustRegisterTunnelMigrationTarget(t *testing.T, store *TunnelStore, clientID string) {
+	t.Helper()
+	now := formatTime(time.Now().UTC())
+	if _, err := store.db.Exec(`INSERT OR IGNORE INTO registered_clients (id, install_id, created_at, last_seen) VALUES (?, ?, ?, ?)`, clientID, "install-"+clientID, now, now); err != nil {
+		t.Fatalf("register migration target %q: %v", clientID, err)
+	}
+}
+
+func queryTunnelTargetResourceKey(t *testing.T, store *TunnelStore, id string) string {
+	t.Helper()
+
+	var key string
+	if err := store.db.QueryRow(`SELECT target_resource_key FROM tunnels WHERE id = ?`, id).Scan(&key); err != nil {
+		t.Fatalf("query target_resource_key: %v", err)
+	}
+	return key
+}
+
 func TestTunnelStore_NewEmpty(t *testing.T) {
 	store := newTestTunnelStore(t)
 	allTunnels, err := store.GetAllTunnels()
@@ -579,6 +609,456 @@ func TestTunnelStore_GetTunnelByID(t *testing.T) {
 	}
 	if _, err := store.GetTunnelByID("missing-id"); !errors.Is(err, ErrTunnelNotFound) {
 		t.Fatalf("missing tunnel should return ErrTunnelNotFound, got %v", err)
+	}
+}
+
+func TestTunnelStore_ReplaceTunnelByIDRejectsClientIDOwnerChange(t *testing.T) {
+	store := newTestTunnelStore(t)
+	original := StoredTunnel{
+		ProxyNewRequest: protocol.ProxyNewRequest{ID: "replace-owner-guard", Name: "web", Type: protocol.ProxyTypeTCP, LocalIP: "127.0.0.1", LocalPort: 80, RemotePort: 18080},
+		ClientID:        "client-old",
+		Hostname:        "host-old",
+	}
+	mustAddStableTunnel(t, store, original)
+	stored, err := store.GetTunnelByIDE("client-old", "replace-owner-guard")
+	if err != nil {
+		t.Fatalf("GetTunnelByIDE failed: %v", err)
+	}
+
+	replacement := stored
+	replacement.ClientID = "client-new"
+	replacement.OwnerClientID = "client-new"
+	replacement.Target.ClientID = "client-new"
+	replacement.Revision = stored.Revision + 1
+
+	err = store.ReplaceTunnelByID("client-old", stored.ID, stored.Revision, replacement)
+	if err == nil || !strings.Contains(err.Error(), "replacement client_id cannot change") {
+		t.Fatalf("ReplaceTunnelByID should reject client_id/owner migration, got %v", err)
+	}
+	reloaded, err := store.GetTunnelByIDE("client-old", stored.ID)
+	if err != nil {
+		t.Fatalf("original tunnel should remain under old owner: %v", err)
+	}
+	if reloaded.ClientID != stored.ClientID || reloaded.OwnerClientID != stored.OwnerClientID || reloaded.Target.ClientID != stored.Target.ClientID || reloaded.Revision != stored.Revision {
+		t.Fatalf("rejected replacement mutated tunnel: %+v", reloaded)
+	}
+	if _, err := store.GetTunnelByIDE("client-new", stored.ID); !errors.Is(err, ErrTunnelNotFound) {
+		t.Fatalf("rejected replacement should not create new owner row, got %v", err)
+	}
+}
+
+func TestTunnelStore_MigrateTunnelTargetByIDRejectsUnregisteredTargetWithoutMutation(t *testing.T) {
+	store := newTestTunnelStore(t)
+	mustAddStableTunnel(t, store, StoredTunnel{
+		ProxyNewRequest: protocol.ProxyNewRequest{ID: "migrate-unregistered", Name: "web", Type: protocol.ProxyTypeTCP, LocalIP: "127.0.0.1", LocalPort: 8080, RemotePort: 18080},
+		ClientID:        "client-old",
+		Hostname:        "host-old",
+	})
+	stored, err := store.GetTunnelByIDE("client-old", "migrate-unregistered")
+	if err != nil {
+		t.Fatalf("GetTunnelByIDE failed: %v", err)
+	}
+	replacement := stored
+	replacement.ClientID = "client-missing"
+	replacement.OwnerClientID = "client-missing"
+	replacement.Target.ClientID = "client-missing"
+
+	_, _, err = store.MigrateTunnelTargetByID(stored.ID, stored.Revision, replacement)
+	if !errors.Is(err, ErrTunnelTargetClientNotFound) {
+		t.Fatalf("MigrateTunnelTargetByID error = %v, want ErrTunnelTargetClientNotFound", err)
+	}
+	reloaded, err := store.GetTunnelByIDE("client-old", stored.ID)
+	if err != nil {
+		t.Fatalf("unregistered target rejection removed original tunnel: %v", err)
+	}
+	if reloaded.Revision != stored.Revision || reloaded.OwnerClientID != stored.OwnerClientID || reloaded.Target.ClientID != stored.Target.ClientID {
+		t.Fatalf("unregistered target rejection mutated tunnel: %+v", reloaded)
+	}
+}
+
+func TestTunnelStore_MigrateTunnelTargetByIDMovesOwnerAndPreservesConfig(t *testing.T) {
+	store := newTestTunnelStore(t)
+	original := StoredTunnel{
+		ProxyNewRequest: protocol.ProxyNewRequest{
+			ID:         "migrate-happy",
+			Name:       "web",
+			Type:       protocol.ProxyTypeTCP,
+			LocalIP:    "127.0.0.1",
+			LocalPort:  8080,
+			RemotePort: 18080,
+			BindIP:     "127.0.0.1",
+			BandwidthSettings: protocol.BandwidthSettings{
+				IngressBPS: 1234,
+				EgressBPS:  5678,
+			},
+		},
+		ClientID:        "client-old",
+		Hostname:        "host-old",
+		CreatedByUserID: "user-1",
+		TransportPolicy: TunnelTransportDirectPreferred,
+	}
+	mustAddStableTunnel(t, store, original)
+	stored, err := store.GetTunnelByIDE("client-old", "migrate-happy")
+	if err != nil {
+		t.Fatalf("GetTunnelByIDE failed: %v", err)
+	}
+	replacement := tunnelTargetMigrationReplacement(t, store, stored, "client-new")
+	replacement.CreatedAt = stored.CreatedAt.Add(time.Hour)
+	replacement.CreatedByUserID = "changed-user"
+	replacement.Hostname = "changed-host"
+
+	before, after, err := store.MigrateTunnelTargetByID(stored.ID, stored.Revision, replacement)
+	if err != nil {
+		t.Fatalf("MigrateTunnelTargetByID failed: %v", err)
+	}
+	if before.ID != stored.ID || before.ClientID != "client-old" || before.OwnerClientID != "client-old" || before.Target.ClientID != "client-old" {
+		t.Fatalf("before tunnel mismatch: %+v", before)
+	}
+	if after.ID != stored.ID || after.ClientID != "client-new" || after.OwnerClientID != "client-new" || after.Target.ClientID != "client-new" {
+		t.Fatalf("after tunnel did not move target owner: %+v", after)
+	}
+	if after.Revision != stored.Revision+1 {
+		t.Fatalf("revision = %d, want %d", after.Revision, stored.Revision+1)
+	}
+	if !after.CreatedAt.Equal(stored.CreatedAt) || after.CreatedByUserID != stored.CreatedByUserID || after.Hostname != stored.Hostname || after.Binding != stored.Binding {
+		t.Fatalf("returned migrated tunnel changed immutable fields: after=%+v before=%+v", after, stored)
+	}
+	if _, err := store.GetTunnelByIDE("client-old", stored.ID); !errors.Is(err, ErrTunnelNotFound) {
+		t.Fatalf("old owner lookup should miss after migration, got %v", err)
+	}
+	reloaded, err := store.GetTunnelByIDE("client-new", stored.ID)
+	if err != nil {
+		t.Fatalf("new owner lookup should load migrated tunnel: %v", err)
+	}
+	if after.ClientID != reloaded.ClientID || after.OwnerClientID != reloaded.OwnerClientID || after.Target.ClientID != reloaded.Target.ClientID || after.Revision != reloaded.Revision || after.RuntimeState != reloaded.RuntimeState || after.ActualTransport != reloaded.ActualTransport || !after.UpdatedAt.Equal(reloaded.UpdatedAt) {
+		t.Fatalf("returned after tunnel must match committed row: after=%+v reloaded=%+v", after, reloaded)
+	}
+	if reloaded.Name != stored.Name || reloaded.Ingress.Type != stored.Ingress.Type || string(reloaded.Ingress.Config) != string(stored.Ingress.Config) || string(reloaded.Target.Config) != string(stored.Target.Config) {
+		t.Fatalf("migration should preserve name and endpoint config, got %+v want ingress %s target %s", reloaded, stored.Ingress.Config, stored.Target.Config)
+	}
+	if reloaded.RemotePort != stored.RemotePort || reloaded.LocalIP != stored.LocalIP || reloaded.LocalPort != stored.LocalPort || reloaded.IngressBPS != stored.IngressBPS || reloaded.EgressBPS != stored.EgressBPS || reloaded.TransportPolicy != stored.TransportPolicy || !reloaded.CreatedAt.Equal(stored.CreatedAt) || reloaded.CreatedByUserID != stored.CreatedByUserID {
+		t.Fatalf("migration should preserve tunnel config, got %+v want %+v", reloaded, stored)
+	}
+	byID, err := store.GetTunnelByID(stored.ID)
+	if err != nil {
+		t.Fatalf("GetTunnelByID failed after migration: %v", err)
+	}
+	if byID.ClientID != "client-new" || byID.OwnerClientID != "client-new" || byID.Target.ClientID != "client-new" {
+		t.Fatalf("stable id lookup should return migrated owner: %+v", byID)
+	}
+}
+
+func TestTunnelStore_MigrateTunnelTargetByIDClearsAllTrafficLayersAndStartsNewRevisionAtZero(t *testing.T) {
+	store := newTestTunnelStore(t)
+	mustAddStableTunnel(t, store, StoredTunnel{
+		ProxyNewRequest: protocol.ProxyNewRequest{ID: "migrate-traffic", Name: "web", Type: protocol.ProxyTypeTCP, LocalIP: "127.0.0.1", LocalPort: 8080, RemotePort: 18080},
+		ClientID:        "client-old",
+		Hostname:        "host-old",
+	})
+	mustAddStableTunnel(t, store, StoredTunnel{
+		ProxyNewRequest: protocol.ProxyNewRequest{ID: "keep-traffic", Name: "keep", Type: protocol.ProxyTypeTCP, LocalIP: "127.0.0.1", LocalPort: 8081, RemotePort: 18081},
+		ClientID:        "client-other",
+		Hostname:        "host-other",
+	})
+	stored, err := store.GetTunnelByIDE("client-old", "migrate-traffic")
+	if err != nil {
+		t.Fatalf("GetTunnelByIDE failed: %v", err)
+	}
+	other, err := store.GetTunnelByIDE("client-other", "keep-traffic")
+	if err != nil {
+		t.Fatalf("GetTunnelByIDE failed for unaffected tunnel: %v", err)
+	}
+
+	trafficStore := newTrafficStoreWithDB(store.path, store.db, false)
+	store.attachTrafficStore(trafficStore)
+	now := secondFloorUTC(time.Now().UTC())
+	oldDelta := trafficDeltaFromStoredTunnel(stored, 10, 4)
+	oldDelta.SecondStart = now.Unix()
+	oldDelta.MinuteStart = minuteFloorUTC(now).Unix()
+	trafficStore.ApplyDeltas([]TrafficDelta{oldDelta})
+	if err := trafficStore.Flush(); err != nil {
+		t.Fatalf("flush durable traffic: %v", err)
+	}
+	oldPending := oldDelta
+	oldPending.IngressBytes = 5
+	oldPending.EgressBytes = 2
+	otherDelta := trafficDeltaFromStoredTunnel(other, 21, 8)
+	otherDelta.SecondStart = now.Unix()
+	otherDelta.MinuteStart = minuteFloorUTC(now).Unix()
+	trafficStore.ApplyDeltas([]TrafficDelta{oldPending, otherDelta})
+
+	_, migrated, err := store.MigrateTunnelTargetByID(stored.ID, stored.Revision, tunnelTargetMigrationReplacement(t, store, stored, "client-new"))
+	if err != nil {
+		t.Fatalf("MigrateTunnelTargetByID failed: %v", err)
+	}
+
+	var durableCount int
+	if err := store.db.QueryRow(`SELECT COUNT(*) FROM traffic_buckets WHERE tunnel_id = ?`, stored.ID).Scan(&durableCount); err != nil {
+		t.Fatalf("count migrated traffic buckets: %v", err)
+	}
+	if durableCount != 0 {
+		t.Fatalf("migrated durable traffic rows = %d, want 0", durableCount)
+	}
+	for _, resolution := range []TrafficResolution{TrafficResolutionSecond, TrafficResolutionMinute} {
+		result := mustQueryWithResolution(t, trafficStore, "client-old", stored.ID, now.Add(-time.Minute), now.Add(time.Minute), resolution)
+		if len(result.Items) != 0 {
+			t.Fatalf("old-owner %s traffic should be empty after migration, got %+v", resolution, result.Items)
+		}
+	}
+	if got := trafficStore.minimumRevisionByTunnel[stored.ID]; got != migrated.Revision {
+		t.Fatalf("minimum accepted revision = %d, want %d", got, migrated.Revision)
+	}
+
+	lateOld := oldDelta
+	lateOld.IngressBytes = 100
+	lateOld.EgressBytes = 50
+	trafficStore.ApplyDeltas([]TrafficDelta{lateOld})
+	oldResult := mustQueryWithResolution(t, trafficStore, "client-old", stored.ID, now.Add(-time.Minute), now.Add(time.Minute), TrafficResolutionMinute)
+	if len(oldResult.Items) != 0 {
+		t.Fatalf("late old-revision traffic should be discarded, got %+v", oldResult.Items)
+	}
+
+	fresh := trafficDeltaFromStoredTunnel(migrated, 7, 3)
+	fresh.SecondStart = now.Unix()
+	fresh.MinuteStart = minuteFloorUTC(now).Unix()
+	trafficStore.ApplyDeltas([]TrafficDelta{fresh})
+	freshResult := mustQueryWithResolution(t, trafficStore, "client-new", migrated.ID, now.Add(-time.Minute), now.Add(time.Minute), TrafficResolutionMinute)
+	freshSeries := mustSingleSeries(t, freshResult, migrated.Name)
+	if len(freshSeries.Points) != 1 || freshSeries.Points[0].IngressBytes != 7 || freshSeries.Points[0].EgressBytes != 3 {
+		t.Fatalf("new revision should start from zero, got %+v", freshSeries.Points)
+	}
+	otherResult := mustQueryWithResolution(t, trafficStore, "client-other", other.ID, now.Add(-time.Minute), now.Add(time.Minute), TrafficResolutionMinute)
+	otherSeries := mustSingleSeries(t, otherResult, other.Name)
+	if len(otherSeries.Points) != 1 || otherSeries.Points[0].IngressBytes != 21 || otherSeries.Points[0].EgressBytes != 8 {
+		t.Fatalf("migration should not clear unrelated traffic, got %+v", otherSeries.Points)
+	}
+}
+
+func TestTunnelStore_MigrateTunnelTargetByIDTrafficDeleteFailureRollsBackWithoutClearingMemory(t *testing.T) {
+	store := newTestTunnelStore(t)
+	mustAddStableTunnel(t, store, StoredTunnel{
+		ProxyNewRequest: protocol.ProxyNewRequest{ID: "migrate-traffic-rollback", Name: "web", Type: protocol.ProxyTypeTCP, LocalIP: "127.0.0.1", LocalPort: 8080, RemotePort: 18080},
+		ClientID:        "client-old",
+		Hostname:        "host-old",
+	})
+	stored, err := store.GetTunnelByIDE("client-old", "migrate-traffic-rollback")
+	if err != nil {
+		t.Fatalf("GetTunnelByIDE failed: %v", err)
+	}
+	trafficStore := newTrafficStoreWithDB(store.path, store.db, false)
+	store.attachTrafficStore(trafficStore)
+	now := secondFloorUTC(time.Now().UTC())
+	delta := trafficDeltaFromStoredTunnel(stored, 10, 4)
+	delta.SecondStart = now.Unix()
+	delta.MinuteStart = minuteFloorUTC(now).Unix()
+	trafficStore.ApplyDeltas([]TrafficDelta{delta})
+	if err := trafficStore.Flush(); err != nil {
+		t.Fatalf("flush durable traffic: %v", err)
+	}
+	pending := delta
+	pending.IngressBytes = 5
+	pending.EgressBytes = 2
+	trafficStore.ApplyDeltas([]TrafficDelta{pending})
+	if _, err := store.db.Exec(`CREATE TRIGGER reject_migration_traffic_delete
+		BEFORE DELETE ON traffic_buckets
+		WHEN OLD.tunnel_id = 'migrate-traffic-rollback'
+		BEGIN
+			SELECT RAISE(ABORT, 'blocked traffic delete');
+		END`); err != nil {
+		t.Fatalf("create traffic delete failure trigger: %v", err)
+	}
+
+	_, _, err = store.MigrateTunnelTargetByID(stored.ID, stored.Revision, tunnelTargetMigrationReplacement(t, store, stored, "client-new"))
+	if err == nil || !strings.Contains(err.Error(), "blocked traffic delete") {
+		t.Fatalf("MigrateTunnelTargetByID error = %v, want blocked traffic delete", err)
+	}
+	reloaded, err := store.GetTunnelByIDE("client-old", stored.ID)
+	if err != nil {
+		t.Fatalf("failed migration should keep old owner: %v", err)
+	}
+	if reloaded.Revision != stored.Revision || reloaded.OwnerClientID != stored.OwnerClientID || reloaded.Target.ClientID != stored.Target.ClientID {
+		t.Fatalf("failed migration mutated tunnel: %+v", reloaded)
+	}
+	if _, ok := trafficStore.minimumRevisionByTunnel[stored.ID]; ok {
+		t.Fatalf("failed migration should not advance minimum traffic revision: %+v", trafficStore.minimumRevisionByTunnel)
+	}
+	result := mustQueryWithResolution(t, trafficStore, "client-old", stored.ID, now.Add(-time.Minute), now.Add(time.Minute), TrafficResolutionMinute)
+	series := mustSingleSeries(t, result, stored.Name)
+	if len(series.Points) != 1 || series.Points[0].IngressBytes != 15 || series.Points[0].EgressBytes != 6 {
+		t.Fatalf("failed migration should preserve durable and pending traffic, got %+v", series.Points)
+	}
+}
+
+func TestTunnelStore_MigrateTunnelTargetByIDRejectsRevisionConflictWithoutMutation(t *testing.T) {
+	store := newTestTunnelStore(t)
+	original := StoredTunnel{
+		ProxyNewRequest: protocol.ProxyNewRequest{ID: "migrate-revision-conflict", Name: "web", Type: protocol.ProxyTypeTCP, LocalIP: "127.0.0.1", LocalPort: 8080, RemotePort: 18080},
+		ClientID:        "client-old",
+		Hostname:        "host-old",
+	}
+	mustAddStableTunnel(t, store, original)
+	stored, err := store.GetTunnelByIDE("client-old", "migrate-revision-conflict")
+	if err != nil {
+		t.Fatalf("GetTunnelByIDE failed: %v", err)
+	}
+	replacement := tunnelTargetMigrationReplacement(t, store, stored, "client-new")
+
+	_, _, err = store.MigrateTunnelTargetByID(stored.ID, stored.Revision+1, replacement)
+	if !errors.Is(err, ErrTunnelRevisionConflict) {
+		t.Fatalf("MigrateTunnelTargetByID should reject stale revision, got %v", err)
+	}
+	reloaded, err := store.GetTunnelByIDE("client-old", stored.ID)
+	if err != nil {
+		t.Fatalf("original tunnel should remain under old owner: %v", err)
+	}
+	if reloaded.ClientID != stored.ClientID || reloaded.OwnerClientID != stored.OwnerClientID || reloaded.Target.ClientID != stored.Target.ClientID || reloaded.Revision != stored.Revision {
+		t.Fatalf("revision conflict mutated tunnel: %+v", reloaded)
+	}
+	if _, err := store.GetTunnelByIDE("client-new", stored.ID); !errors.Is(err, ErrTunnelNotFound) {
+		t.Fatalf("revision conflict should not create new owner row, got %v", err)
+	}
+}
+
+func TestTunnelStore_MigrateTunnelTargetByIDRejectsPendingInsideStoreLock(t *testing.T) {
+	store := newTestTunnelStore(t)
+	mustAddStableTunnel(t, store, StoredTunnel{
+		ProxyNewRequest: protocol.ProxyNewRequest{ID: "migrate-pending-store", Name: "web", Type: protocol.ProxyTypeTCP, LocalIP: "127.0.0.1", LocalPort: 8080, RemotePort: 18080},
+		ClientID:        "client-old",
+		Hostname:        "host-old",
+		RuntimeState:    protocol.ProxyRuntimeStatePending,
+	})
+	stored, err := store.GetTunnelByIDE("client-old", "migrate-pending-store")
+	if err != nil {
+		t.Fatalf("GetTunnelByIDE failed: %v", err)
+	}
+
+	_, _, err = store.MigrateTunnelTargetByID(stored.ID, stored.Revision, tunnelTargetMigrationReplacement(t, store, stored, "client-new"))
+	if !errors.Is(err, ErrTunnelMigrationPending) {
+		t.Fatalf("MigrateTunnelTargetByID pending error = %v, want ErrTunnelMigrationPending", err)
+	}
+	reloaded, err := store.GetTunnelByIDE("client-old", stored.ID)
+	if err != nil {
+		t.Fatalf("pending migration should keep old owner: %v", err)
+	}
+	if reloaded.Revision != stored.Revision || reloaded.RuntimeState != protocol.ProxyRuntimeStatePending {
+		t.Fatalf("pending migration mutated tunnel: %+v", reloaded)
+	}
+}
+
+func TestTunnelStore_MigrateTunnelTargetByIDRejectsNewOwnerNameConflictWithoutDeletingOriginal(t *testing.T) {
+	store := newTestTunnelStore(t)
+	mustAddStableTunnel(t, store, StoredTunnel{
+		ProxyNewRequest: protocol.ProxyNewRequest{ID: "migrate-name-conflict-original", Name: "web", Type: protocol.ProxyTypeTCP, LocalIP: "127.0.0.1", LocalPort: 8080, RemotePort: 18080},
+		ClientID:        "client-old",
+		Hostname:        "host-old",
+	})
+	mustAddStableTunnel(t, store, StoredTunnel{
+		ProxyNewRequest: protocol.ProxyNewRequest{ID: "migrate-name-conflict-existing", Name: "web", Type: protocol.ProxyTypeTCP, LocalIP: "127.0.0.1", LocalPort: 8081, RemotePort: 18081},
+		ClientID:        "client-new",
+		Hostname:        "host-new",
+	})
+	stored, err := store.GetTunnelByIDE("client-old", "migrate-name-conflict-original")
+	if err != nil {
+		t.Fatalf("GetTunnelByIDE failed: %v", err)
+	}
+	replacement := tunnelTargetMigrationReplacement(t, store, stored, "client-new")
+
+	_, _, err = store.MigrateTunnelTargetByID(stored.ID, stored.Revision, replacement)
+	if !errors.Is(err, ErrTunnelOwnerNameConflict) {
+		t.Fatalf("MigrateTunnelTargetByID name conflict error = %v, want ErrTunnelOwnerNameConflict", err)
+	}
+	reloaded, err := store.GetTunnelByIDE("client-old", stored.ID)
+	if err != nil {
+		t.Fatalf("original tunnel should remain under old owner: %v", err)
+	}
+	if reloaded.ClientID != stored.ClientID || reloaded.OwnerClientID != stored.OwnerClientID || reloaded.Target.ClientID != stored.Target.ClientID || reloaded.Revision != stored.Revision {
+		t.Fatalf("name conflict mutated original tunnel: %+v", reloaded)
+	}
+	conflict, err := store.GetTunnelByIDE("client-new", "migrate-name-conflict-existing")
+	if err != nil {
+		t.Fatalf("conflicting tunnel should remain under new owner: %v", err)
+	}
+	if conflict.Name != "web" || conflict.ID != "migrate-name-conflict-existing" {
+		t.Fatalf("conflicting tunnel mutated: %+v", conflict)
+	}
+}
+
+func TestTunnelStore_MigrateTunnelTargetByIDRefreshesTargetResourceLock(t *testing.T) {
+	store := newTestTunnelStore(t)
+	original := StoredTunnel{
+		ProxyNewRequest: protocol.ProxyNewRequest{ID: "migrate-target-resource", Name: "web", Type: protocol.ProxyTypeTCP, LocalIP: "127.0.0.1", LocalPort: 8080, RemotePort: 18080},
+		ClientID:        "client-old",
+		Hostname:        "host-old",
+	}
+	mustAddStableTunnel(t, store, original)
+	stored, err := store.GetTunnelByIDE("client-old", "migrate-target-resource")
+	if err != nil {
+		t.Fatalf("GetTunnelByIDE failed: %v", err)
+	}
+	oldKey := queryTunnelTargetResourceKey(t, store, stored.ID)
+	replacement := tunnelTargetMigrationReplacement(t, store, stored, "client-new")
+
+	_, after, err := store.MigrateTunnelTargetByID(stored.ID, stored.Revision, replacement)
+	if err != nil {
+		t.Fatalf("MigrateTunnelTargetByID failed: %v", err)
+	}
+	newKey := queryTunnelTargetResourceKey(t, store, stored.ID)
+	wantKey := "target:client:client-new:tcp_service:127.0.0.1:8080"
+	if oldKey == newKey || newKey != wantKey {
+		t.Fatalf("target_resource_key = %q, old %q, want %q", newKey, oldKey, wantKey)
+	}
+	reloaded, err := store.GetTunnelByIDE("client-new", stored.ID)
+	if err != nil {
+		t.Fatalf("new owner lookup should load migrated tunnel: %v", err)
+	}
+	if reloaded.Target.ClientID != "client-new" || after.Target.ClientID != "client-new" {
+		t.Fatalf("reloaded target client mismatch: after=%+v reloaded=%+v", after, reloaded)
+	}
+	var lockCount int
+	if err := store.db.QueryRow(`SELECT COUNT(*) FROM tunnel_resource_locks WHERE tunnel_id = ?`, stored.ID).Scan(&lockCount); err != nil {
+		t.Fatalf("count resource locks: %v", err)
+	}
+	if lockCount != 1 {
+		t.Fatalf("resource lock count = %d, want 1", lockCount)
+	}
+}
+
+func TestTunnelStore_DeleteTunnelsByClientIDDeletesAnyClientParticipation(t *testing.T) {
+	store := newTestTunnelStore(t)
+	for _, tunnel := range []StoredTunnel{
+		{
+			ProxyNewRequest: protocol.ProxyNewRequest{ID: "delete-target-participant", Name: "target", Type: protocol.ProxyTypeTCP, LocalIP: "127.0.0.1", LocalPort: 8080, RemotePort: 18080},
+			ClientID:        "delete-client",
+			Hostname:        "target-host",
+		},
+		{
+			ProxyNewRequest: protocol.ProxyNewRequest{ID: "delete-ingress-participant", Name: "relay", Type: protocol.ProxyTypeTCP, LocalIP: "127.0.0.1", LocalPort: 8081},
+			ClientID:        "target-owner",
+			OwnerClientID:   "target-owner",
+			Topology:        TunnelTopologyClientToClient,
+			Ingress:         EndpointSpec{Location: protocol.EndpointLocationClient, ClientID: "delete-client", Type: TunnelIngressTypeTCPListen, Config: mustRawJSON(tcpListenConfigAPI{BindIP: "127.0.0.1", Port: 18081, AllowedSourceCIDRs: allowAllSourceCIDRs()})},
+			Target:          EndpointSpec{Location: protocol.EndpointLocationClient, ClientID: "target-owner", Type: TunnelTargetTypeTCPService, Config: mustRawJSON(serviceConfigAPI{IP: "127.0.0.1", Port: 8081})},
+			TransportPolicy: TunnelTransportServerRelayOnly,
+		},
+		{
+			ProxyNewRequest: protocol.ProxyNewRequest{ID: "keep-unrelated", Name: "keep", Type: protocol.ProxyTypeTCP, LocalIP: "127.0.0.1", LocalPort: 8082, RemotePort: 18082},
+			ClientID:        "unrelated",
+			Hostname:        "unrelated-host",
+		},
+	} {
+		mustAddStableTunnel(t, store, tunnel)
+	}
+
+	if err := store.DeleteTunnelsByClientID("delete-client"); err != nil {
+		t.Fatalf("DeleteTunnelsByClientID failed: %v", err)
+	}
+	for _, id := range []string{"delete-target-participant", "delete-ingress-participant"} {
+		if _, err := store.GetTunnelByID(id); !errors.Is(err, ErrTunnelNotFound) {
+			t.Fatalf("participating tunnel %q still exists: %v", id, err)
+		}
+	}
+	if _, err := store.GetTunnelByID("keep-unrelated"); err != nil {
+		t.Fatalf("unrelated tunnel was deleted: %v", err)
 	}
 }
 

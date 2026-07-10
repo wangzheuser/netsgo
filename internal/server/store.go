@@ -20,6 +20,9 @@ const (
 
 var ErrTunnelNotFound = errors.New("tunnel not found")
 var ErrTunnelRevisionConflict = errors.New("tunnel revision conflict")
+var ErrTunnelOwnerNameConflict = errors.New("target client already has a tunnel with this name")
+var ErrTunnelMigrationPending = errors.New("pending tunnel cannot be migrated")
+var ErrTunnelTargetClientNotFound = errors.New("target client is not registered")
 
 const (
 	TunnelTopologyServerExpose           = protocol.TunnelTopologyServerExpose
@@ -107,16 +110,26 @@ func (t *StoredTunnel) normalize() error {
 
 // TunnelStore is a SQLite-backed persistent store for tunnel configurations.
 type TunnelStore struct {
-	path      string
-	db        *sql.DB
-	closeDB   bool
-	mu        sync.RWMutex
-	closeOnce sync.Once
-	closeErr  error
+	path         string
+	db           *sql.DB
+	closeDB      bool
+	trafficStore *TrafficStore
+	mu           sync.RWMutex
+	closeOnce    sync.Once
+	closeErr     error
 
 	// For testing only: inject a save failure before the next SQL mutation.
 	failSaveErr   error
 	failSaveCount int
+}
+
+func (s *TunnelStore) attachTrafficStore(trafficStore *TrafficStore, accumulators ...*trafficAccumulator) {
+	s.mu.Lock()
+	s.trafficStore = trafficStore
+	s.mu.Unlock()
+	if trafficStore != nil && len(accumulators) > 0 {
+		trafficStore.attachAccumulator(accumulators[0])
+	}
 }
 
 // NewTunnelStore creates or opens a standalone tunnel store that owns its DB.
@@ -890,6 +903,147 @@ func (s *TunnelStore) ReplaceTunnelByID(clientID, id string, expectedRevision in
 	return commitTx(tx, &committed)
 }
 
+// MigrateTunnelTargetByID replaces a tunnel's target-side owner by stable id and
+// expected revision. It updates the tunnel row and resource locks atomically and
+// returns the stored tunnel before and after migration.
+func (s *TunnelStore) MigrateTunnelTargetByID(id string, expectedRevision int64, replacement StoredTunnel) (StoredTunnel, StoredTunnel, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	trafficStore := s.trafficStore
+	if trafficStore != nil {
+		trafficStore.mu.Lock()
+		defer trafficStore.mu.Unlock()
+	}
+
+	if expectedRevision <= 0 {
+		return StoredTunnel{}, StoredTunnel{}, fmt.Errorf("expected revision is required")
+	}
+	existing, err := scanStoredTunnel(s.db.QueryRow(`SELECT `+tunnelSelectColumns+` FROM tunnels WHERE id = ?`, id))
+	if err == sql.ErrNoRows {
+		return StoredTunnel{}, StoredTunnel{}, ErrTunnelNotFound
+	}
+	if err != nil {
+		return StoredTunnel{}, StoredTunnel{}, err
+	}
+	if existing.Revision != expectedRevision {
+		return StoredTunnel{}, StoredTunnel{}, ErrTunnelRevisionConflict
+	}
+	if existing.RuntimeState == protocol.ProxyRuntimeStatePending {
+		return StoredTunnel{}, StoredTunnel{}, ErrTunnelMigrationPending
+	}
+	replacement.ID = id
+	replacement.Revision = expectedRevision + 1
+	replacement.CreatedAt = existing.CreatedAt
+	replacement.CreatedByUserID = existing.CreatedByUserID
+	replacement.Hostname = existing.Hostname
+	replacement.Binding = existing.Binding
+	if replacement.UpdatedAt.IsZero() {
+		replacement.UpdatedAt = time.Now().UTC()
+	}
+	if err := replacement.normalize(); err != nil {
+		return StoredTunnel{}, StoredTunnel{}, err
+	}
+	var conflictingID string
+	err = s.db.QueryRow(`SELECT id FROM tunnels WHERE owner_client_id = ? AND name = ? AND id <> ? LIMIT 1`, replacement.OwnerClientID, replacement.Name, id).Scan(&conflictingID)
+	if err == nil {
+		return StoredTunnel{}, StoredTunnel{}, ErrTunnelOwnerNameConflict
+	}
+	if err != sql.ErrNoRows {
+		return StoredTunnel{}, StoredTunnel{}, err
+	}
+	if err := s.maybeFailSave(); err != nil {
+		return StoredTunnel{}, StoredTunnel{}, err
+	}
+
+	tx, err := s.db.Begin()
+	if err != nil {
+		return StoredTunnel{}, StoredTunnel{}, err
+	}
+	committed := false
+	defer rollbackUnlessCommitted(tx, &committed)
+	var targetExists int
+	if err := tx.QueryRow(`SELECT 1 FROM registered_clients WHERE id = ?`, replacement.Target.ClientID).Scan(&targetExists); err != nil {
+		if err == sql.ErrNoRows {
+			return StoredTunnel{}, StoredTunnel{}, ErrTunnelTargetClientNotFound
+		}
+		return StoredTunnel{}, StoredTunnel{}, err
+	}
+
+	result, err := tx.Exec(`UPDATE tunnels SET
+		client_id = ?, name = ?, type = ?, local_ip = ?, local_port = ?, remote_port = ?, domain = ?,
+		revision = ?, topology = ?, owner_client_id = ?,
+		ingress_location = ?, ingress_client_id = ?, ingress_type = ?, ingress_config = ?, ingress_bind_ip = ?, ingress_port = ?, ingress_domain = ?,
+		target_location = ?, target_client_id = ?, target_type = ?, target_config = ?, target_host = ?, target_port = ?, target_resource_key = ?,
+		transport_policy = ?, actual_transport = ?, p2p_state = ?, p2p_error = ?, p2p_session_id = ?,
+		ingress_bps = ?, egress_bps = ?, desired_state = ?, runtime_state = ?, error = ?, updated_at = ?
+		WHERE id = ? AND revision = ?`,
+		replacement.ClientID,
+		replacement.Name,
+		replacement.Type,
+		replacement.LocalIP,
+		replacement.LocalPort,
+		replacement.RemotePort,
+		replacement.Domain,
+		replacement.Revision,
+		replacement.Topology,
+		replacement.OwnerClientID,
+		replacement.Ingress.Location,
+		replacement.Ingress.ClientID,
+		replacement.Ingress.Type,
+		string(replacement.Ingress.Config),
+		tunnelIngressBindIP(replacement),
+		tunnelIngressPort(replacement),
+		tunnelIngressDomain(replacement),
+		replacement.Target.Location,
+		replacement.Target.ClientID,
+		replacement.Target.Type,
+		string(replacement.Target.Config),
+		replacement.LocalIP,
+		replacement.LocalPort,
+		tunnelTargetResourceKey(replacement),
+		replacement.TransportPolicy,
+		storageActualTransport(replacement),
+		replacement.P2P.State,
+		replacement.P2P.Error,
+		replacement.P2P.SessionID,
+		replacement.IngressBPS,
+		replacement.EgressBPS,
+		replacement.DesiredState,
+		storageRuntimeStateFromProtocol(replacement.RuntimeState),
+		replacement.Error,
+		formatTime(replacement.UpdatedAt),
+		id,
+		expectedRevision,
+	)
+	if err != nil {
+		return StoredTunnel{}, StoredTunnel{}, err
+	}
+	rowsAffected, err := result.RowsAffected()
+	if err != nil {
+		return StoredTunnel{}, StoredTunnel{}, err
+	}
+	if rowsAffected == 0 {
+		return StoredTunnel{}, StoredTunnel{}, ErrTunnelRevisionConflict
+	}
+	if err := replaceTunnelResourceLocksTx(tx, replacement); err != nil {
+		return StoredTunnel{}, StoredTunnel{}, err
+	}
+	if _, err := tx.Exec(`DELETE FROM traffic_buckets WHERE tunnel_id = ?`, id); err != nil {
+		return StoredTunnel{}, StoredTunnel{}, err
+	}
+	if err := commitTx(tx, &committed); err != nil {
+		return StoredTunnel{}, StoredTunnel{}, err
+	}
+	after, err := scanStoredTunnel(s.db.QueryRow(`SELECT `+tunnelSelectColumns+` FROM tunnels WHERE id = ?`, id))
+	if err != nil {
+		return StoredTunnel{}, StoredTunnel{}, err
+	}
+	if trafficStore != nil {
+		trafficStore.resetTunnelAfterMigrationLocked(id, after.Revision)
+	}
+	return existing, after, nil
+}
+
 // UpdateHostname updates the display hostname for a given Client.
 func (s *TunnelStore) UpdateHostname(clientID, hostname string) error {
 	s.mu.Lock()
@@ -942,10 +1096,12 @@ func (s *TunnelStore) DeleteTunnelsByClientID(clientID string) error {
 	}
 	committed := false
 	defer rollbackUnlessCommitted(tx, &committed)
-	if _, err := tx.Exec(`DELETE FROM tunnel_resource_locks WHERE tunnel_id IN (SELECT id FROM tunnels WHERE client_id = ?)`, clientID); err != nil {
+	if _, err := tx.Exec(`DELETE FROM tunnel_resource_locks WHERE tunnel_id IN (
+		SELECT id FROM tunnels WHERE client_id = ? OR owner_client_id = ? OR ingress_client_id = ? OR target_client_id = ?
+	)`, clientID, clientID, clientID, clientID); err != nil {
 		return err
 	}
-	if _, err := tx.Exec(`DELETE FROM tunnels WHERE client_id = ?`, clientID); err != nil {
+	if _, err := tx.Exec(`DELETE FROM tunnels WHERE client_id = ? OR owner_client_id = ? OR ingress_client_id = ? OR target_client_id = ?`, clientID, clientID, clientID, clientID); err != nil {
 		return err
 	}
 	return commitTx(tx, &committed)

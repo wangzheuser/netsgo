@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -217,6 +218,28 @@ func rejectPreflight(t *testing.T, conn interface {
 	}
 	return req
 }
+
+type gatedRequestBody struct {
+	data        []byte
+	readStarted chan struct{}
+	release     chan struct{}
+}
+
+func (b *gatedRequestBody) Read(p []byte) (int, error) {
+	select {
+	case b.readStarted <- struct{}{}:
+	default:
+	}
+	<-b.release
+	if len(b.data) == 0 {
+		return 0, io.EOF
+	}
+	n := copy(p, b.data)
+	b.data = b.data[n:]
+	return n, nil
+}
+
+func (b *gatedRequestBody) Close() error { return nil }
 
 func doMuxRequestAsync(t *testing.T, handler http.Handler, method, path, token string, body []byte) <-chan *httptest.ResponseRecorder {
 	t.Helper()
@@ -1455,6 +1478,948 @@ func TestAPI_UnifiedTunnelUpdateRequiresExpectedRevisionAndHardDelete(t *testing
 	assertTunnelBandwidthFields(t, tunnelPayload, 128, 256)
 }
 
+func TestAPI_UnifiedTunnelUpdateRejectsOwnerChange(t *testing.T) {
+	s, handler, token, cleanup := setupTestServerWithStores(t, true)
+	defer cleanup()
+
+	// Given
+	currentTarget := createUnifiedAPITestClient(t, s, "install-update-owner-current", "update-owner-current")
+	nextTarget := createUnifiedAPITestClient(t, s, "install-update-owner-next", "update-owner-next")
+	ingressPort := reserveTCPPort(t)
+	createResp := doMuxRequest(t, handler, http.MethodPost, "/api/tunnels", token, unifiedCreatePayload("update-owner-reject", currentTarget.ID, ingressPort))
+	if createResp.Code != http.StatusCreated {
+		t.Fatalf("POST /api/tunnels: want 201, got %d body=%s", createResp.Code, createResp.Body.String())
+	}
+	var created tunnelSpecAPI
+	if err := mustDecodeJSON(t, createResp.Body, &created); err != nil {
+		t.Fatalf("decode created tunnel: %v", err)
+	}
+	before, err := s.store.GetTunnelByIDE(currentTarget.ID, created.ID)
+	if err != nil {
+		t.Fatalf("load tunnel before rejected owner update: %v", err)
+	}
+
+	// When
+	update := []byte(`{"expected_revision":` + strconv.FormatInt(created.Revision, 10) + `,"spec":{
+		"name":"update-owner-reject",
+		"topology":"server_expose",
+		"ingress":{"location":"server","type":"tcp_listen","config":{"bind_ip":"0.0.0.0","port":` + strconv.Itoa(ingressPort) + `,"allowed_source_cidrs":["0.0.0.0/0","::/0"]}},
+		"target":{"location":"client","client_id":"` + nextTarget.ID + `","type":"tcp_service","config":{"ip":"127.0.0.1","port":22}},
+		"transport_policy":"server_relay_only"
+	}}`)
+	resp := doMuxRequest(t, handler, http.MethodPut, "/api/tunnels/"+created.ID, token, update)
+
+	// Then
+	if resp.Code != http.StatusBadRequest {
+		t.Fatalf("owner-changing update: want 400, got %d body=%s", resp.Code, resp.Body.String())
+	}
+	var body tunnelMutationErrorResponse
+	if err := mustDecodeJSON(t, resp.Body, &body); err != nil {
+		t.Fatalf("decode owner update error: %v", err)
+	}
+	if body.ErrorCode != "owner_change_not_supported" || body.Field != "target.client_id" {
+		t.Fatalf("owner update error mismatch: %+v", body)
+	}
+	after, err := s.store.GetTunnelByIDE(currentTarget.ID, created.ID)
+	if err != nil {
+		t.Fatalf("load tunnel after rejected owner update: %v", err)
+	}
+	assertStoredTunnelUnchangedAfterRejectedUpdate(t, before, after)
+	if _, err := s.store.GetTunnelByIDE(nextTarget.ID, created.ID); !errors.Is(err, ErrTunnelNotFound) {
+		t.Fatalf("rejected owner update must not create next-target tunnel, got err=%v", err)
+	}
+}
+
+func TestAPI_UnifiedTunnelMigrateRejectsMissingRevision(t *testing.T) {
+	s, handler, token, cleanup := setupTestServerWithStores(t, true)
+	defer cleanup()
+
+	// Given
+	currentTarget := createUnifiedAPITestClient(t, s, "install-migrate-missing-rev-current", "migrate-missing-rev-current")
+	nextTarget := createUnifiedAPITestClient(t, s, "install-migrate-missing-rev-next", "migrate-missing-rev-next")
+	createResp := doMuxRequest(t, handler, http.MethodPost, "/api/tunnels", token, unifiedCreatePayload("migrate-missing-revision", currentTarget.ID, reserveTCPPort(t)))
+	if createResp.Code != http.StatusCreated {
+		t.Fatalf("POST /api/tunnels: want 201, got %d body=%s", createResp.Code, createResp.Body.String())
+	}
+	var created tunnelSpecAPI
+	if err := mustDecodeJSON(t, createResp.Body, &created); err != nil {
+		t.Fatalf("decode created tunnel: %v", err)
+	}
+	before, err := s.store.GetTunnelByIDE(currentTarget.ID, created.ID)
+	if err != nil {
+		t.Fatalf("load tunnel before rejected migration: %v", err)
+	}
+
+	// When
+	resp := doMuxRequest(t, handler, http.MethodPost, "/api/tunnels/"+created.ID+"/migrate", token, []byte(`{"target_client_id":"`+nextTarget.ID+`"}`))
+
+	// Then
+	assertMigrateRevisionConflictResponse(t, resp, http.StatusBadRequest, created.Revision)
+	assertMigrateRejectDidNotMutate(t, s, before, currentTarget.ID, nextTarget.ID)
+}
+
+func TestAPI_UnifiedTunnelMigrateRejectsRevisionConflict(t *testing.T) {
+	s, handler, token, cleanup := setupTestServerWithStores(t, true)
+	defer cleanup()
+
+	// Given
+	currentTarget := createUnifiedAPITestClient(t, s, "install-migrate-rev-current", "migrate-rev-current")
+	nextTarget := createUnifiedAPITestClient(t, s, "install-migrate-rev-next", "migrate-rev-next")
+	createResp := doMuxRequest(t, handler, http.MethodPost, "/api/tunnels", token, unifiedCreatePayload("migrate-revision-conflict", currentTarget.ID, reserveTCPPort(t)))
+	if createResp.Code != http.StatusCreated {
+		t.Fatalf("POST /api/tunnels: want 201, got %d body=%s", createResp.Code, createResp.Body.String())
+	}
+	var created tunnelSpecAPI
+	if err := mustDecodeJSON(t, createResp.Body, &created); err != nil {
+		t.Fatalf("decode created tunnel: %v", err)
+	}
+	before, err := s.store.GetTunnelByIDE(currentTarget.ID, created.ID)
+	if err != nil {
+		t.Fatalf("load tunnel before rejected migration: %v", err)
+	}
+
+	// When
+	body := []byte(`{"expected_revision":` + strconv.FormatInt(created.Revision+1, 10) + `,"target_client_id":"` + nextTarget.ID + `"}`)
+	resp := doMuxRequest(t, handler, http.MethodPost, "/api/tunnels/"+created.ID+"/migrate", token, body)
+
+	// Then
+	assertMigrateRevisionConflictResponse(t, resp, http.StatusConflict, created.Revision)
+	assertMigrateRejectDidNotMutate(t, s, before, currentTarget.ID, nextTarget.ID)
+}
+
+func TestAPI_UnifiedTunnelMigrateConcurrentSameRevisionReturnsOneSuccessAndRevisionConflicts(t *testing.T) {
+	s, handler, token, cleanup := setupTestServerWithStores(t, true)
+	defer cleanup()
+
+	currentTarget := createUnifiedAPITestClient(t, s, "install-migrate-concurrent-current", "migrate-concurrent-current")
+	nextTarget := createUnifiedAPITestClient(t, s, "install-migrate-concurrent-next", "migrate-concurrent-next")
+
+	const (
+		rounds   = 8
+		requests = 12
+	)
+	for round := 0; round < rounds; round++ {
+		createResp := doMuxRequest(t, handler, http.MethodPost, "/api/tunnels", token, unifiedCreatePayload(fmt.Sprintf("migrate-concurrent-%d", round), currentTarget.ID, reserveTCPPort(t)))
+		if createResp.Code != http.StatusCreated {
+			t.Fatalf("round %d POST /api/tunnels: want 201, got %d body=%s", round, createResp.Code, createResp.Body.String())
+		}
+		var created tunnelSpecAPI
+		if err := mustDecodeJSON(t, createResp.Body, &created); err != nil {
+			t.Fatalf("round %d decode created tunnel: %v", round, err)
+		}
+
+		requestBody := []byte(`{"expected_revision":` + strconv.FormatInt(created.Revision, 10) + `,"target_client_id":"` + nextTarget.ID + `"}`)
+		gates := make([]*gatedRequestBody, requests)
+		responses := make([]chan *httptest.ResponseRecorder, requests)
+		for i := range requests {
+			gates[i] = &gatedRequestBody{
+				data:        append([]byte(nil), requestBody...),
+				readStarted: make(chan struct{}, 1),
+				release:     make(chan struct{}),
+			}
+			responses[i] = make(chan *httptest.ResponseRecorder, 1)
+			req := httptest.NewRequest(http.MethodPost, "/api/tunnels/"+created.ID+"/migrate", gates[i])
+			req.Host = defaultTestRequestHost()
+			req.Header.Set("Content-Type", "application/json")
+			req.Header.Set("Authorization", "Bearer "+token)
+			go func(index int) {
+				resp := httptest.NewRecorder()
+				handler.ServeHTTP(resp, req)
+				responses[index] <- resp
+			}(i)
+		}
+
+		// Every handler has already captured the same initial tunnel spec before
+		// the winner moves its owner. Releasing the followers afterwards makes a
+		// stale owner lookup deterministic while preserving concurrent handlers.
+		for i := range requests {
+			<-gates[i].readStarted
+		}
+		close(gates[0].release)
+		winner := <-responses[0]
+		if winner.Code != http.StatusOK {
+			t.Fatalf("round %d winner: want 200, got %d body=%s", round, winner.Code, winner.Body.String())
+		}
+		for i := 1; i < requests; i++ {
+			close(gates[i].release)
+		}
+
+		successes := 1
+		for i := 1; i < requests; i++ {
+			resp := <-responses[i]
+			if resp.Code == http.StatusOK {
+				successes++
+				continue
+			}
+			assertMigrateRevisionConflictResponse(t, resp, http.StatusConflict, 0)
+		}
+		if successes != 1 {
+			t.Fatalf("round %d concurrent migrations: want exactly one success, got %d", round, successes)
+		}
+	}
+}
+
+func TestAPI_UnifiedTunnelMigrateConcurrentTargetDeleteNeverLeavesOrphan(t *testing.T) {
+	s, handler, token, cleanup := setupTestServerWithStores(t, true)
+	defer cleanup()
+
+	currentTarget := createUnifiedAPITestClient(t, s, "install-migrate-delete-current", "migrate-delete-current")
+	const rounds = 24
+	for round := 0; round < rounds; round++ {
+		target := createUnifiedAPITestClient(t, s, fmt.Sprintf("install-migrate-delete-target-%d", round), fmt.Sprintf("migrate-delete-target-%d", round))
+		created := testStoredServerExposeTCPTunnel(fmt.Sprintf("migrate-delete-id-%d", round), fmt.Sprintf("migrate-delete-%d", round), currentTarget.ID, 8080+round, 30000+round, time.Now().UTC())
+		created.DesiredState = protocol.ProxyDesiredStateStopped
+		created.RuntimeState = protocol.ProxyRuntimeStateIdle
+		mustAddStableTunnel(t, s.store, created)
+		var err error
+		created, err = s.store.GetTunnelByID(created.ID)
+		if err != nil {
+			t.Fatalf("round %d load created tunnel: %v", round, err)
+		}
+
+		start := make(chan struct{})
+		migrateResult := make(chan *httptest.ResponseRecorder, 1)
+		deleteResult := make(chan *httptest.ResponseRecorder, 1)
+		go func() {
+			<-start
+			body := []byte(`{"expected_revision":` + strconv.FormatInt(created.Revision, 10) + `,"target_client_id":"` + target.ID + `"}`)
+			migrateResult <- doMuxRequest(t, handler, http.MethodPost, "/api/tunnels/"+created.ID+"/migrate", token, body)
+		}()
+		go func() {
+			<-start
+			deleteResult <- doMuxRequest(t, handler, http.MethodDelete, "/api/clients/"+target.ID, token, nil)
+		}()
+		close(start)
+
+		migrateResp := <-migrateResult
+		deleteResp := <-deleteResult
+		if deleteResp.Code != http.StatusNoContent {
+			t.Fatalf("round %d DELETE target: want 204, got %d body=%s", round, deleteResp.Code, deleteResp.Body.String())
+		}
+		switch migrateResp.Code {
+		case http.StatusOK:
+			if _, err := s.store.GetTunnelByID(created.ID); !errors.Is(err, ErrTunnelNotFound) {
+				t.Fatalf("round %d migrate-wins delete must remove migrated tunnel, got %v", round, err)
+			}
+		case http.StatusNotFound:
+			assertMigrateErrorResponse(t, migrateResp, http.StatusNotFound, protocol.TunnelMutationErrorCodeUnknownClient, "target_client_id")
+			remaining, err := s.store.GetTunnelByID(created.ID)
+			if err != nil {
+				t.Fatalf("round %d delete-wins migration should leave original tunnel: %v", round, err)
+			}
+			if remaining.Target.ClientID != currentTarget.ID || remaining.OwnerClientID != currentTarget.ID {
+				t.Fatalf("round %d delete-wins migration mutated original tunnel: %+v", round, remaining)
+			}
+		default:
+			t.Fatalf("round %d migrate status = %d body=%s, want 200 or 404", round, migrateResp.Code, migrateResp.Body.String())
+		}
+		if _, ok := s.auth.adminStore.GetRegisteredClient(target.ID); ok {
+			t.Fatalf("round %d deleted target remains registered", round)
+		}
+		var orphanCount int
+		if err := s.store.db.QueryRow(`SELECT COUNT(*) FROM tunnels WHERE client_id = ? OR owner_client_id = ? OR ingress_client_id = ? OR target_client_id = ?`, target.ID, target.ID, target.ID, target.ID).Scan(&orphanCount); err != nil {
+			t.Fatalf("round %d count target tunnel references: %v", round, err)
+		}
+		if orphanCount != 0 {
+			t.Fatalf("round %d deleted target has %d tunnel reference(s)", round, orphanCount)
+		}
+	}
+}
+
+func TestAPI_UnifiedTunnelMigrateRejectsUnknownTargetClient(t *testing.T) {
+	s, handler, token, cleanup := setupTestServerWithStores(t, true)
+	defer cleanup()
+
+	// Given
+	currentTarget := createUnifiedAPITestClient(t, s, "install-migrate-unknown-current", "migrate-unknown-current")
+	createResp := doMuxRequest(t, handler, http.MethodPost, "/api/tunnels", token, unifiedCreatePayload("migrate-unknown-target", currentTarget.ID, reserveTCPPort(t)))
+	if createResp.Code != http.StatusCreated {
+		t.Fatalf("POST /api/tunnels: want 201, got %d body=%s", createResp.Code, createResp.Body.String())
+	}
+	var created tunnelSpecAPI
+	if err := mustDecodeJSON(t, createResp.Body, &created); err != nil {
+		t.Fatalf("decode created tunnel: %v", err)
+	}
+	before, err := s.store.GetTunnelByIDE(currentTarget.ID, created.ID)
+	if err != nil {
+		t.Fatalf("load tunnel before rejected migration: %v", err)
+	}
+
+	// When
+	body := []byte(`{"expected_revision":` + strconv.FormatInt(created.Revision, 10) + `,"target_client_id":"missing-target"}`)
+	resp := doMuxRequest(t, handler, http.MethodPost, "/api/tunnels/"+created.ID+"/migrate", token, body)
+
+	// Then
+	assertMigrateErrorResponse(t, resp, http.StatusNotFound, protocol.TunnelMutationErrorCodeUnknownClient, "target_client_id")
+	assertMigrateRejectDidNotMutate(t, s, before, currentTarget.ID, "missing-target")
+}
+
+func TestAPI_UnifiedTunnelMigrateRejectsSameTargetClient(t *testing.T) {
+	s, handler, token, cleanup := setupTestServerWithStores(t, true)
+	defer cleanup()
+
+	// Given
+	currentTarget := createUnifiedAPITestClient(t, s, "install-migrate-same-current", "migrate-same-current")
+	createResp := doMuxRequest(t, handler, http.MethodPost, "/api/tunnels", token, unifiedCreatePayload("migrate-same-target", currentTarget.ID, reserveTCPPort(t)))
+	if createResp.Code != http.StatusCreated {
+		t.Fatalf("POST /api/tunnels: want 201, got %d body=%s", createResp.Code, createResp.Body.String())
+	}
+	var created tunnelSpecAPI
+	if err := mustDecodeJSON(t, createResp.Body, &created); err != nil {
+		t.Fatalf("decode created tunnel: %v", err)
+	}
+	before, err := s.store.GetTunnelByIDE(currentTarget.ID, created.ID)
+	if err != nil {
+		t.Fatalf("load tunnel before rejected migration: %v", err)
+	}
+
+	// When
+	body := []byte(`{"expected_revision":` + strconv.FormatInt(created.Revision, 10) + `,"target_client_id":"` + currentTarget.ID + `"}`)
+	resp := doMuxRequest(t, handler, http.MethodPost, "/api/tunnels/"+created.ID+"/migrate", token, body)
+
+	// Then
+	assertMigrateErrorResponse(t, resp, http.StatusBadRequest, "same_target_client", "target_client_id")
+	assertMigrateRejectDidNotMutate(t, s, before, currentTarget.ID, currentTarget.ID)
+}
+
+func TestAPI_UnifiedTunnelMigrateRejectsPendingTunnel(t *testing.T) {
+	s, handler, token, cleanup := setupTestServerWithStores(t, true)
+	defer cleanup()
+
+	// Given
+	currentTarget := createUnifiedAPITestClient(t, s, "install-migrate-pending-current", "migrate-pending-current")
+	nextTarget := createUnifiedAPITestClient(t, s, "install-migrate-pending-next", "migrate-pending-next")
+	createResp := doMuxRequest(t, handler, http.MethodPost, "/api/tunnels", token, unifiedCreatePayload("migrate-pending", currentTarget.ID, reserveTCPPort(t)))
+	if createResp.Code != http.StatusCreated {
+		t.Fatalf("POST /api/tunnels: want 201, got %d body=%s", createResp.Code, createResp.Body.String())
+	}
+	var created tunnelSpecAPI
+	if err := mustDecodeJSON(t, createResp.Body, &created); err != nil {
+		t.Fatalf("decode created tunnel: %v", err)
+	}
+	stored, err := s.store.GetTunnelByIDE(currentTarget.ID, created.ID)
+	if err != nil {
+		t.Fatalf("load tunnel before marking pending: %v", err)
+	}
+	if err := s.store.UpdateStates(currentTarget.ID, stored.Name, protocol.ProxyDesiredStateRunning, protocol.ProxyRuntimeStatePending, ""); err != nil {
+		t.Fatalf("mark tunnel pending: %v", err)
+	}
+	before, err := s.store.GetTunnelByIDE(currentTarget.ID, created.ID)
+	if err != nil {
+		t.Fatalf("load pending tunnel: %v", err)
+	}
+
+	// When
+	body := []byte(`{"expected_revision":` + strconv.FormatInt(created.Revision, 10) + `,"target_client_id":"` + nextTarget.ID + `"}`)
+	resp := doMuxRequest(t, handler, http.MethodPost, "/api/tunnels/"+created.ID+"/migrate", token, body)
+
+	// Then
+	assertMigrateErrorResponse(t, resp, http.StatusConflict, "tunnel_pending", "runtime_state")
+	assertMigrateRejectDidNotMutate(t, s, before, currentTarget.ID, nextTarget.ID)
+}
+
+func TestAPI_UnifiedTunnelMigrateRejectsClientRelayIngressAsNewTarget(t *testing.T) {
+	s, handler, token, cleanup := setupTestServerWithStores(t, true)
+	defer cleanup()
+
+	// Given
+	currentTarget := createUnifiedAPITestClient(t, s, "install-migrate-c2c-current", "migrate-c2c-current")
+	ingress := createUnifiedAPITestClient(t, s, "install-migrate-c2c-ingress", "migrate-c2c-ingress")
+	stored := addUnifiedC2CTestTunnel(t, s, "migrate-c2c-ingress-target", ingress.ID, currentTarget.ID, reserveTCPPort(t))
+	before, err := s.store.GetTunnelByIDE(currentTarget.ID, stored.ID)
+	if err != nil {
+		t.Fatalf("load c2c tunnel before rejected migration: %v", err)
+	}
+
+	// When
+	body := []byte(`{"expected_revision":` + strconv.FormatInt(stored.Revision, 10) + `,"target_client_id":"` + ingress.ID + `"}`)
+	resp := doMuxRequest(t, handler, http.MethodPost, "/api/tunnels/"+stored.ID+"/migrate", token, body)
+
+	// Then
+	assertMigrateErrorResponse(t, resp, http.StatusBadRequest, protocol.TunnelMutationErrorCodeSameIngressAndTargetClient, "target_client_id")
+	assertMigrateRejectDidNotMutate(t, s, before, currentTarget.ID, ingress.ID)
+}
+
+func TestAPI_UnifiedTunnelMigrateRejectsUnsupportedTargetCapabilityWithoutMutation(t *testing.T) {
+	s, handler, token, cleanup := setupTestServerWithStores(t, true)
+	defer cleanup()
+
+	// Given
+	currentTarget := createUnifiedAPITestClient(t, s, "install-migrate-cap-current", "migrate-cap-current")
+	unsupportedCaps := protocol.DefaultClientCapabilities()
+	unsupportedCaps.TargetTypes = []string{protocol.TargetTypeUDPService}
+	nextTarget := createUnifiedAPITestClientWithCapabilities(t, s, "install-migrate-cap-next", "migrate-cap-next", unsupportedCaps)
+	createResp := doMuxRequest(t, handler, http.MethodPost, "/api/tunnels", token, unifiedCreatePayload("migrate-unsupported-capability", currentTarget.ID, reserveTCPPort(t)))
+	if createResp.Code != http.StatusCreated {
+		t.Fatalf("POST /api/tunnels: want 201, got %d body=%s", createResp.Code, createResp.Body.String())
+	}
+	var created tunnelSpecAPI
+	if err := mustDecodeJSON(t, createResp.Body, &created); err != nil {
+		t.Fatalf("decode created tunnel: %v", err)
+	}
+	before, err := s.store.GetTunnelByIDE(currentTarget.ID, created.ID)
+	if err != nil {
+		t.Fatalf("load tunnel before rejected migration: %v", err)
+	}
+	defaultCaps := protocol.DefaultClientCapabilities()
+	liveCurrent := &ClientConn{ID: currentTarget.ID, generation: 1, state: clientStateLive, proxies: make(map[string]*ProxyTunnel)}
+	liveCurrent.SetInfo(protocol.ClientInfo{Capabilities: &defaultCaps})
+	liveCurrent.proxies[before.Name] = &ProxyTunnel{Config: storedTunnelToProxyConfig(before)}
+	s.clients.Store(currentTarget.ID, liveCurrent)
+
+	// When
+	body := []byte(`{"expected_revision":` + strconv.FormatInt(created.Revision, 10) + `,"target_client_id":"` + nextTarget.ID + `"}`)
+	resp := doMuxRequest(t, handler, http.MethodPost, "/api/tunnels/"+created.ID+"/migrate", token, body)
+
+	// Then
+	assertMigrateErrorResponse(t, resp, http.StatusBadRequest, protocol.TunnelMutationErrorCodeCapabilityNotSupported, "target.type")
+	assertMigrateRejectDidNotMutate(t, s, before, currentTarget.ID, nextTarget.ID)
+	if _, exists := liveCurrent.proxies[before.Name]; !exists {
+		t.Fatal("rejected migration must not remove current target runtime")
+	}
+	if value, ok := s.clients.Load(nextTarget.ID); ok {
+		nextLive := value.(*ClientConn)
+		if _, exists := nextLive.proxies[before.Name]; exists {
+			t.Fatal("rejected migration must not create next-target runtime")
+		}
+	}
+}
+
+func TestAPI_UnifiedTunnelMigrateRejectsMalformedJSONEmptyTargetAndInvalidRevision(t *testing.T) {
+	s, handler, token, cleanup := setupTestServerWithStores(t, true)
+	defer cleanup()
+
+	// Given
+	currentTarget := createUnifiedAPITestClient(t, s, "install-migrate-malformed-current", "migrate-malformed-current")
+	createResp := doMuxRequest(t, handler, http.MethodPost, "/api/tunnels", token, unifiedCreatePayload("migrate-malformed", currentTarget.ID, reserveTCPPort(t)))
+	if createResp.Code != http.StatusCreated {
+		t.Fatalf("POST /api/tunnels: want 201, got %d body=%s", createResp.Code, createResp.Body.String())
+	}
+	var created tunnelSpecAPI
+	if err := mustDecodeJSON(t, createResp.Body, &created); err != nil {
+		t.Fatalf("decode created tunnel: %v", err)
+	}
+	before, err := s.store.GetTunnelByIDE(currentTarget.ID, created.ID)
+	if err != nil {
+		t.Fatalf("load tunnel before rejected migrations: %v", err)
+	}
+
+	for _, tc := range []struct {
+		name       string
+		body       []byte
+		wantStatus int
+		wantCode   string
+		wantField  string
+	}{
+		{name: "malformed json", body: []byte(`{"expected_revision":`), wantStatus: http.StatusBadRequest, wantCode: "invalid_request_body"},
+		{name: "empty target", body: []byte(`{"expected_revision":` + strconv.FormatInt(created.Revision, 10) + `,"target_client_id":"   "}`), wantStatus: http.StatusBadRequest, wantCode: "missing_client_id", wantField: "target_client_id"},
+		{name: "invalid revision", body: []byte(`{"expected_revision":-1,"target_client_id":"missing-target"}`), wantStatus: http.StatusBadRequest, wantCode: protocol.TunnelMutationErrorCodeRevisionConflict, wantField: "expected_revision"},
+		{name: "forbidden name", body: []byte(`{"expected_revision":` + strconv.FormatInt(created.Revision, 10) + `,"target_client_id":"missing-target","name":"renamed"}`), wantStatus: http.StatusBadRequest, wantCode: "server_owned_field", wantField: "name"},
+		{name: "forbidden ingress", body: []byte(`{"expected_revision":` + strconv.FormatInt(created.Revision, 10) + `,"target_client_id":"missing-target","ingress":{"type":"tcp_listen"}}`), wantStatus: http.StatusBadRequest, wantCode: "server_owned_field", wantField: "ingress"},
+		{name: "forbidden target endpoint", body: []byte(`{"expected_revision":` + strconv.FormatInt(created.Revision, 10) + `,"target_client_id":"missing-target","target":{"type":"tcp_service","config":{"host":"127.0.0.1","port":22}}}`), wantStatus: http.StatusBadRequest, wantCode: "server_owned_field", wantField: "target"},
+		{name: "forbidden bandwidth", body: []byte(`{"expected_revision":` + strconv.FormatInt(created.Revision, 10) + `,"target_client_id":"missing-target","bandwidth_settings":{"ingress_bps":1}}`), wantStatus: http.StatusBadRequest, wantCode: "server_owned_field", wantField: "bandwidth_settings"},
+		{name: "forbidden transport", body: []byte(`{"expected_revision":` + strconv.FormatInt(created.Revision, 10) + `,"target_client_id":"missing-target","transport_policy":"server_relay_only"}`), wantStatus: http.StatusBadRequest, wantCode: "server_owned_field", wantField: "transport_policy"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			// When
+			resp := doMuxRequest(t, handler, http.MethodPost, "/api/tunnels/"+created.ID+"/migrate", token, tc.body)
+
+			// Then
+			if tc.wantCode == "invalid_request_body" {
+				if resp.Code != tc.wantStatus {
+					t.Fatalf("%s: want %d, got %d body=%s", tc.name, tc.wantStatus, resp.Code, resp.Body.String())
+				}
+			} else if tc.wantCode == protocol.TunnelMutationErrorCodeRevisionConflict {
+				assertMigrateRevisionConflictResponse(t, resp, tc.wantStatus, created.Revision)
+			} else {
+				assertMigrateErrorResponse(t, resp, tc.wantStatus, tc.wantCode, tc.wantField)
+			}
+			assertMigrateRejectDidNotMutate(t, s, before, currentTarget.ID, "missing-target")
+		})
+	}
+}
+
+func TestAPI_UnifiedTunnelMigrateServerExposeMovesTargetAndPreservesConfig(t *testing.T) {
+	s, handler, token, cleanup := setupTestServerWithStores(t, true)
+	defer cleanup()
+
+	// Given
+	currentTarget := createUnifiedAPITestClient(t, s, "install-migrate-server-expose-current", "migrate-server-expose-current")
+	nextTarget := createUnifiedAPITestClient(t, s, "install-migrate-server-expose-next", "migrate-server-expose-next")
+	ingressPort := reserveTCPPort(t)
+	body := []byte(`{
+		"name":"migrate-server-expose-preserve",
+		"topology":"server_expose",
+		"ingress":{"location":"server","type":"tcp_listen","config":{"bind_ip":"0.0.0.0","port":` + strconv.Itoa(ingressPort) + `,"allowed_source_cidrs":["10.0.0.0/8"]}},
+		"target":{"location":"client","client_id":"` + currentTarget.ID + `","type":"tcp_service","config":{"host":"10.20.30.40","port":22022}},
+		"transport_policy":"server_relay_only",
+		"bandwidth_settings":{"ingress_bps":4096,"egress_bps":8192}
+	}`)
+	createResp := doMuxRequest(t, handler, http.MethodPost, "/api/tunnels", token, body)
+	if createResp.Code != http.StatusCreated {
+		t.Fatalf("POST /api/tunnels: want 201, got %d body=%s", createResp.Code, createResp.Body.String())
+	}
+	var created tunnelSpecAPI
+	if err := mustDecodeJSON(t, createResp.Body, &created); err != nil {
+		t.Fatalf("decode created tunnel: %v", err)
+	}
+	before, err := s.store.GetTunnelByIDE(currentTarget.ID, created.ID)
+	if err != nil {
+		t.Fatalf("load tunnel before migration: %v", err)
+	}
+
+	// When
+	migrateBody := []byte(`{"expected_revision":` + strconv.FormatInt(created.Revision, 10) + `,"target_client_id":"` + nextTarget.ID + `"}`)
+	resp := doMuxRequest(t, handler, http.MethodPost, "/api/tunnels/"+created.ID+"/migrate", token, migrateBody)
+
+	// Then
+	if resp.Code != http.StatusOK {
+		t.Fatalf("migrate server_expose: want 200, got %d body=%s", resp.Code, resp.Body.String())
+	}
+	var payload struct {
+		Tunnel tunnelSpecAPI `json:"tunnel"`
+	}
+	if err := mustDecodeJSON(t, resp.Body, &payload); err != nil {
+		t.Fatalf("decode migration response: %v", err)
+	}
+	if payload.Tunnel.Revision != before.Revision+1 {
+		t.Fatalf("migrated revision: want %d, got %d", before.Revision+1, payload.Tunnel.Revision)
+	}
+	if payload.Tunnel.OwnerClientID != nextTarget.ID || payload.Tunnel.Target.ClientID != nextTarget.ID {
+		t.Fatalf("migrated response owner/target mismatch: %+v", payload.Tunnel)
+	}
+	if _, err := s.store.GetTunnelByIDE(currentTarget.ID, created.ID); !errors.Is(err, ErrTunnelNotFound) {
+		t.Fatalf("old target must no longer own migrated tunnel, got err=%v", err)
+	}
+	after, err := s.store.GetTunnelByIDE(nextTarget.ID, created.ID)
+	if err != nil {
+		t.Fatalf("new target should own migrated tunnel: %v", err)
+	}
+	assertServerExposeMigrationPreservedStoredConfig(t, before, after, nextTarget.ID)
+	assertClientTunnelOwnership(t, handler, token, currentTarget.ID, created.ID, false)
+	assertClientTunnelOwnership(t, handler, token, nextTarget.ID, created.ID, true)
+}
+
+func TestAPI_UnifiedTunnelMigrateClientRelayMovesTargetKeepsIngress(t *testing.T) {
+	s, handler, token, cleanup := setupTestServerWithStores(t, true)
+	defer cleanup()
+
+	ingress := createUnifiedAPITestClient(t, s, "install-migrate-c2c-move-ingress", "migrate-c2c-move-ingress")
+	currentTarget := createUnifiedAPITestClient(t, s, "install-migrate-c2c-move-current", "migrate-c2c-move-current")
+	nextTarget := createUnifiedAPITestClient(t, s, "install-migrate-c2c-move-next", "migrate-c2c-move-next")
+	stored := addUnifiedC2CTestTunnel(t, s, "migrate-c2c-move", ingress.ID, currentTarget.ID, reserveTCPPort(t))
+	before, err := s.store.GetTunnelByIDE(currentTarget.ID, stored.ID)
+	if err != nil {
+		t.Fatalf("load c2c tunnel before migration: %v", err)
+	}
+
+	body := []byte(`{"expected_revision":` + strconv.FormatInt(before.Revision, 10) + `,"target_client_id":"` + nextTarget.ID + `"}`)
+	resp := doMuxRequest(t, handler, http.MethodPost, "/api/tunnels/"+stored.ID+"/migrate", token, body)
+	if resp.Code != http.StatusOK {
+		t.Fatalf("migrate c2c tunnel: want 200, got %d body=%s", resp.Code, resp.Body.String())
+	}
+
+	after, err := s.store.GetTunnelByIDE(nextTarget.ID, stored.ID)
+	if err != nil {
+		t.Fatalf("load migrated c2c tunnel: %v", err)
+	}
+	if after.Ingress.ClientID != ingress.ID || after.Target.ClientID != nextTarget.ID || after.OwnerClientID != nextTarget.ID || after.ClientID != nextTarget.ID {
+		t.Fatalf("c2c participants after migration mismatch: %+v", after)
+	}
+	if after.Ingress.Type != before.Ingress.Type || !bytes.Equal(after.Ingress.Config, before.Ingress.Config) || after.Target.Type != before.Target.Type || !bytes.Equal(after.Target.Config, before.Target.Config) {
+		t.Fatalf("c2c endpoint config changed during migration:\nbefore=%+v\nafter=%+v", before, after)
+	}
+	if after.RuntimeState != protocol.ProxyRuntimeStateOffline || after.Revision != before.Revision+1 {
+		t.Fatalf("c2c migrated runtime/revision mismatch: %+v", after)
+	}
+}
+
+func TestAPI_UnifiedTunnelMigrateSOCKS5MovesProxyHandlerAndPreservesPolicy(t *testing.T) {
+	s, handler, token, cleanup := setupTestServerWithStores(t, true)
+	defer cleanup()
+
+	ingress := createUnifiedAPITestClient(t, s, "install-migrate-socks5-ingress", "migrate-socks5-ingress")
+	currentTarget := createUnifiedAPITestClient(t, s, "install-migrate-socks5-current", "migrate-socks5-current")
+	nextTarget := createUnifiedAPITestClient(t, s, "install-migrate-socks5-next", "migrate-socks5-next")
+	createBody := []byte(fmt.Sprintf(`{
+		"name":"migrate-c2c-socks5",
+		"topology":"client_to_client",
+		"ingress":{"location":"client","client_id":"%s","type":"socks5_listen","config":{"bind_ip":"127.0.0.1","port":%d,"allowed_source_cidrs":["127.0.0.0/8"],"auth":{"type":"none"}}},
+		"target":{"location":"client","client_id":"%s","type":"socks5_connect_handler","config":{"allowed_target_cidrs":["10.0.0.0/8"],"allowed_target_hosts":["internal.example"],"allowed_target_ports":[443,8443],"dial_timeout_seconds":9}},
+		"transport_policy":"server_relay_only"
+	}`, ingress.ID, reserveTCPPort(t), currentTarget.ID))
+	createResp := doMuxRequest(t, handler, http.MethodPost, "/api/tunnels", token, createBody)
+	if createResp.Code != http.StatusCreated {
+		t.Fatalf("create c2c SOCKS5 tunnel: want 201, got %d body=%s", createResp.Code, createResp.Body.String())
+	}
+	var created tunnelSpecAPI
+	if err := mustDecodeJSON(t, createResp.Body, &created); err != nil {
+		t.Fatalf("decode created c2c SOCKS5 tunnel: %v", err)
+	}
+	before, err := s.store.GetTunnelByIDE(currentTarget.ID, created.ID)
+	if err != nil {
+		t.Fatalf("load SOCKS5 tunnel before migration: %v", err)
+	}
+
+	body := []byte(`{"expected_revision":` + strconv.FormatInt(before.Revision, 10) + `,"target_client_id":"` + nextTarget.ID + `"}`)
+	resp := doMuxRequest(t, handler, http.MethodPost, "/api/tunnels/"+created.ID+"/migrate", token, body)
+	if resp.Code != http.StatusOK {
+		t.Fatalf("migrate c2c SOCKS5 tunnel: want 200, got %d body=%s", resp.Code, resp.Body.String())
+	}
+	after, err := s.store.GetTunnelByIDE(nextTarget.ID, created.ID)
+	if err != nil {
+		t.Fatalf("load migrated SOCKS5 tunnel: %v", err)
+	}
+	if after.Ingress.ClientID != ingress.ID || after.Target.ClientID != nextTarget.ID || after.Target.Type != protocol.TargetTypeSOCKS5ConnectHandler {
+		t.Fatalf("migrated SOCKS5 participants/type mismatch: %+v", after)
+	}
+	if !bytes.Equal(after.Ingress.Config, before.Ingress.Config) || !bytes.Equal(after.Target.Config, before.Target.Config) || after.TransportPolicy != before.TransportPolicy {
+		t.Fatalf("SOCKS5 policy changed during migration:\nbefore ingress=%s target=%s\nafter ingress=%s target=%s", before.Ingress.Config, before.Target.Config, after.Ingress.Config, after.Target.Config)
+	}
+}
+
+func TestAPI_UnifiedTunnelMigrateStoppedTunnelRemainsIdle(t *testing.T) {
+	s, handler, token, cleanup := setupTestServerWithStores(t, true)
+	defer cleanup()
+
+	currentTarget := createUnifiedAPITestClient(t, s, "install-migrate-stopped-current", "migrate-stopped-current")
+	nextTarget := createUnifiedAPITestClient(t, s, "install-migrate-stopped-next", "migrate-stopped-next")
+	createResp := doMuxRequest(t, handler, http.MethodPost, "/api/tunnels", token, unifiedCreatePayload("migrate-stopped", currentTarget.ID, reserveTCPPort(t)))
+	if createResp.Code != http.StatusCreated {
+		t.Fatalf("create stopped migration tunnel: want 201, got %d body=%s", createResp.Code, createResp.Body.String())
+	}
+	var created tunnelSpecAPI
+	if err := mustDecodeJSON(t, createResp.Body, &created); err != nil {
+		t.Fatalf("decode created tunnel: %v", err)
+	}
+	if err := s.store.UpdateStates(currentTarget.ID, created.Name, protocol.ProxyDesiredStateStopped, protocol.ProxyRuntimeStateIdle, ""); err != nil {
+		t.Fatalf("stop stored tunnel: %v", err)
+	}
+
+	body := []byte(`{"expected_revision":` + strconv.FormatInt(created.Revision, 10) + `,"target_client_id":"` + nextTarget.ID + `"}`)
+	resp := doMuxRequest(t, handler, http.MethodPost, "/api/tunnels/"+created.ID+"/migrate", token, body)
+	if resp.Code != http.StatusOK {
+		t.Fatalf("migrate stopped tunnel: want 200, got %d body=%s", resp.Code, resp.Body.String())
+	}
+	after, err := s.store.GetTunnelByIDE(nextTarget.ID, created.ID)
+	if err != nil {
+		t.Fatalf("load stopped migrated tunnel: %v", err)
+	}
+	if after.DesiredState != protocol.ProxyDesiredStateStopped || after.RuntimeState != protocol.ProxyRuntimeStateIdle {
+		t.Fatalf("stopped migrated tunnel state = %s/%s, want stopped/idle", after.DesiredState, after.RuntimeState)
+	}
+}
+
+func TestAPI_UnifiedTunnelMigrateRejectsNewOwnerNameConflict(t *testing.T) {
+	s, handler, token, cleanup := setupTestServerWithStores(t, true)
+	defer cleanup()
+
+	currentTarget := createUnifiedAPITestClient(t, s, "install-migrate-name-current", "migrate-name-current")
+	nextTarget := createUnifiedAPITestClient(t, s, "install-migrate-name-next", "migrate-name-next")
+	oldResp := doMuxRequest(t, handler, http.MethodPost, "/api/tunnels", token, unifiedCreatePayload("duplicate-name", currentTarget.ID, reserveTCPPort(t)))
+	if oldResp.Code != http.StatusCreated {
+		t.Fatalf("create old-owner tunnel: want 201, got %d body=%s", oldResp.Code, oldResp.Body.String())
+	}
+	newResp := doMuxRequest(t, handler, http.MethodPost, "/api/tunnels", token, unifiedCreatePayload("duplicate-name", nextTarget.ID, reserveTCPPort(t)))
+	if newResp.Code != http.StatusCreated {
+		t.Fatalf("create new-owner conflicting tunnel: want 201, got %d body=%s", newResp.Code, newResp.Body.String())
+	}
+	var oldTunnel tunnelSpecAPI
+	if err := mustDecodeJSON(t, oldResp.Body, &oldTunnel); err != nil {
+		t.Fatalf("decode old-owner tunnel: %v", err)
+	}
+
+	body := []byte(`{"expected_revision":` + strconv.FormatInt(oldTunnel.Revision, 10) + `,"target_client_id":"` + nextTarget.ID + `"}`)
+	resp := doMuxRequest(t, handler, http.MethodPost, "/api/tunnels/"+oldTunnel.ID+"/migrate", token, body)
+	assertMigrateErrorResponse(t, resp, http.StatusConflict, protocol.TunnelMutationErrorCodeTunnelNameConflict, "target_client_id")
+	if _, err := s.store.GetTunnelByIDE(currentTarget.ID, oldTunnel.ID); err != nil {
+		t.Fatalf("name-conflicted migration must keep old owner: %v", err)
+	}
+}
+
+func TestAPI_UnifiedTunnelMigrateServerExposeOfflineTargetProjectsOffline(t *testing.T) {
+	s, handler, token, cleanup := setupTestServerWithStores(t, true)
+	defer cleanup()
+
+	// Given
+	currentTarget := createUnifiedAPITestClient(t, s, "install-migrate-offline-current", "migrate-offline-current")
+	nextTarget := createUnifiedAPITestClient(t, s, "install-migrate-offline-next", "migrate-offline-next")
+	createResp := doMuxRequest(t, handler, http.MethodPost, "/api/tunnels", token, unifiedCreatePayload("migrate-offline-target", currentTarget.ID, reserveTCPPort(t)))
+	if createResp.Code != http.StatusCreated {
+		t.Fatalf("POST /api/tunnels: want 201, got %d body=%s", createResp.Code, createResp.Body.String())
+	}
+	var created tunnelSpecAPI
+	if err := mustDecodeJSON(t, createResp.Body, &created); err != nil {
+		t.Fatalf("decode created tunnel: %v", err)
+	}
+
+	// When
+	body := []byte(`{"expected_revision":` + strconv.FormatInt(created.Revision, 10) + `,"target_client_id":"` + nextTarget.ID + `"}`)
+	resp := doMuxRequest(t, handler, http.MethodPost, "/api/tunnels/"+created.ID+"/migrate", token, body)
+
+	// Then
+	if resp.Code != http.StatusOK {
+		t.Fatalf("migrate to offline target: want 200, got %d body=%s", resp.Code, resp.Body.String())
+	}
+	var payload struct {
+		Tunnel tunnelSpecAPI `json:"tunnel"`
+	}
+	if err := mustDecodeJSON(t, resp.Body, &payload); err != nil {
+		t.Fatalf("decode migration response: %v", err)
+	}
+	if payload.Tunnel.RuntimeState != protocol.ProxyRuntimeStateOffline {
+		t.Fatalf("offline target response runtime: want offline, got %q", payload.Tunnel.RuntimeState)
+	}
+	getResp := doMuxRequest(t, handler, http.MethodGet, "/api/tunnels/"+created.ID, token, nil)
+	if getResp.Code != http.StatusOK {
+		t.Fatalf("GET migrated tunnel: want 200, got %d body=%s", getResp.Code, getResp.Body.String())
+	}
+	var reloaded tunnelSpecAPI
+	if err := mustDecodeJSON(t, getResp.Body, &reloaded); err != nil {
+		t.Fatalf("decode reloaded tunnel: %v", err)
+	}
+	if reloaded.Target.ClientID != nextTarget.ID || reloaded.RuntimeState != protocol.ProxyRuntimeStateOffline {
+		t.Fatalf("reloaded offline projection mismatch: %+v", reloaded)
+	}
+}
+
+func TestAPI_UnifiedTunnelMigrateServerExposeEmitsOldAndNewOwnerEvents(t *testing.T) {
+	s, handler, token, cleanup := setupTestServerWithStores(t, true)
+	defer cleanup()
+
+	// Given
+	currentTarget := createUnifiedAPITestClient(t, s, "install-migrate-events-current", "migrate-events-current")
+	nextTarget := createUnifiedAPITestClient(t, s, "install-migrate-events-next", "migrate-events-next")
+	createResp := doMuxRequest(t, handler, http.MethodPost, "/api/tunnels", token, unifiedCreatePayload("migrate-events", currentTarget.ID, reserveTCPPort(t)))
+	if createResp.Code != http.StatusCreated {
+		t.Fatalf("POST /api/tunnels: want 201, got %d body=%s", createResp.Code, createResp.Body.String())
+	}
+	var created tunnelSpecAPI
+	if err := mustDecodeJSON(t, createResp.Body, &created); err != nil {
+		t.Fatalf("decode created tunnel: %v", err)
+	}
+	eventsCh := s.events.Subscribe()
+	defer s.events.Unsubscribe(eventsCh)
+
+	// When
+	body := []byte(`{"expected_revision":` + strconv.FormatInt(created.Revision, 10) + `,"target_client_id":"` + nextTarget.ID + `"}`)
+	resp := doMuxRequest(t, handler, http.MethodPost, "/api/tunnels/"+created.ID+"/migrate", token, body)
+
+	// Then
+	if resp.Code != http.StatusOK {
+		t.Fatalf("migrate for events: want 200, got %d body=%s", resp.Code, resp.Body.String())
+	}
+	events := waitForTunnelChangedEventsByClient(t, eventsCh, "migrate-events", map[string]string{
+		currentTarget.ID: "migrated_out",
+		nextTarget.ID:    "migrated_in",
+	})
+	if gotClientID, _ := events[currentTarget.ID]["client_id"].(string); gotClientID != currentTarget.ID {
+		t.Fatalf("old owner event client_id: want %q, got %#v", currentTarget.ID, events[currentTarget.ID])
+	}
+	if gotClientID, _ := events[nextTarget.ID]["client_id"].(string); gotClientID != nextTarget.ID {
+		t.Fatalf("new owner event client_id: want %q, got %#v", nextTarget.ID, events[nextTarget.ID])
+	}
+	oldTunnel, _ := events[currentTarget.ID]["tunnel"].(map[string]any)
+	newTunnel, _ := events[nextTarget.ID]["tunnel"].(map[string]any)
+	if oldTunnel["client_id"] != currentTarget.ID || oldTunnel["owner_client_id"] != currentTarget.ID {
+		t.Fatalf("old owner event should describe old ownership, got %+v", oldTunnel)
+	}
+	if newTunnel["client_id"] != nextTarget.ID || newTunnel["owner_client_id"] != nextTarget.ID {
+		t.Fatalf("new owner event should describe new ownership, got %+v", newTunnel)
+	}
+}
+
+func assertServerExposeMigrationPreservedStoredConfig(t *testing.T, before, after StoredTunnel, newTargetClientID string) {
+	t.Helper()
+
+	if after.ID != before.ID ||
+		after.Name != before.Name ||
+		after.Topology != before.Topology ||
+		after.ClientID != newTargetClientID ||
+		after.OwnerClientID != newTargetClientID ||
+		after.Target.ClientID != newTargetClientID ||
+		after.Revision != before.Revision+1 {
+		t.Fatalf("migrated stored identity mismatch:\n before=%+v\n after=%+v", before, after)
+	}
+	if after.LocalIP != before.LocalIP ||
+		after.LocalPort != before.LocalPort ||
+		after.RemotePort != before.RemotePort ||
+		after.BindIP != before.BindIP ||
+		after.Domain != before.Domain ||
+		after.IngressBPS != before.IngressBPS ||
+		after.EgressBPS != before.EgressBPS ||
+		after.TransportPolicy != before.TransportPolicy {
+		t.Fatalf("migrated stored config mismatch:\n before=%+v\n after=%+v", before, after)
+	}
+	if after.Ingress.Location != before.Ingress.Location ||
+		after.Ingress.ClientID != before.Ingress.ClientID ||
+		after.Ingress.Type != before.Ingress.Type ||
+		after.Target.Location != before.Target.Location ||
+		after.Target.Type != before.Target.Type {
+		t.Fatalf("migrated endpoint shape mismatch:\n before=%+v\n after=%+v", before, after)
+	}
+	if !bytes.Equal(after.Ingress.Config, before.Ingress.Config) || !bytes.Equal(after.Target.Config, before.Target.Config) {
+		t.Fatalf("migrated endpoint config bytes changed:\n before ingress=%s target=%s\n after ingress=%s target=%s", before.Ingress.Config, before.Target.Config, after.Ingress.Config, after.Target.Config)
+	}
+	if after.DesiredState != before.DesiredState {
+		t.Fatalf("migrated desired state: want %q, got %q", before.DesiredState, after.DesiredState)
+	}
+	if after.RuntimeState != protocol.ProxyRuntimeStateOffline || after.Error != "" {
+		t.Fatalf("migrated runtime metadata: want offline with empty error, got state=%q error=%q", after.RuntimeState, after.Error)
+	}
+}
+
+func assertClientTunnelOwnership(t *testing.T, handler http.Handler, token, clientID, tunnelID string, wantOwned bool) {
+	t.Helper()
+
+	resp := doMuxRequest(t, handler, http.MethodGet, "/api/clients/"+clientID+"/tunnels?role=owner", token, nil)
+	if resp.Code != http.StatusOK {
+		t.Fatalf("GET client tunnels for %s: want 200, got %d body=%s", clientID, resp.Code, resp.Body.String())
+	}
+	var tunnels []protocol.ProxyConfig
+	if err := mustDecodeJSON(t, resp.Body, &tunnels); err != nil {
+		t.Fatalf("decode client tunnels for %s: %v", clientID, err)
+	}
+	for _, tunnel := range tunnels {
+		if tunnel.ID == tunnelID {
+			if !wantOwned {
+				t.Fatalf("client %s should not own tunnel %s after migration", clientID, tunnelID)
+			}
+			return
+		}
+	}
+	if wantOwned {
+		t.Fatalf("client %s should own tunnel %s after migration; got %+v", clientID, tunnelID, tunnels)
+	}
+}
+
+func waitForTunnelChangedEventsByClient(t *testing.T, ch <-chan SSEEvent, tunnelName string, actionByClient map[string]string) map[string]map[string]any {
+	t.Helper()
+
+	found := make(map[string]map[string]any, len(actionByClient))
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		select {
+		case event := <-ch:
+			if event.Type != "tunnel_changed" {
+				continue
+			}
+			var payload map[string]any
+			if err := json.Unmarshal([]byte(event.Data), &payload); err != nil {
+				t.Fatalf("failed to parse tunnel_changed event: %v", err)
+			}
+			gotAction, _ := payload["action"].(string)
+			clientID, _ := payload["client_id"].(string)
+			wantAction, ok := actionByClient[clientID]
+			if !ok || gotAction != wantAction {
+				continue
+			}
+			tunnelPayload, ok := payload["tunnel"].(map[string]any)
+			if !ok {
+				t.Fatalf("tunnel_changed.tunnel has invalid type: %#v", payload["tunnel"])
+			}
+			gotName, _ := tunnelPayload["name"].(string)
+			if gotName != tunnelName {
+				continue
+			}
+			found[clientID] = payload
+			if len(found) == len(actionByClient) {
+				return found
+			}
+		case <-time.After(20 * time.Millisecond):
+		}
+	}
+	t.Fatalf("did not receive tunnel_changed actions=%v tunnel=%q; got=%v", actionByClient, tunnelName, found)
+	return nil
+}
+
+func waitForTunnelChangedActions(t *testing.T, ch <-chan SSEEvent, tunnelName, clientID, terminalAction string) []string {
+	t.Helper()
+	actions := make([]string, 0, 4)
+	deadline := time.NewTimer(time.Second)
+	defer deadline.Stop()
+	for {
+		select {
+		case event := <-ch:
+			if event.Type != "tunnel_changed" {
+				continue
+			}
+			var payload map[string]any
+			if err := json.Unmarshal([]byte(event.Data), &payload); err != nil {
+				t.Fatalf("failed to parse tunnel_changed event: %v", err)
+			}
+			if payload["client_id"] != clientID {
+				continue
+			}
+			tunnelPayload, ok := payload["tunnel"].(map[string]any)
+			if !ok || tunnelPayload["name"] != tunnelName {
+				continue
+			}
+			action, _ := payload["action"].(string)
+			actions = append(actions, action)
+			if action == terminalAction {
+				return actions
+			}
+		case <-deadline.C:
+			t.Fatalf("did not receive terminal tunnel_changed action %q for client=%q tunnel=%q; got=%v", terminalAction, clientID, tunnelName, actions)
+			return nil
+		}
+	}
+}
+
+func assertMigrateRevisionConflictResponse(t *testing.T, resp *httptest.ResponseRecorder, wantStatus int, wantCurrentRevision int64) {
+	t.Helper()
+
+	if resp.Code != wantStatus {
+		t.Fatalf("revision response: want %d, got %d body=%s", wantStatus, resp.Code, resp.Body.String())
+	}
+	var body struct {
+		ErrorCode       string `json:"error_code"`
+		Code            string `json:"code"`
+		Field           string `json:"field"`
+		CurrentRevision int64  `json:"current_revision"`
+	}
+	if err := mustDecodeJSON(t, resp.Body, &body); err != nil {
+		t.Fatalf("decode revision response: %v", err)
+	}
+	if body.ErrorCode != protocol.TunnelMutationErrorCodeRevisionConflict ||
+		body.Code != protocol.TunnelMutationErrorCodeRevisionConflict ||
+		body.Field != "expected_revision" ||
+		body.CurrentRevision != wantCurrentRevision {
+		t.Fatalf("revision response mismatch: %+v", body)
+	}
+}
+
+func assertMigrateErrorResponse(t *testing.T, resp *httptest.ResponseRecorder, wantStatus int, wantCode, wantField string) {
+	t.Helper()
+
+	if resp.Code != wantStatus {
+		t.Fatalf("migrate response: want %d, got %d body=%s", wantStatus, resp.Code, resp.Body.String())
+	}
+	var body tunnelMutationErrorResponse
+	if err := mustDecodeJSON(t, resp.Body, &body); err != nil {
+		t.Fatalf("decode migrate error: %v", err)
+	}
+	if body.ErrorCode != wantCode || body.Code != wantCode || body.Field != wantField {
+		t.Fatalf("migrate error mismatch: %+v want code=%q field=%q", body, wantCode, wantField)
+	}
+}
+
+func assertMigrateRejectDidNotMutate(t *testing.T, s *Server, before StoredTunnel, currentClientID, newClientID string) {
+	t.Helper()
+
+	after, err := s.store.GetTunnelByIDE(currentClientID, before.ID)
+	if err != nil {
+		t.Fatalf("load tunnel after rejected migration: %v", err)
+	}
+	assertStoredTunnelUnchangedAfterRejectedUpdate(t, before, after)
+	if newClientID != currentClientID {
+		if _, err := s.store.GetTunnelByIDE(newClientID, before.ID); !errors.Is(err, ErrTunnelNotFound) {
+			t.Fatalf("rejected migration must not create next-target tunnel, got err=%v", err)
+		}
+	}
+}
+
 func TestAPI_UnifiedTunnelResumeRequiresResumableState(t *testing.T) {
 	s, handler, token, cleanup := setupTestServerWithStores(t, true)
 	defer cleanup()
@@ -1578,6 +2543,73 @@ func TestAPI_UnifiedTunnelUpdateUnprovisionsOldServerExposeTarget(t *testing.T) 
 	unprovision := readTunnelUnprovision(t, targetConn)
 	if unprovision.TunnelID != created.ID || unprovision.Revision != created.Revision || unprovision.Role != protocol.DataStreamRoleTarget || unprovision.Reason != "updated" {
 		t.Fatalf("old target unprovision mismatch: %+v", unprovision)
+	}
+}
+
+func TestAPI_UnifiedTunnelMigrateOnlineServerExposeReprovisionsNewTarget(t *testing.T) {
+	s := New(0)
+	initTestAdminStore(t, s)
+	var err error
+	s.store, err = newTunnelStoreWithDB(s.auth.adminStore.path, s.auth.adminStore.db, false)
+	if err != nil {
+		t.Fatalf("create shared TunnelStore: %v", err)
+	}
+	ts := httptest.NewServer(s.newHTTPMux())
+	defer ts.Close()
+	token := loginAdminTokenLocal(t, s.StartHTTPOnly(), "admin", "password123")
+
+	oldConn, oldAuth := connectAndAuthWithInstallID(t, ts, "migrate-live-server-old", "install-migrate-live-server-old")
+	defer mustClose(t, oldConn)
+	newConn, newAuth := connectAndAuthWithInstallID(t, ts, "migrate-live-server-new", "install-migrate-live-server-new")
+	defer mustClose(t, newConn)
+	setLiveClientDefaultCapabilities(t, s, oldAuth.ClientID)
+	setLiveClientDefaultCapabilities(t, s, newAuth.ClientID)
+
+	create := []byte(fmt.Sprintf(`{
+		"name":"migrate-live-server",
+		"topology":"server_expose",
+		"ingress":{"location":"server","type":"tcp_listen","config":{"bind_ip":"127.0.0.1","port":%d,"allowed_source_cidrs":["127.0.0.0/8"]}},
+		"target":{"location":"client","client_id":"%s","type":"tcp_service","config":{"ip":"127.0.0.1","port":2222}},
+		"transport_policy":"server_relay_only"
+	}`, reserveTCPPort(t), oldAuth.ClientID))
+	createResp := doMuxRequest(t, s.StartHTTPOnly(), http.MethodPost, "/api/tunnels", token, create)
+	if createResp.Code != http.StatusCreated {
+		t.Fatalf("create live server-expose tunnel: want 201, got %d body=%s", createResp.Code, createResp.Body.String())
+	}
+	var created tunnelSpecAPI
+	if err := mustDecodeJSON(t, createResp.Body, &created); err != nil {
+		t.Fatalf("decode created tunnel: %v", err)
+	}
+	initialProvision := ackTunnelProvision(t, oldConn)
+	if initialProvision.TunnelID != created.ID || initialProvision.Revision != created.Revision {
+		t.Fatalf("initial provision mismatch: %+v", initialProvision)
+	}
+	waitForUnifiedTunnelRuntimeState(t, s, token, created.ID, tunnelRuntimeStateActive)
+
+	eventsCh := s.events.Subscribe()
+	defer s.events.Unsubscribe(eventsCh)
+
+	migrateBody := []byte(`{"expected_revision":` + strconv.FormatInt(created.Revision, 10) + `,"target_client_id":"` + newAuth.ClientID + `"}`)
+	migrateResp := doMuxRequest(t, s.StartHTTPOnly(), http.MethodPost, "/api/tunnels/"+created.ID+"/migrate", token, migrateBody)
+	if migrateResp.Code != http.StatusOK {
+		t.Fatalf("migrate live server-expose tunnel: want 200, got %d body=%s", migrateResp.Code, migrateResp.Body.String())
+	}
+
+	unprovision := readTunnelUnprovision(t, oldConn)
+	if unprovision.TunnelID != created.ID || unprovision.Revision != created.Revision || unprovision.Role != protocol.DataStreamRoleTarget || unprovision.Reason != "migrated" {
+		t.Fatalf("old target migration unprovision mismatch: %+v", unprovision)
+	}
+	newProvision := ackTunnelProvision(t, newConn)
+	if newProvision.TunnelID != created.ID || newProvision.Revision != created.Revision+1 || newProvision.Role != protocol.DataStreamRoleTarget {
+		t.Fatalf("new target migration provision mismatch: %+v", newProvision)
+	}
+	if newProvision.Spec.Target.ClientID != newAuth.ClientID || newProvision.Spec.Target.Type != protocol.TargetTypeTCPService {
+		t.Fatalf("new target provision spec mismatch: %+v", newProvision.Spec)
+	}
+	waitForUnifiedTunnelRuntimeState(t, s, token, created.ID, tunnelRuntimeStateActive)
+	actions := waitForTunnelChangedActions(t, eventsCh, created.Name, newAuth.ClientID, "restored")
+	if len(actions) < 3 || actions[0] != "migrated_in" || actions[len(actions)-1] != "restored" {
+		t.Fatalf("new owner migration event order = %v, want migrated_in before reconcile events and restored last", actions)
 	}
 }
 
@@ -1749,6 +2781,77 @@ func TestAPI_UnifiedTunnelUpdateUnprovisionsOldClientToClientParticipants(t *tes
 	if resp.Code != http.StatusOK {
 		t.Fatalf("client_to_client update: want 200, got %d body=%s", resp.Code, resp.Body.String())
 	}
+}
+
+func TestAPI_UnifiedTunnelMigrateOnlineClientRelayReprovisionsParticipants(t *testing.T) {
+	s := New(0)
+	initTestAdminStore(t, s)
+	var err error
+	s.store, err = newTunnelStoreWithDB(s.auth.adminStore.path, s.auth.adminStore.db, false)
+	if err != nil {
+		t.Fatalf("create shared TunnelStore: %v", err)
+	}
+	ts := httptest.NewServer(s.newHTTPMux())
+	defer ts.Close()
+	token := loginAdminTokenLocal(t, s.StartHTTPOnly(), "admin", "password123")
+
+	oldTargetConn, oldTargetAuth := connectAndAuthWithInstallID(t, ts, "migrate-live-c2c-old", "install-migrate-live-c2c-old")
+	defer mustClose(t, oldTargetConn)
+	newTargetConn, newTargetAuth := connectAndAuthWithInstallID(t, ts, "migrate-live-c2c-new", "install-migrate-live-c2c-new")
+	defer mustClose(t, newTargetConn)
+	ingressConn, ingressAuth := connectAndAuthWithInstallID(t, ts, "migrate-live-c2c-ingress", "install-migrate-live-c2c-ingress")
+	defer mustClose(t, ingressConn)
+	setLiveClientDefaultCapabilities(t, s, oldTargetAuth.ClientID)
+	setLiveClientDefaultCapabilities(t, s, newTargetAuth.ClientID)
+	setLiveClientDefaultCapabilities(t, s, ingressAuth.ClientID)
+
+	create := []byte(fmt.Sprintf(`{
+		"name":"migrate-live-c2c",
+		"topology":"client_to_client",
+		"ingress":{"location":"client","client_id":"%s","type":"tcp_listen","config":{"bind_ip":"127.0.0.1","port":%d,"allowed_source_cidrs":["127.0.0.0/8"]}},
+		"target":{"location":"client","client_id":"%s","type":"tcp_service","config":{"ip":"127.0.0.1","port":2222}},
+		"transport_policy":"server_relay_only"
+	}`, ingressAuth.ClientID, reserveTCPPort(t), oldTargetAuth.ClientID))
+	createRespCh := doMuxRequestAsync(t, s.StartHTTPOnly(), http.MethodPost, "/api/tunnels", token, create)
+	respondPreflight(t, ingressConn)
+	ackProvisionMessages(t, oldTargetConn, 1)
+	ackProvisionMessages(t, ingressConn, 1)
+	createResp := awaitMuxResponse(t, createRespCh)
+	if createResp.Code != http.StatusCreated {
+		t.Fatalf("create live c2c tunnel: want 201, got %d body=%s", createResp.Code, createResp.Body.String())
+	}
+	var created tunnelSpecAPI
+	if err := mustDecodeJSON(t, createResp.Body, &created); err != nil {
+		t.Fatalf("decode created c2c tunnel: %v", err)
+	}
+	waitForUnifiedTunnelRuntimeState(t, s, token, created.ID, tunnelRuntimeStateActive)
+
+	migrateBody := []byte(`{"expected_revision":` + strconv.FormatInt(created.Revision, 10) + `,"target_client_id":"` + newTargetAuth.ClientID + `"}`)
+	migrateResp := doMuxRequest(t, s.StartHTTPOnly(), http.MethodPost, "/api/tunnels/"+created.ID+"/migrate", token, migrateBody)
+	if migrateResp.Code != http.StatusOK {
+		t.Fatalf("migrate live c2c tunnel: want 200, got %d body=%s", migrateResp.Code, migrateResp.Body.String())
+	}
+
+	oldTargetUnprovision := readTunnelUnprovision(t, oldTargetConn)
+	if oldTargetUnprovision.TunnelID != created.ID || oldTargetUnprovision.Revision != created.Revision || oldTargetUnprovision.Role != protocol.DataStreamRoleTarget || oldTargetUnprovision.Reason != "migrated" {
+		t.Fatalf("old c2c target unprovision mismatch: %+v", oldTargetUnprovision)
+	}
+	ingressUnprovision := readTunnelUnprovision(t, ingressConn)
+	if ingressUnprovision.TunnelID != created.ID || ingressUnprovision.Revision != created.Revision || ingressUnprovision.Role != protocol.DataStreamRoleIngress || ingressUnprovision.Reason != "migrated" {
+		t.Fatalf("c2c ingress unprovision mismatch: %+v", ingressUnprovision)
+	}
+	newTargetProvision := ackTunnelProvision(t, newTargetConn)
+	if newTargetProvision.TunnelID != created.ID || newTargetProvision.Revision != created.Revision+1 || newTargetProvision.Role != protocol.DataStreamRoleTarget {
+		t.Fatalf("new c2c target provision mismatch: %+v", newTargetProvision)
+	}
+	ingressProvision := ackTunnelProvision(t, ingressConn)
+	if ingressProvision.TunnelID != created.ID || ingressProvision.Revision != created.Revision+1 || ingressProvision.Role != protocol.DataStreamRoleIngress {
+		t.Fatalf("c2c ingress reprovision mismatch: %+v", ingressProvision)
+	}
+	if ingressProvision.Spec.Ingress.ClientID != ingressAuth.ClientID || ingressProvision.Spec.Target.ClientID != newTargetAuth.ClientID {
+		t.Fatalf("c2c ingress reprovision participants mismatch: %+v", ingressProvision.Spec)
+	}
+	waitForUnifiedTunnelRuntimeState(t, s, token, created.ID, tunnelRuntimeStateActive)
 }
 
 func TestAPI_UnifiedTunnelStopUnprovisionsClientToClientParticipants(t *testing.T) {

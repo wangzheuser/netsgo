@@ -126,6 +126,11 @@ type tunnelUpdateRequestAPI struct {
 	Spec             tunnelCreateRequestAPI `json:"spec"`
 }
 
+type tunnelMigrateRequestAPI struct {
+	ExpectedRevision int64  `json:"expected_revision"`
+	TargetClientID   string `json:"target_client_id"`
+}
+
 type tcpListenConfigAPI struct {
 	BindIP             string   `json:"bind_ip"`
 	Port               int      `json:"port"`
@@ -388,6 +393,169 @@ func (s *Server) handleUpdateUnifiedTunnel(w http.ResponseWriter, r *http.Reques
 		return
 	}
 	encodeJSON(w, http.StatusOK, map[string]any{"success": true, "tunnel": specFromStoredTunnel(updated, s)})
+}
+
+func (s *Server) handleUnifiedTunnelMigrate(w http.ResponseWriter, r *http.Request) {
+	current, ok, err := s.findUnifiedTunnelSpecByID(r.PathValue("tunnel_id"))
+	if err != nil {
+		writeAPIError(w, http.StatusInternalServerError, "tunnel_lookup_failed", err.Error())
+		return
+	}
+	if !ok {
+		writeAPIError(w, http.StatusNotFound, "tunnel_not_found", "tunnel not found")
+		return
+	}
+
+	req, err := decodeTunnelMigrateRequest(r)
+	if err != nil {
+		if validationErr, ok := err.(*proxyRequestValidationError); ok {
+			status, payload := tunnelMutationErrorStatusAndBody(validationErr)
+			encodeJSON(w, status, payload)
+			return
+		}
+		writeJSONRequestDecodeError(w, err)
+		return
+	}
+	if req.ExpectedRevision <= 0 {
+		encodeJSON(w, http.StatusBadRequest, revisionConflictPayload("expected_revision is required", current.Revision))
+		return
+	}
+	if req.ExpectedRevision != current.Revision {
+		encodeJSON(w, http.StatusConflict, revisionConflictPayload(errTunnelRevisionConflict.Error(), current.Revision))
+		return
+	}
+	s.clientTunnelMutationMu.Lock()
+	defer s.clientTunnelMutationMu.Unlock()
+	if err := s.validateTunnelMigrateRequest(current, req); err != nil {
+		status, payload := tunnelMutationErrorStatusAndBody(err)
+		encodeJSON(w, status, payload)
+		return
+	}
+
+	migrated, err := s.migrateUnifiedStoredTunnel(current, req)
+	if err != nil {
+		switch {
+		case errors.Is(err, ErrTunnelRevisionConflict):
+			encodeJSON(w, http.StatusConflict, revisionConflictPayload(errTunnelRevisionConflict.Error(), 0))
+			return
+		case errors.Is(err, ErrTunnelNotFound):
+			writeAPIError(w, http.StatusNotFound, "tunnel_not_found", "tunnel not found")
+			return
+		case errors.Is(err, ErrTunnelTargetClientNotFound):
+			err = newProxyRequestValidationError(err, "target_client_id", protocol.TunnelMutationErrorCodeUnknownClient, http.StatusNotFound)
+		case errors.Is(err, ErrTunnelOwnerNameConflict):
+			err = newProxyRequestValidationError(err, "target_client_id", protocol.TunnelMutationErrorCodeTunnelNameConflict, http.StatusConflict)
+		case errors.Is(err, ErrTunnelMigrationPending):
+			err = newProxyRequestValidationError(err, "runtime_state", protocol.TunnelMutationErrorCodeTunnelPending, http.StatusConflict)
+		}
+		status, payload := tunnelMutationErrorStatusAndBody(err)
+		encodeJSON(w, status, payload)
+		return
+	}
+	encodeJSON(w, http.StatusOK, map[string]any{"success": true, "tunnel": specFromStoredTunnel(migrated, s)})
+}
+
+func decodeTunnelMigrateRequest(r *http.Request) (tunnelMigrateRequestAPI, error) {
+	var fields map[string]json.RawMessage
+	if err := decodeJSONRequestBody(r, &fields); err != nil {
+		return tunnelMigrateRequestAPI{}, err
+	}
+	for field := range fields {
+		switch field {
+		case "expected_revision", "target_client_id":
+		default:
+			return tunnelMigrateRequestAPI{}, newProxyRequestValidationError(fmt.Errorf("%s is not accepted in migrate request", field), field, "server_owned_field", http.StatusBadRequest)
+		}
+	}
+	var req tunnelMigrateRequestAPI
+	if raw, ok := fields["expected_revision"]; ok {
+		if err := json.Unmarshal(raw, &req.ExpectedRevision); err != nil {
+			return tunnelMigrateRequestAPI{}, err
+		}
+	}
+	if raw, ok := fields["target_client_id"]; ok {
+		if err := json.Unmarshal(raw, &req.TargetClientID); err != nil {
+			return tunnelMigrateRequestAPI{}, err
+		}
+	}
+	req.TargetClientID = strings.TrimSpace(req.TargetClientID)
+	return req, nil
+}
+
+func (s *Server) validateTunnelMigrateRequest(current tunnelSpecAPI, req tunnelMigrateRequestAPI) error {
+	if req.TargetClientID == "" {
+		return newProxyRequestValidationError(fmt.Errorf("target_client_id is required"), "target_client_id", "missing_client_id", http.StatusBadRequest)
+	}
+	if req.TargetClientID == current.Target.ClientID {
+		return newProxyRequestValidationError(fmt.Errorf("target client is already assigned"), "target_client_id", protocol.TunnelMutationErrorCodeSameTargetClient, http.StatusBadRequest)
+	}
+	if current.Topology == tunnelTopologyClientToClient && req.TargetClientID == current.Ingress.ClientID {
+		return newProxyRequestValidationError(fmt.Errorf("ingress and target clients must differ"), "target_client_id", protocol.TunnelMutationErrorCodeSameIngressAndTargetClient, http.StatusBadRequest)
+	}
+	target, ok := s.registeredClientInfo(req.TargetClientID)
+	if !ok {
+		return newProxyRequestValidationError(fmt.Errorf("unknown target client %q", req.TargetClientID), "target_client_id", protocol.TunnelMutationErrorCodeUnknownClient, http.StatusNotFound)
+	}
+	if !clientSupportsTargetType(target.Info.Capabilities, current.Target.Type) {
+		return newProxyRequestValidationError(fmt.Errorf("target client does not support %s", current.Target.Type), "target.type", protocol.TunnelMutationErrorCodeCapabilityNotSupported, http.StatusBadRequest)
+	}
+	return nil
+}
+
+func (s *Server) migrateUnifiedStoredTunnel(current tunnelSpecAPI, req tunnelMigrateRequestAPI) (StoredTunnel, error) {
+	if s.store == nil {
+		return StoredTunnel{}, fmt.Errorf("tunnel store not initialized")
+	}
+
+	existing, err := s.store.GetTunnelByID(current.ID)
+	if err != nil {
+		return StoredTunnel{}, err
+	}
+	if existing.Revision != req.ExpectedRevision {
+		return StoredTunnel{}, ErrTunnelRevisionConflict
+	}
+
+	replacement := existing
+	replacement.ClientID = req.TargetClientID
+	replacement.OwnerClientID = req.TargetClientID
+	replacement.Target.ClientID = req.TargetClientID
+	replacement.ActualTransport = TunnelActualTransportUnknown
+	replacement.P2P = P2PState{State: TunnelP2PStateIdle}
+	replacement.UpdatedAt = time.Now().UTC()
+	runtimeState := protocol.ProxyRuntimeStateOffline
+	if canonicalDesiredState(existing.DesiredState) == protocol.ProxyDesiredStateStopped {
+		runtimeState = protocol.ProxyRuntimeStateIdle
+	}
+	setStoredTunnelStates(&replacement, existing.DesiredState, runtimeState, "")
+
+	before, migrated, err := s.store.MigrateTunnelTargetByID(current.ID, req.ExpectedRevision, replacement)
+	if err != nil {
+		return StoredTunnel{}, err
+	}
+	if err := s.unprovisionStoredUnifiedTunnel(before, "migrated", true); err != nil {
+		logUnifiedRuntimeCleanupFailure("migrate", before, err)
+	}
+	s.emitMigratedTunnelOwnerEvents(before, migrated)
+	s.scheduleUnifiedTunnelReconcile(migrated, "migrated")
+	if reloaded, err := s.store.GetTunnelByIDE(migrated.OwnerClientID, migrated.ID); err == nil {
+		migrated = reloaded
+	}
+	return migrated, nil
+}
+
+func (s *Server) emitMigratedTunnelOwnerEvents(before, after StoredTunnel) {
+	oldOwnerID := before.OwnerClientID
+	if oldOwnerID == "" {
+		oldOwnerID = before.ClientID
+	}
+	newOwnerID := after.OwnerClientID
+	if newOwnerID == "" {
+		newOwnerID = after.ClientID
+	}
+	oldConfig := storedTunnelToProxyConfig(before)
+	setProxyConfigStates(&oldConfig, protocol.ProxyDesiredStateStopped, protocol.ProxyRuntimeStateIdle, "")
+	s.emitTunnelChanged(oldOwnerID, oldConfig, "migrated_out")
+	s.emitTunnelChanged(newOwnerID, storedTunnelToProxyConfig(after), "migrated_in")
 }
 
 func revisionConflictPayload(message string, currentRevision int64) map[string]any {

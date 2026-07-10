@@ -1,5 +1,6 @@
 import { useEffect } from 'react';
 import { useQueryClient } from '@tanstack/react-query';
+import type { QueryClient } from '@tanstack/react-query';
 import { useRouterState } from '@tanstack/react-router';
 import { api } from '@/lib/api';
 import { EMPTY_CONSOLE_SUMMARY } from '@/lib/console-summary';
@@ -21,7 +22,7 @@ import type {
   TrafficRealtimeEvent,
 } from '@/types';
 
-type EventStreamQueryClient = ReturnType<typeof useQueryClient>;
+type EventStreamQueryClient = QueryClient;
 type JsonObject = Record<string, unknown>;
 
 export interface EventStreamDiagnostics {
@@ -284,7 +285,16 @@ function applyConsoleSnapshot(queryClient: EventStreamQueryClient, snapshotState
 async function resyncConsoleSnapshot(queryClient: EventStreamQueryClient, snapshotState: EventStreamSnapshotState) {
   const snapshotRequestId = ++snapshotState.requestSeq;
   logEventStreamDiagnostic('snapshot_request_start', { eventType: 'snapshot_request', snapshotRequestId });
-  const snapshot = await api.get<ConsoleSnapshot>('/api/console/snapshot');
+  let snapshot: ConsoleSnapshot;
+  try {
+    snapshot = await api.get<ConsoleSnapshot>('/api/console/snapshot');
+  } catch (error) {
+    if (snapshotRequestId !== snapshotState.requestSeq) {
+      logEventStreamDiagnostic('snapshot_request_stale', { eventType: 'snapshot_request', snapshotRequestId });
+      return false;
+    }
+    throw error;
+  }
   const diagnostic = snapshotDiagnostic('snapshot_request', snapshot, snapshotRequestId);
   if (snapshotRequestId !== snapshotState.requestSeq) {
     logEventStreamDiagnostic('snapshot_request_stale', diagnostic);
@@ -442,7 +452,8 @@ export function applyEventForDiagnostics(queryClient: EventStreamQueryClient, se
           runtimeState: parsed.tunnel.runtime_state,
           desiredState: parsed.tunnel.desired_state,
         });
-        const relatedClientIds = getTunnelChangedClientIds(parsed);
+        const migratedOut = parsed.action === 'migrated_out';
+        const relatedClientIds = migratedOut ? [parsed.client_id] : getTunnelChangedClientIds(parsed);
         queryClient.setQueryData<Client[]>(['clients'], (old) =>
           old?.map((client) => {
             if (!relatedClientIds.includes(client.id)) {
@@ -450,7 +461,7 @@ export function applyEventForDiagnostics(queryClient: EventStreamQueryClient, se
             }
 
             const proxies = client.proxies ?? [];
-            if (parsed.action === 'deleted') {
+            if (parsed.action === 'deleted' || migratedOut) {
               return {
                 ...client,
                 proxies: proxies.filter((proxy) => proxy.id !== parsed.tunnel.id),

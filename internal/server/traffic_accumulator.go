@@ -12,7 +12,9 @@ import (
 const trafficAccumulatorShardCount = 32
 
 type trafficAccumulator struct {
-	shards [trafficAccumulatorShardCount]trafficAccumulatorShard
+	shards                  [trafficAccumulatorShardCount]trafficAccumulatorShard
+	minimumRevisionMu       sync.RWMutex
+	minimumRevisionByTunnel map[string]int64
 }
 
 type trafficAccumulatorShard struct {
@@ -22,6 +24,7 @@ type trafficAccumulatorShard struct {
 
 type trafficAccumulatorKey struct {
 	tunnelID    string
+	revision    int64
 	clientID    string
 	tunnelName  string
 	tunnelType  string
@@ -30,7 +33,7 @@ type trafficAccumulatorKey struct {
 }
 
 func newTrafficAccumulator() *trafficAccumulator {
-	acc := &trafficAccumulator{}
+	acc := &trafficAccumulator{minimumRevisionByTunnel: make(map[string]int64)}
 	for i := range acc.shards {
 		acc.shards[i].pending = make(map[trafficAccumulatorKey]TrafficDelta)
 	}
@@ -55,12 +58,18 @@ func (a *trafficAccumulator) AddDelta(now time.Time, delta TrafficDelta) error {
 	if delta.IngressBytes == 0 && delta.EgressBytes == 0 {
 		return nil
 	}
+	a.minimumRevisionMu.RLock()
+	defer a.minimumRevisionMu.RUnlock()
+	if delta.TunnelID != "" && delta.Revision < a.minimumRevisionByTunnel[delta.TunnelID] {
+		return nil
+	}
 
 	now = now.UTC()
 	delta.SecondStart = secondFloorUTC(now).Unix()
 	delta.MinuteStart = minuteFloorUTC(now).Unix()
 	key := trafficAccumulatorKey{
 		tunnelID:    delta.TunnelID,
+		revision:    delta.Revision,
 		clientID:    delta.ClientID,
 		tunnelName:  delta.TunnelName,
 		tunnelType:  delta.TunnelType,
@@ -113,6 +122,35 @@ func mergeTrafficDeltaMetadata(existing *TrafficDelta, delta TrafficDelta) {
 	}
 }
 
+// ResetTunnel removes observations already queued for an older tunnel
+// specification and prevents late producers from queueing that revision again.
+func (a *trafficAccumulator) ResetTunnel(tunnelID string, minimumRevision int64) {
+	if a == nil || tunnelID == "" || minimumRevision <= 0 {
+		return
+	}
+
+	a.minimumRevisionMu.Lock()
+	if a.minimumRevisionByTunnel == nil {
+		a.minimumRevisionByTunnel = make(map[string]int64)
+	}
+	if a.minimumRevisionByTunnel[tunnelID] >= minimumRevision {
+		a.minimumRevisionMu.Unlock()
+		return
+	}
+	a.minimumRevisionByTunnel[tunnelID] = minimumRevision
+	for i := range a.shards {
+		shard := &a.shards[i]
+		shard.mu.Lock()
+		for key := range shard.pending {
+			if key.tunnelID == tunnelID && key.revision < minimumRevision {
+				delete(shard.pending, key)
+			}
+		}
+		shard.mu.Unlock()
+	}
+	a.minimumRevisionMu.Unlock()
+}
+
 func (a *trafficAccumulator) Drain() []TrafficDelta {
 	if a == nil {
 		return nil
@@ -133,6 +171,9 @@ func (a *trafficAccumulator) Drain() []TrafficDelta {
 	sort.Slice(deltas, func(i, j int) bool {
 		if deltas[i].TunnelID != deltas[j].TunnelID {
 			return deltas[i].TunnelID < deltas[j].TunnelID
+		}
+		if deltas[i].Revision != deltas[j].Revision {
+			return deltas[i].Revision < deltas[j].Revision
 		}
 		if deltas[i].ClientID != deltas[j].ClientID {
 			return deltas[i].ClientID < deltas[j].ClientID
@@ -201,6 +242,7 @@ func (s *Server) recordTrafficObservationAt(now time.Time, tunnelID, clientID, t
 	if ingressBytes == 0 && egressBytes == 0 {
 		return
 	}
+	s.trafficStore.attachAccumulator(s.trafficAccumulator)
 	s.recordTrafficDeltaAt(now, TrafficDelta{
 		TunnelID:     tunnelID,
 		ClientID:     clientID,
@@ -222,9 +264,16 @@ func (s *Server) recordTrafficDeltaAt(now time.Time, delta TrafficDelta) {
 	if delta.IngressBytes == 0 && delta.EgressBytes == 0 {
 		return
 	}
-	if delta.TunnelID == "" {
-		delta.TunnelID = s.resolveTrafficTunnelID(delta.ClientID, delta.TunnelName, delta.TunnelType)
+	if delta.TunnelID == "" || delta.Revision <= 0 {
+		tunnelID, revision := s.resolveTrafficTunnelIdentity(delta.ClientID, delta.TunnelName, delta.TunnelType)
+		if delta.TunnelID == "" {
+			delta.TunnelID = tunnelID
+		}
+		if delta.Revision <= 0 && tunnelID == delta.TunnelID {
+			delta.Revision = revision
+		}
 	}
+	s.trafficStore.attachAccumulator(s.trafficAccumulator)
 
 	acc := s.trafficAccumulator
 	if acc == nil {
@@ -270,6 +319,7 @@ func trafficDeltaFromProxyConfig(clientID string, config protocol.ProxyConfig, i
 	}
 	return TrafficDelta{
 		TunnelID:        config.ID,
+		Revision:        config.Revision,
 		ClientID:        clientID,
 		OwnerClientID:   ownerClientID,
 		IngressClientID: ingressClientID,
@@ -301,6 +351,7 @@ func trafficDeltaFromStoredTunnel(stored StoredTunnel, ingressBytes, egressBytes
 	}
 	return TrafficDelta{
 		TunnelID:        stored.ID,
+		Revision:        stored.Revision,
 		ClientID:        ownerClientID,
 		OwnerClientID:   ownerClientID,
 		IngressClientID: stored.Ingress.ClientID,
@@ -321,9 +372,9 @@ func relayTrafficTransport(actual string) string {
 	return actual
 }
 
-func (s *Server) resolveTrafficTunnelID(clientID, tunnelName, tunnelType string) string {
+func (s *Server) resolveTrafficTunnelIdentity(clientID, tunnelName, tunnelType string) (string, int64) {
 	if s == nil || clientID == "" || tunnelName == "" {
-		return ""
+		return "", 0
 	}
 	if value, ok := s.clients.Load(clientID); ok {
 		if client, ok := value.(*ClientConn); ok {
@@ -331,18 +382,19 @@ func (s *Server) resolveTrafficTunnelID(clientID, tunnelName, tunnelType string)
 			tunnel, ok := client.proxies[tunnelName]
 			if ok && tunnel != nil && tunnel.Config.ID != "" && (tunnelType == "" || tunnel.Config.Type == tunnelType) {
 				tunnelID := tunnel.Config.ID
+				revision := tunnel.Config.Revision
 				client.proxyMu.RUnlock()
-				return tunnelID
+				return tunnelID, revision
 			}
 			client.proxyMu.RUnlock()
 		}
 	}
 	if s.store != nil {
 		if stored, ok := s.store.GetTunnel(clientID, tunnelName); ok && stored.ID != "" && (tunnelType == "" || stored.Type == tunnelType) {
-			return stored.ID
+			return stored.ID, stored.Revision
 		}
 	}
-	return ""
+	return "", 0
 }
 
 func (s *Server) flushTrafficObservations() {

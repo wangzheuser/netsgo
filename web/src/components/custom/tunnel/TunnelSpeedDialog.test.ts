@@ -21,6 +21,7 @@ describe('TunnelSpeedDialog', () => {
         can_stop: true,
         can_edit: true,
         can_delete: true,
+        can_migrate: true,
       },
     } as const;
 

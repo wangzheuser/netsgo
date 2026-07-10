@@ -83,7 +83,11 @@ func setupTestServerWithStores(t *testing.T, initialized bool) (*Server, http.Ha
 
 	s, cleanup := setupTestServerWithDB(t, initialized)
 
-	s.store = newTestTunnelStore(t)
+	var err error
+	s.store, err = newTunnelStoreWithDB(s.auth.adminStore.path, s.auth.adminStore.db, false)
+	if err != nil {
+		t.Fatalf("failed to create shared TunnelStore: %v", err)
+	}
 
 	handler := s.StartHTTPOnly()
 	token := ""

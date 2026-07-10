@@ -46,6 +46,7 @@ func (s *Server) initStore() error {
 
 	trafficStore := newTrafficStoreWithDB(path, db, false)
 	s.trafficStore = trafficStore
+	store.attachTrafficStore(trafficStore, s.trafficAccumulator)
 
 	return nil
 }

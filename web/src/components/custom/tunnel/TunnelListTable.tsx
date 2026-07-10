@@ -13,6 +13,7 @@ import {
 } from '@/components/ui/tooltip';
 import { ConfirmDialog } from '@/components/custom/common/ConfirmDialog';
 import { TunnelDialog } from '@/components/custom/tunnel/TunnelDialog';
+import { TunnelMigrateDialog } from '@/components/custom/tunnel/TunnelMigrateDialog';
 import { TunnelSpeedDialog } from '@/components/custom/tunnel/TunnelSpeedDialog';
 import toast from 'react-hot-toast';
 import {
@@ -22,6 +23,7 @@ import {
 } from '@/lib/tunnel-model';
 import { cn } from '@/lib/utils';
 import { getClientDisplayName } from '@/lib/client-utils';
+import { getLatestTunnelMigrationTarget, getTunnelMigrationCandidates } from '@/lib/tunnel-migration';
 import { formatTunnelIssueMessage, formatTunnelIssueTooltipLine } from '@/lib/tunnel-issues';
 import {
   useResumeTunnel, useStopTunnel, useDeleteTunnel,
@@ -82,6 +84,7 @@ function compareTunnelsByCreatedAtDesc(a: TunnelEntry, b: TunnelEntry) {
   return a.name.localeCompare(b.name);
 }
 
+
 export function TunnelListTable({
   tunnels,
   clients,
@@ -104,9 +107,12 @@ export function TunnelListTable({
   const [searchQuery, setSearchQuery] = useState('');
   const [deleteTarget, setDeleteTarget] = useState<{ id: string; name: string; clientId: string } | null>(null);
   const [editTarget, setEditTarget] = useState<TunnelEntry | null>(null);
+  const [migrateTargetId, setMigrateTargetId] = useState<string | null>(null);
   const [speedTarget, setSpeedTarget] = useState<TunnelEntry | null>(null);
   const orderedTunnels = useMemo(() => [...tunnels].sort(compareTunnelsByCreatedAtDesc), [tunnels]);
+  const migrateTarget = getLatestTunnelMigrationTarget(orderedTunnels, migrateTargetId);
   const clientNameById = useMemo(() => buildClientNameMap(clients), [clients]);
+
 
   const filteredTunnels = useMemo(() => {
     if (!searchQuery.trim()) return orderedTunnels;
@@ -141,7 +147,9 @@ export function TunnelListTable({
       canStop,
       canEdit,
       canDelete,
+      canMigrate,
     } = getTunnelActionAvailability(tunnel);
+		const hasMigrationCandidate = getTunnelMigrationCandidates(tunnel, clients).length > 0;
 
     return (
       <div className="flex items-center justify-end gap-1">
@@ -201,6 +209,16 @@ export function TunnelListTable({
             <Pencil className="h-4 w-4" />
           </button>
         )}
+        {canMigrate && hasMigrationCandidate && (
+          <button
+            className="p-1.5 hover:bg-primary/10 rounded text-primary"
+            title={t('tunnels.migrateTunnel')}
+            aria-label={t('tunnels.migrateTunnel')}
+            onClick={() => setMigrateTargetId(tunnel.id)}
+          >
+            <ArrowRightLeft className="h-4 w-4" />
+          </button>
+        )}
         {canDelete && (
           <button
             className="p-1.5 hover:bg-destructive/10 rounded text-destructive"
@@ -257,7 +275,7 @@ export function TunnelListTable({
                     {showTraffic24h && <th className="w-28 whitespace-nowrap px-4 py-3 font-medium sm:px-6">{t('tunnels.traffic24h')}</th>}
                     <th className="w-28 whitespace-nowrap px-4 py-3 font-medium sm:px-6">{t('tunnels.status')}</th>
                     {(showActions || renderRowAction) && (
-                      <th className="w-28 whitespace-nowrap px-4 py-3 text-right font-medium sm:px-6">{t('tunnels.actions')}</th>
+                      <th className="w-40 whitespace-nowrap px-4 py-3 text-right font-medium sm:px-6">{t('tunnels.actions')}</th>
                     )}
                   </tr>
                 </thead>
@@ -325,6 +343,12 @@ export function TunnelListTable({
             clientId={speedTarget?.clientId ?? ''}
             open={speedTarget !== null}
             onOpenChange={(v) => { if (!v) setSpeedTarget(null); }}
+          />
+          <TunnelMigrateDialog
+            tunnel={migrateTarget}
+            clients={clients}
+            open={migrateTarget !== null}
+            onOpenChange={(v) => { if (!v) setMigrateTargetId(null); }}
           />
         </>
       )}

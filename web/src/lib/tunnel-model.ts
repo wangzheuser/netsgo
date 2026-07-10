@@ -48,6 +48,7 @@ export interface TunnelActionAvailability {
   canStop: boolean;
   canEdit: boolean;
   canDelete: boolean;
+  canMigrate: boolean;
 }
 
 const requiredTunnelCapabilities = [
@@ -55,6 +56,7 @@ const requiredTunnelCapabilities = [
   'can_stop',
   'can_edit',
   'can_delete',
+  'can_migrate',
 ] as const;
 
 interface TunnelMutationPayloadInput {
@@ -358,7 +360,7 @@ export function getTunnelMutationFieldError(error: unknown) {
 }
 
 export function getTunnelActionAvailability(
-  tunnel: Pick<ProxyConfig, 'capabilities'>,
+  tunnel: { readonly capabilities: Partial<TunnelCapabilities> | null | undefined },
 ): TunnelActionAvailability {
   const capabilities = requireTunnelCapabilities(tunnel.capabilities);
 
@@ -367,6 +369,7 @@ export function getTunnelActionAvailability(
     canStop: capabilities.can_stop,
     canEdit: capabilities.can_edit,
     canDelete: capabilities.can_delete,
+    canMigrate: capabilities.can_migrate,
   };
 }
 
