@@ -333,6 +333,9 @@ func (s *Server) handleAPIAdminConfig(w http.ResponseWriter, r *http.Request) {
 		})
 
 	case http.MethodPut:
+		s.serverConfigMutationMu.Lock()
+		defer s.serverConfigMutationMu.Unlock()
+
 		var config ServerConfig
 		if err := decodeJSONRequestBody(r, &config); err != nil {
 			writeJSONRequestDecodeError(w, err)
@@ -425,6 +428,16 @@ func (s *Server) handleAPIAdminConfig(w http.ResponseWriter, r *http.Request) {
 			writeAPIError(w, http.StatusInternalServerError, "config_update_failed", "failed to update config")
 			return
 		}
+		if s.portPolicyAfterConfigSaveHook != nil {
+			s.portPolicyAfterConfigSaveHook()
+		}
+		affectedToMark := affected
+		if currentAffected, refreshErr := s.findTunnelsAffectedByPortChange(config.AllowedPorts); refreshErr != nil {
+			slog.Warn("Failed to refresh affected tunnels after server config update",
+				"error", refreshErr, "module", "admin")
+		} else {
+			affectedToMark = currentAffected
+		}
 
 		info := GetSessionFromContext(r.Context())
 		adminName := "unknown"
@@ -434,10 +447,10 @@ func (s *Server) handleAPIAdminConfig(w http.ResponseWriter, r *http.Request) {
 		slog.Info("Server config updated", "admin", adminName, "module", "admin")
 
 		// mark affected runtime tunnels as error
-		if len(affected) > 0 {
-			s.markTunnelsPortNotAllowed(affected)
+		if len(affectedToMark) > 0 {
+			s.markTunnelsPortNotAllowed(affectedToMark, config.AllowedPorts)
 			slog.Warn("Port allowlist change caused tunnels to be marked as errored",
-				"affected_count", len(affected), "module", "admin")
+				"affected_count", len(affectedToMark), "module", "admin")
 		}
 
 		encodeJSON(w, http.StatusOK, adminConfigUpdateResponse{

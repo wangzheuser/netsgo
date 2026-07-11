@@ -9,7 +9,10 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"netsgo/pkg/protocol"
 
@@ -408,6 +411,134 @@ func TestAPI_AdminConfig_GetAndUpdate(t *testing.T) {
 	if w4.Code != http.StatusBadRequest {
 		t.Fatalf("invalid port range should return 400, got %d", w4.Code)
 	}
+}
+
+func TestAPI_AdminConfig_RefreshesAffectedTunnelsAfterSave(t *testing.T) {
+	s, handler, token, cleanup := setupTestServerWithStores(t, true)
+	defer cleanup()
+
+	hookCalled := false
+	s.portPolicyAfterConfigSaveHook = func() {
+		hookCalled = true
+		seedStoredTunnel(t, s, "client-after-save", protocol.ProxyNewRequest{
+			Name:       "created-during-port-policy-update",
+			Type:       protocol.ProxyTypeTCP,
+			RemotePort: 40000,
+		}, protocol.ProxyStatusActive)
+	}
+
+	body := []byte(`{"server_addr":"http://localhost","allowed_ports":[{"start":30000,"end":30010}]}`)
+	resp := doMuxRequest(t, handler, http.MethodPut, "/api/admin/config", token, body)
+	if resp.Code != http.StatusOK {
+		t.Fatalf("PUT /api/admin/config: want 200, got %d body=%s", resp.Code, resp.Body.String())
+	}
+	if !hookCalled {
+		t.Fatal("port policy after-save hook was not reached")
+	}
+
+	stored, err := s.store.GetTunnelE("client-after-save", "created-during-port-policy-update")
+	if err != nil {
+		t.Fatalf("load tunnel created after initial scan: %v", err)
+	}
+	if stored.RuntimeState != protocol.ProxyRuntimeStateError ||
+		stored.Error != "port 40000 is not allowed" {
+		t.Fatalf("post-save scan did not enforce the new port policy: %+v", stored)
+	}
+
+	var payload map[string]any
+	if err := mustDecodeJSON(t, resp.Body, &payload); err != nil {
+		t.Fatalf("decode config update response: %v", err)
+	}
+	if affected, ok := payload["affected_tunnels"].([]any); !ok || len(affected) != 0 {
+		t.Fatalf("response should preserve the initial preview set, got %v", payload["affected_tunnels"])
+	}
+}
+
+func TestAPI_AdminConfig_SerializesPortPolicySaveAndEnforcement(t *testing.T) {
+	s, handler, token, cleanup := setupTestServerWithStores(t, true)
+	defer cleanup()
+
+	seedStoredTunnel(t, s, "port-policy-client", protocol.ProxyNewRequest{
+		Name:       "concurrent-port-policy",
+		Type:       protocol.ProxyTypeTCP,
+		RemotePort: 40000,
+	}, protocol.ProxyStatusActive)
+	eventsCh := s.events.Subscribe()
+	defer s.events.Unsubscribe(eventsCh)
+
+	firstSaved := make(chan struct{})
+	releaseFirst := make(chan struct{})
+	var releaseOnce sync.Once
+	releaseFirstUpdate := func() {
+		releaseOnce.Do(func() { close(releaseFirst) })
+	}
+	defer releaseFirstUpdate()
+	var hookCalls atomic.Int32
+	s.portPolicyAfterConfigSaveHook = func() {
+		if hookCalls.Add(1) != 1 {
+			return
+		}
+		close(firstSaved)
+		<-releaseFirst
+	}
+
+	strictBody := []byte(`{"server_addr":"http://localhost","allowed_ports":[{"start":30000,"end":30010}]}`)
+	strictResult := make(chan *httptest.ResponseRecorder, 1)
+	go func() {
+		strictResult <- doMuxRequest(t, handler, http.MethodPut, "/api/admin/config", token, strictBody)
+	}()
+	select {
+	case <-firstSaved:
+	case <-time.After(5 * time.Second):
+		t.Fatal("first config update did not reach the post-save barrier")
+	}
+
+	wideBody := []byte(`{"server_addr":"http://localhost","allowed_ports":[{"start":30000,"end":50000}]}`)
+	wideResult := make(chan *httptest.ResponseRecorder, 1)
+	go func() {
+		wideResult <- doMuxRequest(t, handler, http.MethodPut, "/api/admin/config", token, wideBody)
+	}()
+	select {
+	case response := <-wideResult:
+		t.Fatalf("second config update bypassed serialization: status=%d body=%s", response.Code, response.Body.String())
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	current, err := s.auth.adminStore.GetServerConfigE()
+	if err != nil {
+		t.Fatalf("load config while first update is enforcing: %v", err)
+	}
+	if len(current.AllowedPorts) != 1 || current.AllowedPorts[0] != (PortRange{Start: 30000, End: 30010}) {
+		t.Fatalf("second update changed the policy before first enforcement completed: %+v", current.AllowedPorts)
+	}
+
+	releaseFirstUpdate()
+	for name, result := range map[string]<-chan *httptest.ResponseRecorder{
+		"strict": strictResult,
+		"wide":   wideResult,
+	} {
+		select {
+		case response := <-result:
+			if response.Code != http.StatusOK {
+				t.Fatalf("%s config update: want 200, got %d body=%s", name, response.Code, response.Body.String())
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatalf("%s config update did not finish", name)
+		}
+	}
+
+	final, err := s.auth.adminStore.GetServerConfigE()
+	if err != nil {
+		t.Fatalf("load final config: %v", err)
+	}
+	if len(final.AllowedPorts) != 1 || final.AllowedPorts[0] != (PortRange{Start: 30000, End: 50000}) {
+		t.Fatalf("final policy does not match the serialized second update: %+v", final.AllowedPorts)
+	}
+	payload := waitForTunnelChangedEvent(t, eventsCh, "port_not_allowed", "concurrent-port-policy")
+	if payload["revision"] != float64(1) {
+		t.Fatalf("port policy event revision mismatch: %+v", payload)
+	}
+	assertNoTunnelChangedEvent(t, eventsCh, 100*time.Millisecond, "concurrent-port-policy")
 }
 
 func TestAPI_AdminConfig_ServerAddrValidation(t *testing.T) {
