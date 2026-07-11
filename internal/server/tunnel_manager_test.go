@@ -351,6 +351,9 @@ func TestMarkTunnelsPortNotAllowedDoesNotMutateNewRevisionAfterCleanupBarrier(t 
 	var newRuntime *ProxyTunnel
 	hookCalled := false
 	s.portPolicyAfterRuntimeCleanupHook = func(got affectedTunnel) {
+		if hookCalled {
+			return
+		}
 		hookCalled = true
 		if got.TunnelID != stored.ID || got.Revision != stored.Revision {
 			t.Fatalf("cleanup hook identity mismatch: %+v", got)
@@ -465,6 +468,9 @@ func TestMarkTunnelsPortNotAllowedTransitionsNewDisallowedRevisionAfterCleanupBa
 	var newRuntime *ProxyTunnel
 	hookCalled := false
 	s.portPolicyAfterRuntimeCleanupHook = func(got affectedTunnel) {
+		if hookCalled {
+			return
+		}
 		hookCalled = true
 		if got.TunnelID != stored.ID || got.Revision != stored.Revision {
 			t.Fatalf("cleanup hook identity mismatch: %+v", got)
@@ -527,6 +533,56 @@ func TestMarkTunnelsPortNotAllowedTransitionsNewDisallowedRevisionAfterCleanupBa
 	}
 	if _, err := newListener.Accept(); !errors.Is(err, net.ErrClosed) {
 		t.Fatalf("new disallowed listener must be closed, got %v", err)
+	}
+}
+
+func TestMarkTunnelsPortNotAllowedBoundsRevisionRetries(t *testing.T) {
+	s := New(0)
+	s.store = newTestTunnelStore(t)
+	stored := testStoredServerExposeTCPTunnel(
+		"port-policy-retry-limit-id",
+		"port-policy-retry-limit",
+		"port-policy-retry-limit-client",
+		8080,
+		18084,
+		time.Now().UTC(),
+	)
+	mustAddStableTunnel(t, s.store, stored)
+
+	allowedPorts := []PortRange{{Start: 25000, End: 25010}}
+	affected, err := s.findTunnelsAffectedByPortChange(allowedPorts)
+	if err != nil {
+		t.Fatalf("find affected tunnels: %v", err)
+	}
+	if len(affected) != 1 {
+		t.Fatalf("affected tunnels: want 1, got %+v", affected)
+	}
+
+	hookCalls := 0
+	s.portPolicyAfterRuntimeCleanupHook = func(affectedTunnel) {
+		hookCalls++
+		current, err := s.store.GetTunnelByID(stored.ID)
+		if err != nil {
+			t.Fatalf("load revision during retry: %v", err)
+		}
+		next := current
+		next.Revision++
+		next.UpdatedAt = time.Now().UTC()
+		if err := s.store.ReplaceTunnelByID(current.OwnerClientID, current.ID, current.Revision, next); err != nil {
+			t.Fatalf("advance revision during retry: %v", err)
+		}
+	}
+
+	s.markTunnelsPortNotAllowed(affected, allowedPorts)
+	if hookCalls != maxPortPolicyRevisionAttempts {
+		t.Fatalf("port policy retries: got %d want %d", hookCalls, maxPortPolicyRevisionAttempts)
+	}
+	got, err := s.store.GetTunnelByID(stored.ID)
+	if err != nil {
+		t.Fatalf("load final revision: %v", err)
+	}
+	if got.Revision != stored.Revision+maxPortPolicyRevisionAttempts {
+		t.Fatalf("unexpected final revision after bounded retries: %+v", got)
 	}
 }
 

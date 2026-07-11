@@ -16,6 +16,8 @@ var (
 	errStoredTunnelNotFound       = errors.New("tunnel not found")
 )
 
+const maxPortPolicyRevisionAttempts = 4
+
 func tunnelProvisionErrorMessage(err error) string {
 	var rejected *tunnelProvisionRejectedError
 	switch {
@@ -529,8 +531,7 @@ func (s *Server) markTunnelPortNotAllowed(initial affectedTunnel, allowedPorts [
 	defer releaseRuntimeOperation()
 
 	current := initial
-	runCleanupHook := true
-	for {
+	for attempt := 0; attempt < maxPortPolicyRevisionAttempts; attempt++ {
 		config, ownerClientID = normalizedAffectedTunnel(current)
 		key := affectedTunnelRevisionKey(config.ID, config.Revision, ownerClientID, config.Name)
 		if processed[key] {
@@ -538,11 +539,10 @@ func (s *Server) markTunnelPortNotAllowed(initial affectedTunnel, allowedPorts [
 		}
 		processed[key] = true
 
-		updated, retryCurrent := s.markTunnelPortNotAllowedRevision(current, runCleanupHook)
+		updated, retryCurrent := s.markTunnelPortNotAllowedRevision(current)
 		if updated || !retryCurrent {
 			return
 		}
-		runCleanupHook = false
 
 		latest, ok := s.currentTunnelAffectedByPortPolicy(config.ID, allowedPorts)
 		if !ok {
@@ -550,6 +550,9 @@ func (s *Server) markTunnelPortNotAllowed(initial affectedTunnel, allowedPorts [
 		}
 		current = affectedTunnelFromStored(latest)
 	}
+	config, ownerClientID = normalizedAffectedTunnel(current)
+	log.Printf("⚠️ stopped retrying port policy error for tunnel %s/%s after %d attempts",
+		ownerClientID, config.ID, maxPortPolicyRevisionAttempts)
 }
 
 func normalizedAffectedTunnel(affected affectedTunnel) (protocol.ProxyConfig, string) {
@@ -588,7 +591,7 @@ func normalizedAffectedTunnel(affected affectedTunnel) (protocol.ProxyConfig, st
 	return config, ownerClientID
 }
 
-func (s *Server) markTunnelPortNotAllowedRevision(affected affectedTunnel, runCleanupHook bool) (bool, bool) {
+func (s *Server) markTunnelPortNotAllowedRevision(affected affectedTunnel) (bool, bool) {
 	config, ownerClientID := normalizedAffectedTunnel(affected)
 	if canonicalDesiredState(config.DesiredState) != protocol.ProxyDesiredStateRunning {
 		return false, false
@@ -619,7 +622,7 @@ func (s *Server) markTunnelPortNotAllowedRevision(affected affectedTunnel, runCl
 		}
 	}
 
-	if runCleanupHook && s.portPolicyAfterRuntimeCleanupHook != nil {
+	if s.portPolicyAfterRuntimeCleanupHook != nil {
 		s.portPolicyAfterRuntimeCleanupHook(affected)
 	}
 

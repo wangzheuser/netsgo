@@ -333,6 +333,9 @@ func (s *Server) handleAPIAdminConfig(w http.ResponseWriter, r *http.Request) {
 		})
 
 	case http.MethodPut:
+		s.serverConfigMutationMu.Lock()
+		defer s.serverConfigMutationMu.Unlock()
+
 		var config ServerConfig
 		if err := decodeJSONRequestBody(r, &config); err != nil {
 			writeJSONRequestDecodeError(w, err)

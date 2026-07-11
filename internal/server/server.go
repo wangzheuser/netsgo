@@ -31,6 +31,7 @@ type Server struct {
 	serverDBCloseOnce                   sync.Once
 	serverDBCloseErr                    error
 	clientTunnelMutationMu              sync.Mutex        // serializes registered-client deletion with tunnel target migration
+	serverConfigMutationMu              sync.Mutex        // serializes config persistence with port-policy enforcement
 	tunnelEventMu                       sync.Mutex        // preserves tunnel_changed ordering across state checks and publication
 	startTime                           time.Time         // server start time
 	auth                                *AuthService      // auth and access control (adminStore, rate limiting)
