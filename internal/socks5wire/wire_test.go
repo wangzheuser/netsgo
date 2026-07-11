@@ -77,7 +77,14 @@ func TestReadConnectRequestConnectParsesIPv4(t *testing.T) {
 }
 
 func TestServeHandshakeUsernamePasswordAuth(t *testing.T) {
-	hash, err := credential.HashPassword("secret")
+	const handshakeTestTimeout = 5 * time.Second
+
+	hash, err := credential.HashPasswordWithParams("secret", credential.HashParams{
+		Memory:  1024,
+		Time:    1,
+		Threads: 1,
+		KeyLen:  32,
+	})
 	if err != nil {
 		t.Fatalf("hash password: %v", err)
 	}
@@ -115,7 +122,9 @@ func TestServeHandshakeUsernamePasswordAuth(t *testing.T) {
 				}{req: req, ok: ok}
 			}()
 
-			_ = clientConn.SetDeadline(time.Now().Add(time.Second))
+			if err := clientConn.SetDeadline(time.Now().Add(handshakeTestTimeout)); err != nil {
+				t.Fatalf("set client deadline: %v", err)
+			}
 			if _, err := clientConn.Write([]byte{Version, 0x01, MethodUsernamePass}); err != nil {
 				t.Fatalf("write method negotiation: %v", err)
 			}
@@ -154,10 +163,16 @@ func TestServeHandshakeUsernamePasswordAuth(t *testing.T) {
 				if result.ok != tc.wantOK {
 					t.Fatalf("ServeHandshake ok: got %v want %v", result.ok, tc.wantOK)
 				}
-				if tc.wantOK && (result.req.Host != "127.0.0.1" || result.req.Port != 443) {
+				if tc.wantOK && (result.req.Host != "127.0.0.1" ||
+					result.req.Port != 443 ||
+					result.req.AddrType != protocol.SOCKS5AddrTypeIPv4 ||
+					result.req.OriginalHost != "127.0.0.1") {
 					t.Fatalf("request mismatch: %+v", result.req)
 				}
-			case <-time.After(time.Second):
+				if !tc.wantOK && result.req != (ConnectRequest{}) {
+					t.Fatalf("rejected authentication returned request: %+v", result.req)
+				}
+			case <-time.After(handshakeTestTimeout):
 				t.Fatal("ServeHandshake did not return")
 			}
 		})
