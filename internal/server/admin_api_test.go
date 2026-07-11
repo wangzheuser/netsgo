@@ -410,6 +410,47 @@ func TestAPI_AdminConfig_GetAndUpdate(t *testing.T) {
 	}
 }
 
+func TestAPI_AdminConfig_RefreshesAffectedTunnelsAfterSave(t *testing.T) {
+	s, handler, token, cleanup := setupTestServerWithStores(t, true)
+	defer cleanup()
+
+	hookCalled := false
+	s.portPolicyAfterConfigSaveHook = func() {
+		hookCalled = true
+		seedStoredTunnel(t, s, "client-after-save", protocol.ProxyNewRequest{
+			Name:       "created-during-port-policy-update",
+			Type:       protocol.ProxyTypeTCP,
+			RemotePort: 40000,
+		}, protocol.ProxyStatusActive)
+	}
+
+	body := []byte(`{"server_addr":"http://localhost","allowed_ports":[{"start":30000,"end":30010}]}`)
+	resp := doMuxRequest(t, handler, http.MethodPut, "/api/admin/config", token, body)
+	if resp.Code != http.StatusOK {
+		t.Fatalf("PUT /api/admin/config: want 200, got %d body=%s", resp.Code, resp.Body.String())
+	}
+	if !hookCalled {
+		t.Fatal("port policy after-save hook was not reached")
+	}
+
+	stored, err := s.store.GetTunnelE("client-after-save", "created-during-port-policy-update")
+	if err != nil {
+		t.Fatalf("load tunnel created after initial scan: %v", err)
+	}
+	if stored.RuntimeState != protocol.ProxyRuntimeStateError ||
+		stored.Error != "port 40000 is not allowed" {
+		t.Fatalf("post-save scan did not enforce the new port policy: %+v", stored)
+	}
+
+	var payload map[string]any
+	if err := mustDecodeJSON(t, resp.Body, &payload); err != nil {
+		t.Fatalf("decode config update response: %v", err)
+	}
+	if affected, ok := payload["affected_tunnels"].([]any); !ok || len(affected) != 0 {
+		t.Fatalf("response should preserve the initial preview set, got %v", payload["affected_tunnels"])
+	}
+}
+
 func TestAPI_AdminConfig_ServerAddrValidation(t *testing.T) {
 	s, cleanup := setupTestServerWithDB(t, true)
 	defer cleanup()

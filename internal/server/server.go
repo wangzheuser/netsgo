@@ -57,6 +57,7 @@ type Server struct {
 	updateCapabilityCache               *updateCapabilityCache // cached server install capability for status API
 	serverExposeActivatedHook           func(StoredTunnel, *ProxyTunnel)
 	runtimeErrorCleanupHook             func(protocol.ProxyConfig)
+	portPolicyAfterConfigSaveHook       func()
 	portPolicyAfterRuntimeCleanupHook   func(affectedTunnel)
 	restorePlaceholderBeforeInstallHook func(StoredTunnel, string)
 }

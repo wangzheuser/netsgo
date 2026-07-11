@@ -195,7 +195,7 @@ func TestMarkTunnelsPortNotAllowedTransitionsExactTunnel(t *testing.T) {
 
 	eventsCh := s.events.Subscribe()
 	defer s.events.Unsubscribe(eventsCh)
-	s.markTunnelsPortNotAllowed(affected)
+	s.markTunnelsPortNotAllowed(affected, []PortRange{{Start: 20000, End: 20010}})
 
 	unprovision := readTunnelUnprovision(t, clientWS)
 	if unprovision.TunnelID != stored.ID || unprovision.Revision != stored.Revision {
@@ -238,6 +238,68 @@ func TestMarkTunnelsPortNotAllowedTransitionsExactTunnel(t *testing.T) {
 	}
 	if payload["actual_transport"] != protocol.ActualTransportUnknown {
 		t.Fatalf("event transport should match persisted error state: %+v", payload)
+	}
+}
+
+func TestMarkTunnelsPortNotAllowedReevaluatesCurrentStoredRevision(t *testing.T) {
+	s := New(0)
+	s.store = newTestTunnelStore(t)
+	stored := testStoredServerExposeTCPTunnel(
+		"port-policy-revision-id",
+		"port-policy-revision",
+		"port-policy-revision-client",
+		8080,
+		18080,
+		time.Now().UTC(),
+	)
+	mustAddStableTunnel(t, s.store, stored)
+
+	runtimeTunnel := &ProxyTunnel{
+		Config: storedTunnelToProxyConfig(stored),
+		done:   make(chan struct{}),
+	}
+	initializeTunnelRuntimeFromState(runtimeTunnel, stored.OwnerClientID, time.Now())
+	client := &ClientConn{
+		ID:    stored.OwnerClientID,
+		state: clientStateLive,
+		proxies: map[string]*ProxyTunnel{
+			stored.Name: runtimeTunnel,
+		},
+	}
+	s.clients.Store(client.ID, client)
+
+	next := stored
+	next.Revision++
+	next.RemotePort = 18081
+	next.Ingress.Config = mustRawJSON(tcpListenConfigAPI{
+		BindIP:             "0.0.0.0",
+		Port:               next.RemotePort,
+		AllowedSourceCIDRs: allowAllSourceCIDRs(),
+	})
+	next.UpdatedAt = time.Now().UTC()
+	if err := s.store.ReplaceTunnelByID(stored.OwnerClientID, stored.ID, stored.Revision, next); err != nil {
+		t.Fatalf("advance stored tunnel revision: %v", err)
+	}
+
+	allowedPorts := []PortRange{{Start: 20000, End: 20010}}
+	affected, err := s.findTunnelsAffectedByPortChange(allowedPorts)
+	if err != nil {
+		t.Fatalf("find affected tunnels: %v", err)
+	}
+	if len(affected) != 1 || affected[0].Revision != stored.Revision {
+		t.Fatalf("preview should retain one stable tunnel snapshot: %+v", affected)
+	}
+
+	s.markTunnelsPortNotAllowed(affected, allowedPorts)
+	got, err := s.store.GetTunnelByIDE(stored.OwnerClientID, stored.ID)
+	if err != nil {
+		t.Fatalf("load current stored revision: %v", err)
+	}
+	if got.Revision != next.Revision ||
+		got.RemotePort != next.RemotePort ||
+		got.RuntimeState != protocol.ProxyRuntimeStateError ||
+		got.Error != "port 18081 is not allowed" {
+		t.Fatalf("current stored revision was not transitioned: %+v", got)
 	}
 }
 
@@ -326,7 +388,7 @@ func TestMarkTunnelsPortNotAllowedDoesNotMutateNewRevisionAfterCleanupBarrier(t 
 
 	eventsCh := s.events.Subscribe()
 	defer s.events.Unsubscribe(eventsCh)
-	s.markTunnelsPortNotAllowed(affected)
+	s.markTunnelsPortNotAllowed(affected, []PortRange{{Start: 25000, End: 25010}})
 	if !hookCalled {
 		t.Fatal("port policy cleanup barrier was not reached")
 	}
@@ -359,6 +421,113 @@ func TestMarkTunnelsPortNotAllowedDoesNotMutateNewRevisionAfterCleanupBarrier(t 
 	default:
 	}
 	assertNoTunnelChangedEvent(t, eventsCh, 150*time.Millisecond, stored.Name)
+}
+
+func TestMarkTunnelsPortNotAllowedTransitionsNewDisallowedRevisionAfterCleanupBarrier(t *testing.T) {
+	s := New(0)
+	s.store = newTestTunnelStore(t)
+	stored := testStoredServerExposeTCPTunnel(
+		"port-policy-retry-id",
+		"port-policy-retry",
+		"port-policy-retry-client",
+		8080,
+		18082,
+		time.Now().UTC(),
+	)
+	mustAddStableTunnel(t, s.store, stored)
+
+	oldListener := newScriptedListener(t)
+	oldRuntime := &ProxyTunnel{
+		Config:   storedTunnelToProxyConfig(stored),
+		Listener: oldListener,
+		done:     make(chan struct{}),
+	}
+	initializeTunnelRuntimeFromState(oldRuntime, stored.OwnerClientID, time.Now())
+	client := &ClientConn{
+		ID:    stored.OwnerClientID,
+		state: clientStateLive,
+		proxies: map[string]*ProxyTunnel{
+			stored.Name: oldRuntime,
+		},
+	}
+	s.clients.Store(client.ID, client)
+
+	allowedPorts := []PortRange{{Start: 25000, End: 25010}}
+	affected, err := s.findTunnelsAffectedByPortChange(allowedPorts)
+	if err != nil {
+		t.Fatalf("find affected tunnels: %v", err)
+	}
+	if len(affected) != 1 {
+		t.Fatalf("affected tunnels: want 1, got %+v", affected)
+	}
+
+	newListener := newScriptedListener(t)
+	var newRuntime *ProxyTunnel
+	hookCalled := false
+	s.portPolicyAfterRuntimeCleanupHook = func(got affectedTunnel) {
+		hookCalled = true
+		if got.TunnelID != stored.ID || got.Revision != stored.Revision {
+			t.Fatalf("cleanup hook identity mismatch: %+v", got)
+		}
+		if _, err := oldListener.Accept(); !errors.Is(err, net.ErrClosed) {
+			t.Fatalf("old listener must be closed before barrier, got %v", err)
+		}
+
+		next := stored
+		next.Revision++
+		next.RemotePort = 18083
+		next.Ingress.Config = mustRawJSON(tcpListenConfigAPI{
+			BindIP:             "0.0.0.0",
+			Port:               next.RemotePort,
+			AllowedSourceCIDRs: allowAllSourceCIDRs(),
+		})
+		next.UpdatedAt = time.Now().UTC()
+		if err := s.store.ReplaceTunnelByID(stored.OwnerClientID, stored.ID, stored.Revision, next); err != nil {
+			t.Fatalf("advance stored tunnel revision: %v", err)
+		}
+		reloaded, err := s.store.GetTunnelByIDE(stored.OwnerClientID, stored.ID)
+		if err != nil {
+			t.Fatalf("reload advanced tunnel: %v", err)
+		}
+		newRuntime = &ProxyTunnel{
+			Config:   storedTunnelToProxyConfig(reloaded),
+			Listener: newListener,
+			done:     make(chan struct{}),
+		}
+		initializeTunnelRuntimeFromState(newRuntime, stored.OwnerClientID, time.Now())
+		client.proxyMu.Lock()
+		client.proxies[stored.Name] = newRuntime
+		client.proxyMu.Unlock()
+	}
+
+	s.markTunnelsPortNotAllowed(affected, allowedPorts)
+	if !hookCalled {
+		t.Fatal("port policy cleanup barrier was not reached")
+	}
+
+	got, err := s.store.GetTunnelByIDE(stored.OwnerClientID, stored.ID)
+	if err != nil {
+		t.Fatalf("load new stored revision: %v", err)
+	}
+	wantError := "port 18083 is not allowed"
+	if got.Revision != stored.Revision+1 ||
+		got.RemotePort != 18083 ||
+		got.RuntimeState != protocol.ProxyRuntimeStateError ||
+		got.Error != wantError {
+		t.Fatalf("new disallowed revision was not transitioned: %+v", got)
+	}
+	client.proxyMu.RLock()
+	current := client.proxies[stored.Name]
+	client.proxyMu.RUnlock()
+	if current != newRuntime ||
+		current.Listener != nil ||
+		current.Config.RuntimeState != protocol.ProxyRuntimeStateError ||
+		current.Config.Error != wantError {
+		t.Fatalf("new disallowed runtime was not closed: %+v", current)
+	}
+	if _, err := newListener.Accept(); !errors.Is(err, net.ErrClosed) {
+		t.Fatalf("new disallowed listener must be closed, got %v", err)
+	}
 }
 
 func TestUnprovisionServerExposeTunnelDoesNotCloseNewRevision(t *testing.T) {
@@ -460,7 +629,7 @@ func TestMarkTunnelsPortNotAllowedLeavesStoppedTunnelStopped(t *testing.T) {
 	}
 	eventsCh := s.events.Subscribe()
 	defer s.events.Unsubscribe(eventsCh)
-	s.markTunnelsPortNotAllowed(affected)
+	s.markTunnelsPortNotAllowed(affected, []PortRange{{Start: 20000, End: 20010}})
 
 	got, err := s.store.GetTunnelByIDE(stored.OwnerClientID, stored.ID)
 	if err != nil {
