@@ -2,7 +2,7 @@
 
 ## 状态
 
-Open
+Implemented and locally validated; carrier-grade NAT and passive ICE-TCP deployment validation remain open
 
 ## 严重程度
 
@@ -28,9 +28,9 @@ High
 
 ## 当前实现证据与保护边界
 
-[KNOWN] 存储模型和 DTO 已有 `transport_policy`、`actual_transport`、`p2p_state` 等字段，`DataStreamHeader` 也已有 `transport` 字段，但 P2P 发送和接收尚未形成完整闭环。
+[KNOWN] P2P 数据闭环已经实现：Client pair 共用 Pion PeerConnection，在 negotiated reliable ordered detached DataChannel 上运行 yamux；TCP、UDP-over-stream 和 SOCKS5 共用 transport selector 与 transport-neutral target dispatcher。
 
-[KNOWN] 当前 `/api/tunnels` 会以 `direct_transport_unavailable` 拒绝所有非 `server_relay_only` 策略，Web UI 也将 direct/P2P 标记为 unavailable。这些是有意保留的 future-only 保护边界；在点对点数据路径、策略行为、统计、限速和验证全部完成前不得移除。
+[KNOWN] `/api/tunnels` 已对能力匹配的 `client_to_client` 开放 `direct_preferred` 和 `direct_only`；旧 Client、能力未知或实现标识不匹配的 Client 仍只能使用 relay。Web 已开放三种策略，默认仍为 `server_relay_only`。
 
 [KNOWN] 当前 `client_to_client` 路径是 Ingress Client -> Server -> Target Client：Ingress Client 向 Server 打开 yamux stream，Server 校验隧道身份后向 Target Client 打开第二条 yamux stream，再在两条 stream 间转发 payload。
 
@@ -39,7 +39,7 @@ High
 [KNOWN] 主要代码位置：
 
 - `pkg/protocol/types.go`：传输策略、实际传输、P2P 状态和能力字段。
-- `pkg/protocol/message.go`：future-only P2P 控制消息名。
+- `pkg/protocol/p2p.go`、`pkg/protocol/message.go`：P2P 控制消息、授权、租约、统计和 sender-credit 协议。
 - `pkg/protocol/stream_header.go`：逻辑 stream 身份和 transport 元数据。
 - `internal/server/data.go`：Server 数据 WebSocket 和 yamux session。
 - `internal/server/client_relay.go`：当前 Client-to-Client Server 中继。
@@ -47,6 +47,9 @@ High
 - `internal/client/unified_tunnel.go`：Client ingress stream 创建和 UDP association。
 - `internal/client/client.go`：Client 数据 session 和 target stream 分发。
 - `pkg/mux/udp_frame.go`：UDP-over-stream 帧化。
+- `pkg/p2p/session.go`：Pion DataChannel 与 yamux 适配。
+- `internal/server/p2p_coordinator.go`：pair session、信令、租约、grant、统计和 credit 授权。
+- `internal/client/p2p_manager.go`：Client pair session、direct stream、撤销、过期和统计。
 - `web/src/lib/tunnel-model.ts`：当前传输策略构造和显示文案。
 
 ## 分层契约
@@ -81,7 +84,7 @@ High
 
 1. [KNOWN] Pion ICE 收集、排序和检查 host、局域网、IPv4、IPv6 和 STUN server-reflexive candidate；经过原型验证后可以再启用明确可达的 passive ICE-TCP candidate。
 2. [KNOWN] Pion DTLS 负责 peer 数据路径加密和对端临时身份校验。
-3. [KNOWN] Pion SCTP/DataChannel 提供可靠有序的消息通道。它不是现成的 `net.Conn` 字节流；TCP、SOCKS5 和当前 UDP-over-stream 只有在分片、重组、背压、关闭和容量语义验证完成后才能复用其 stream 适配层。
+3. [KNOWN] Pion SCTP/DataChannel 提供可靠有序的消息通道。实现使用 negotiated detached DataChannel，并在其上运行 yamux，把它适配为多个 `net.Conn` 语义的逻辑 stream。
 4. [INFERRED] 未来原生不可靠或无序 datagram 可以增加独立 DataChannel 能力并复用现有策略和 pair session 生命周期，但仍需新增 capability/version、association grant、最大 datagram、分片和 fallback 协议。
 
 [KNOWN] 不引入 quic-go。QUIC 只能承载已经建立的 UDP 路径，不能提高 ICE 穿透成功率；与 Pion DataChannel 同时引入还会重复加密、多路复用、连接状态和心跳逻辑。
@@ -94,7 +97,7 @@ High
 
 [KNOWN] 第一版不使用 TURN，也不静默依赖项目无法控制的免费公共 TURN 服务。STUN 只处理地址探测，不转发业务 payload，因此不属于 relay。
 
-[INFERRED] STUN endpoint 可以由 NetsGo 自托管或由管理员显式配置。自托管 STUN 需要公网可达的 UDP listener；现有只代理 HTTP/WebSocket 的 nginx/caddy 路径不会自动转发 UDP，这项部署方式仍需在实现前固定。
+[KNOWN] NetsGo Server 已在与 TCP Server 相同的数字端口监听 UDP STUN；Client 在没有显式 ICE server 时从 `ServerAddr` 派生该 STUN 地址。只代理 HTTP/WebSocket 的 nginx/caddy 不会自动转发 UDP，反代部署必须额外代理同端口 UDP，否则只能依赖 host candidate。
 
 [INFERRED] P2P session 的连接层级如下：
 
@@ -111,7 +114,7 @@ NetsGo /ws/control（认证、信令、授权、续期）
      多条 tunnel / TCP / UDP association / SOCKS5
 ```
 
-[KNOWN] 精确的 DataChannel framing 和 multiplex 方式仍需原型决定。可选方向包括在一个可靠 DataChannel 上继续复用逻辑 stream mux，或为逻辑连接建立独立 DataChannel；无论选择哪种，上层必须获得相同的双向 stream 契约，并限制消息大小、缓冲和逻辑通道数量。
+[KNOWN] DataChannel framing 已固定：detached DataChannel 的消息语义先由 `dataChannelByteStream` 转换成连续字节流，单个 SCTP user message 最大 16 KiB，再在该字节流上运行 yamux。该适配会保存一次 DataChannel message 中未被 yamux 当前 `Read` 消费的剩余字节；没有这层适配，大型 yamux frame 会因 DataChannel 要求完整 message buffer 而触发 `io.ErrShortBuffer` 并破坏整个 peer session。
 
 ## 单路径与切换语义
 
@@ -129,7 +132,7 @@ NetsGo /ws/control（认证、信令、授权、续期）
 
 [KNOWN] 因此，同一隧道可能暂时同时存在 relay 活跃连接和 direct 活跃连接，但任何单独连接或 datagram 都不会在两个 transport 上重复发送。
 
-[KNOWN] 单值 `actual_transport` 无法完整表达“旧 relay stream 仍在排空，但新 stream 已选择 direct”的混合期。实现不得静默把已有字段重定义成“下一条流量将选择什么”；应另行明确 selector 当前选择，并在需要时提供 `active_transports` 或等价运行态，而每条 stream/traffic report 始终携带自己的真实 transport。
+[KNOWN] 单值 `actual_transport` 当前表达 selector 对新连接的选择，不能完整表达“旧 relay stream 仍在排空，但新 stream 已选择 direct”的混合期。每条 stream 和 traffic bucket 携带自己的真实 transport，避免计量混淆；精确的 `active_transports`/活动连接计数尚未实现，Web 文案不得把 selector 状态描述成所有存量连接均已迁移。
 
 ## 策略状态行为
 
@@ -165,9 +168,9 @@ NetsGo /ws/control（认证、信令、授权、续期）
 
 [KNOWN] P2P 隧道限速是两个方向共用的 tunnel-wide 总额度，不是每个方向各自获得一份完整额度。服务归属方统一协调共享额度和公平分配，两个 Client 分别在自身发送点执行归属方发放的 credit。
 
-[KNOWN] 当前协议、存储、Web 和 relay runtime 使用 `ingress_bps`、`egress_bps` 两个独立方向额度，无法直接表达共享总额度。这不是 P2P 局部适配：在启用 direct policy 前，必须先完成单独的 bandwidth 产品/协议/存储/UI 设计，使 relay 与 direct 使用同一共享语义。
+[KNOWN] 协议、SQLite、API 和 Web 已新增显式 `total_bps`。Relay 与 direct 都执行同一个 tunnel-wide 共享总额度；旧 `ingress_bps`、`egress_bps` 字段继续保留，用于跨版本兼容和原有方向限制。
 
-[INFERRED] 推荐增加显式 `total_bps` 作为新共享额度，而不是把旧两个字段擅自相加、取较大值或取较小值。旧配置如何迁移、何时废弃方向字段以及跨版本 Client 如何投影仍需单独确认；在该决定完成前，P2P 的共享限速实现和 direct policy 保持门禁关闭。
+[KNOWN] `total_bps` 由 migration `009_tunnel_total_bandwidth` 增加，默认 `0` 表示未配置共享总额度，不会从旧方向字段推导。旧方向字段没有自动迁移或废弃。
 
 [KNOWN] 限速调度必须 work-conserving：只有一个方向有待发送数据时，它可以使用 100% 总额度；两个方向都有待发送数据时，应快速趋向约 50% + 50%。“繁忙”表示确实存在待发送 payload，而不是仅保持着空闲连接。
 
@@ -183,7 +186,9 @@ NetsGo /ws/control（认证、信令、授权、续期）
 
 [KNOWN] Client 侧执行和上报属于协作语义。被修改或有缺陷的 Client 可以忽略限速或上报错误总量，Client 突然故障也可能丢失尚未上报的观测值；产品接受这些边界，不得将其描述为 Server 权威的点对点路径强制执行。
 
-[KNOWN] 当前 traffic storage 能区分 transport，但在开放 relay/direct 混合流量前必须审计内存 accumulator 和查询 projection。同一时间桶内来自不同 transport 的流量不得被归入错误 transport。
+[KNOWN] Traffic storage、内存 accumulator 和查询 projection 已按每份 `TrafficDelta.Transport` 分桶。Relay 数据路径显式记录 `server_relay`，不能读取 selector 当前值替代 stream 的真实路线；因此 selector 已切到 direct 后仍在排空的旧 relay stream 不会被计入 direct。
+
+[KNOWN] P2P session 关闭后保留 15 秒的最终统计宽限期。只有原 tunnel owner、原 generation、匹配的 session/grant/tunnel/revision/epoch 和向前 sequence 才能补交单调累计值；重放、越权和超时报告仍被拒绝。Client 优雅关闭会在发送控制 WebSocket close frame之前先刷新累计统计。
 
 ## Session 与授权边界
 
@@ -246,30 +251,39 @@ NetsGo /ws/control（认证、信令、授权、续期）
 
 - [KNOWN] 旧 Client 或能力未知的 Client 继续视为不支持 P2P。
 - [KNOWN] Server 不得向未明确声明兼容 P2P 实现的 Client 发送 P2P 信令。
-- [KNOWN] 在双方 endpoint、Server 协调器、统计、限速、状态投影和验证路径全部完成前，API/UI 必须继续禁用 `direct_preferred` 和 `direct_only`。
+- [KNOWN] 只有双方明确广告匹配的 P2P capability 时，API/UI 才允许 `direct_preferred` 和 `direct_only`。
 - [KNOWN] `server_relay_only` 以及未协商 P2P 的跨版本 Client/Server 组合必须保持当前 relay 行为不变。
 - [KNOWN] Web UI 只为 `client_to_client` 显示 transport policy 选择，默认仍是 `server_relay_only`，并以 Server 校验为最终准绳。
 
 ## 仍有意保持开放的决策
 
-- [KNOWN] Peer 实现已固定为 Pion WebRTC/ICE/DataChannel，第一版不使用 quic-go；但一个可靠 DataChannel 上复用 stream mux，还是按逻辑连接使用多个 DataChannel，仍需 prototype/benchmark 决定。
+- [KNOWN] Peer 实现已固定为 Pion WebRTC/ICE/DataChannel，第一版不使用 quic-go；当前选择是在一个可靠有序 detached DataChannel 上复用 yamux stream。
 - [KNOWN] Peer session 已固定为按 Client pair 共享；精确空闲关闭、重建和最大并发资源上限仍需实现阶段确定。
-- [KNOWN] 第一版已明确不使用 TURN，`direct_only` 不允许 relay。Host candidate 在同 LAN、直接公网地址或可达 IPv6 下可以不依赖 STUN；常规公网 NAT traversal 需要 STUN 获得 server-reflexive candidate。自托管 UDP listener 与管理员显式配置外部 STUN 的默认部署组合仍未固定。
+- [KNOWN] 第一版不使用 TURN，`direct_only` 不允许 relay。Server 已提供同数字端口的 UDP STUN listener。Pion vnet 已覆盖 full-cone、address-restricted、port-restricted、symmetric、公网端、STUN 故障、candidate 异常、IPv6、丢包/延迟/重复包和并发 stream；独立 Linux network namespace 的双 NAT Docker E2E 还验证了 direct、UDP 全阻断后的 relay fallback、解除阻断后的生产定时重试恢复。真实运营商 CGNAT、移动网络和企业防火墙仍需独立部署验证。
 - [KNOWN] Passive ICE-TCP 是机会性备用路径的原型目标，而不是已经确认的第一版能力。Pion 在 Linux、macOS、Windows、IPv4/IPv6、同 LAN、外部可达 listener 和 UDP 阻断场景下的实际覆盖必须由原型固定；第一版不承诺 TCP srflx、simultaneous-open 或严格 NAT TCP 打洞。
-- [KNOWN] P2P 总限速的公平调度语义已固定；具体时间片、连续发送块、burst 和多 stream 队列实现仍需 benchmark 固定。
-- [KNOWN] 共享总额度需要显式的新配置语义；当前 `ingress_bps` / `egress_bps` 如何迁移、跨版本投影和退出尚未固定，需要单独完成 wire/storage/UI/relay 设计，不能作为 P2P 内部细节处理。
+- [KNOWN] P2P sender-credit 与 relay 共享限速已经实现 work-conserving 公平调度，最大连续调度块为 256 KiB；仍需真实高延迟网络 benchmark 调整性能参数。
+- [KNOWN] 共享总额度使用 `total_bps`；旧方向字段继续兼容，当前没有退出时间表。
 - [KNOWN] 未来客户端 C 中继的协议、选择规则、资源授权和计量方式不属于第一版，需要独立设计。
 
-## 推荐实现顺序
+## 已获得的验证证据
 
-1. [INFERRED] 引入与 transport 无关的 stream 契约和 selector，首期只启用现有 `server_relay` 实现。
-2. [INFERRED] 让当前 TCP、UDP-over-stream 和 SOCKS5 ingress/target 路径通过该契约，并要求现有 relay 测试不变通过。
-3. [INFERRED] 引入 Pion WebRTC/ICE，增加强类型 offer/answer/candidate/lease/status payload、能力门禁、按 Client pair 的 session registry、过期 generation/revision 拒绝和清理，同时保持生产 P2P capability 关闭。
-4. [INFERRED] 增加共享 PeerConnection 和可靠 DataChannel 消息到 stream 的适配，先验证 UDP direct，再原型验证一端具备外部可达 passive listener 的 ICE-TCP；不得引入 quic-go 或 TURN，也不得承诺通用 TCP NAT 打洞。
-5. [INFERRED] 先完成显式共享总额度的 bandwidth wire/storage/UI/relay 设计，再增加 `peer_direct`、单路径固定、`direct_preferred` fallback、服务归属方累计统计、按 tunnel sender-credit 公平限速以及 Web 的策略/readiness/实际 transport 分离展示。
-6. [INFERRED] 增加 60 秒控制授权租约、删除/禁用立即撤销、阻断与重放测试，并验证 control/data 逻辑会话失效会在安全上限内关闭 P2P。
-7. [INFERRED] 在移除 API/UI unavailable 门禁前，增加直连成功、失败、重试、fallback、重连和反向代理信令的真实网络验证。
-8. [INFERRED] 仅在 `direct_only` 的不可用和恢复行为完成端到端验证后开放该策略。
+- [KNOWN] `pkg/p2p/network_test.go` 与 `network_matrix_extended_test.go` 使用 Pion vnet 构造真实路由与 NAT 行为，不使用两个 localhost socket 冒充 NAT；矩阵同时固定成功与预期失败组合，并覆盖 malformed/error STUN、candidate 延迟/逆序/重复、IPv4/IPv6、多地址、受损网络、大 payload、并发 stream 和持续低速传输。
+- [KNOWN] `pkg/p2p/session_test.go` 验证真实 Pion PeerConnection、detached DataChannel、超过 1 MiB 的双向 payload、16 条并发 yamux stream 和有界关闭；`datachannel_stream_test.go` 单独验证大 Write 分片和任意小 Read 不改变字节序列。
+- [KNOWN] `internal/server/unified_tunnel_e2e_test.go` 使用真实 Server 和 Client 覆盖 TCP、UDP-over-stream、SOCKS5 direct。UDP 使用多个不同长度和内容的 datagram，验证边界、无重复及原始 payload byte 精确统计；SOCKS5 验证握手不进入 direct 业务流量统计。
+- [KNOWN] 同一 E2E 覆盖 relay → direct 的旧连接固定、新连接切换、direct 失败后旧 stream 关闭、后续新连接只回退一次、生产代码 10 秒自动重试后恢复 direct，以及持久 Client 身份断线重连后 generation 更新和 P2P session 重建。每条路径都使用精确 payload 长度检查 relay/direct 分桶，没有用 `>=` 掩盖重复字节。
+- [KNOWN] 共享限速 E2E 在 64 KiB/s tunnel-wide 总额度下持续制造 8 MiB 正向 backlog，目标端反向数据仍在 2 秒有界时间内到达，证明反向流量没有排在正向 backlog 尾部。单元测试另覆盖单向借满、双向平分、闲置份额借用和 256 KiB 最大调度块。
+- [KNOWN] Docker system E2E 的 current-only nginx 与 caddy 变体把 TCP、UDP、SOCKS5 `client_to_client` 配置为 `direct_preferred`，并同时等待 `p2p.state=connected` 与 `actual_transport=peer_direct`；Client 和 Server 重启后重复该断言，不能以 tunnel `active` 代替 P2P 成功。
+- [KNOWN] v0.1.8/current 的完整 nginx 跨版本矩阵 11/11 通过。兼容矩阵显式固定 `server_relay_only`，因为只观察 Client capability 不能证明旧 Server 理解新 direct policy；current-only system E2E 则通过 `NETSGO_E2E_REQUIRE_P2P=1` 强制 direct capability 和实际直连断言。
+- [KNOWN] 当前验证通过 `go test ./... -count=1`、`go vet ./...`、`make test-race`、Web lint/171 项测试/build、`make build` 和 `git diff --check`。
+
+## 已采用的实现顺序
+
+1. [KNOWN] 引入 transport-neutral stream 契约和 selector，并让 TCP、UDP-over-stream、SOCKS5 共用该路径。
+2. [KNOWN] 引入 Pion PeerConnection、detached DataChannel 和 yamux，增加强类型信令与按 Client pair 的 session registry。
+3. [KNOWN] 增加 pair/tunnel 短租约、grant/revoke、generation/revision/role/sequence 校验以及 candidate 大小、数量和速率限制。
+4. [KNOWN] 增加 `total_bps` wire/storage/UI/relay 语义，再实现 direct sender-credit、公平调度和 payload-byte 统计。
+5. [KNOWN] 开放 capability-gated API/UI，增加 direct、fallback、direct-only、TCP、UDP、SOCKS5 与迁移 E2E。
+6. [KNOWN] 保持 TURN、quic-go 和 passive ICE-TCP 不在第一版运行范围内。
 
 ## 所需验证
 
@@ -289,6 +303,7 @@ NetsGo /ws/control（认证、信令、授权、续期）
 - [KNOWN] P2P 建连与重试按 Client pair 合并，稳定重试约一分钟并带随机偏移；多条 tunnel 不会成倍制造 ICE session。
 - [KNOWN] Web 同时正确展示策略、P2P readiness 和当前新连接 transport，并说明旧 relay stream 不迁移。
 - [KNOWN] 控制信令和 relay fallback 在 Server 直连、nginx、caddy 三类路径下均可工作。
-- [KNOWN] System E2E 覆盖同网络直连、配置后的 NAT traversal、direct 被阻断后的 fallback、`direct_only` 失败、Client 重连和 Server 重启行为。
+- [KNOWN] System E2E 覆盖同网络直连、两个独立 namespace/NAT 的真实内核转发、direct 被阻断后的 fallback 与自动恢复、`direct_only` 失败、Client 重连和 Server 重启行为。
+- [KNOWN] 双 NAT Docker E2E 另以真实 Linux network namespace 验证 UDP hairpin；该结论不依赖 Pion vnet，因为 vnet 的 NAT hairpin 选项没有实现。
 - [KNOWN] 跨版本兼容保证不支持 P2P 的 Client 保持 relay，且不会收到 P2P 信令。
-- [KNOWN] 完整路径启用前，文档和 UI 不得暗示 P2P 已可用。
+- [KNOWN] UI 只在双方能力匹配时开放 direct 策略，并且不得把尚未验证的 NAT/ICE-TCP 拓扑描述成已支持。
