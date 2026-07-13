@@ -153,6 +153,12 @@ func TestDefaultP2PICEServersUsesConfiguredServerEndpoint(t *testing.T) {
 	}
 }
 
+func TestP2PStatsReportIntervalMatchesRealtimeTrafficResolution(t *testing.T) {
+	if p2pStatsReportInterval != time.Second {
+		t.Fatalf("p2p stats report interval=%s, want 1s realtime resolution", p2pStatsReportInterval)
+	}
+}
+
 func TestClientPeerManagerExpiredPairClosesPeerAndEveryGrantStream(t *testing.T) {
 	now := time.Unix(100, 0).UTC()
 	m := testPeerManager(&now)

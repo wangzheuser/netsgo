@@ -710,14 +710,29 @@ function TunnelDialogForm({
           {isClientToClient && (
             <div className="space-y-1.5">
               <label className="text-sm font-medium">{t('tunnels.transportPolicy')}</label>
-              <Select value={transportPolicy} onValueChange={(value) => { clearMutationFeedback(); setTransportPolicy(value as TransportPolicy); }}>
-                <SelectTrigger aria-label={t('tunnels.transportPolicy')} className="w-full"><SelectValue /></SelectTrigger>
-                <SelectContent>
-                  <SelectItem value="server_relay_only">{t('tunnels.serverRelay')}</SelectItem>
-                  <SelectItem value="direct_preferred">{t('tunnels.directPreferred')}</SelectItem>
-                  <SelectItem value="direct_only">{t('tunnels.directOnly')}</SelectItem>
-                </SelectContent>
-              </Select>
+              <div className="grid grid-cols-1 gap-2 sm:grid-cols-3">
+                {([
+                  ['server_relay_only', t('tunnels.serverRelay')],
+                  ['direct_preferred', t('tunnels.directPreferred')],
+                  ['direct_only', t('tunnels.directOnly')],
+                ] satisfies [TransportPolicy, string][]).map(([value, label]) => {
+                  const selected = transportPolicy === value;
+                  return (
+                    <button
+                      key={value}
+                      type="button"
+                      aria-pressed={selected}
+                      className={protocolCardClassName(selected)}
+                      onClick={() => {
+                        clearMutationFeedback();
+                        setTransportPolicy(value);
+                      }}
+                    >
+                      {label}
+                    </button>
+                  );
+                })}
+              </div>
               <p className="text-xs text-muted-foreground">{t('tunnels.transportPolicyHint')}</p>
               <FieldErrorText error={fieldError} fields={['transport_policy']} />
             </div>

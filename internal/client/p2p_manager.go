@@ -43,6 +43,7 @@ type clientPeerSession struct {
 const (
 	p2pEarlySignalTTL      = 10 * time.Second
 	p2pEarlySignalSessions = 64
+	p2pStatsReportInterval = time.Second
 )
 
 type pendingP2PSignals struct {
@@ -464,7 +465,7 @@ func (m *clientPeerManager) ensureTrafficCounterLocked(grant protocol.P2PTunnelG
 }
 
 func (m *clientPeerManager) statsLoop() {
-	ticker := time.NewTicker(5 * time.Second)
+	ticker := time.NewTicker(p2pStatsReportInterval)
 	defer ticker.Stop()
 	for {
 		select {
